@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MIX FLIP2外屏增强</string>
+    <string name="xposed_description">为小米 MIX Flip 2（HyperOS 4）外屏提供状态圈、外屏应用全屏去留白、小组件与超级岛适配、超级小爱外屏全屏适配、小组件常用应用固定、外屏通知直接打开及微信输入法外屏适配。</string>
+
+    <!-- Navigation -->
+    <string name="tab_home">首页</string>
+    <string name="tab_appearance">界面</string>
+    <string name="tab_layout">功能</string>
+    <string name="tab_compat">兼容</string>
+    <string name="sub_home">专为小米 MIX Flip 2 · HyperOS 4 外屏适配</string>
+    <string name="sub_appearance">状态圈、小组件与桌面样式</string>
+    <string name="sub_layout">全屏显示、限制解除与微信输入法适配</string>
+    <string name="sub_compat">作用域维护、系统恢复与关于</string>
+
+    <!-- Status -->
+    <string name="badge_unsupported">不支持</string>
+    <string name="badge_disconnected">未连接</string>
+    <string name="badge_ready">框架就绪</string>
+    <string name="badge_reboot">待重启</string>
+    <string name="status_unsupported_device">不支持的设备 (需要 MIX Flip 2)</string>
+    <string name="status_unsupported_firmware">不支持的系统版本：%1$s（需要 HyperOS 4）</string>
+    <string name="status_inactive">模块未激活</string>
+    <string name="status_running">运行正常</string>
+    <string name="status_needs_reboot">需要重启</string>
+    <string name="fw_ready">框架已就绪</string>
+    <string name="fw_inactive">模块未激活或需要重启</string>
+    <string name="fw_mismatch">框架版本不一致，需要重启</string>
+    <string name="meta_target">MIX Flip 2 · HyperOS 4</string>
+    <string name="meta_version">v%1$s</string>
+    <string name="meta_scopes">%1$d 个作用域</string>
+    <string name="hint_unsupported">本模块仅适配小米 MIX Flip 2（HyperOS 4），在此设备或系统版本上保持停用，不会修改系统。</string>
+    <string name="hint_disconnected">请在 LSPosed 中启用模块并勾选核心作用域。</string>
+    <string name="hint_ready">外屏状态圈、全屏显示与小组件适配已生效。</string>
+    <string name="hint_reboot">更新后请重启手机以使系统框架生效。</string>
+
+    <!-- Home actions & overview -->
+    <string name="action_zero_blank">一键全屏去留白</string>
+    <string name="action_request_core">补齐核心作用域</string>
+    <string name="section_overview">模块状态总览</string>
+    <string name="home_nav_appearance_title">界面与桌面样式</string>
+    <string name="home_nav_appearance_sub">状态圈：%1$s · 超级岛小组件：%2$s · 隐藏名称：%3$s</string>
+    <string name="home_nav_layout_title">全屏与功能增强</string>
+    <string name="home_nav_layout_sub">全屏去留白：%1$s · 应用与通知直开：%2$s · 微信输入法：%3$s</string>
+    <string name="home_nav_compat_title">作用域与系统维护</string>
+    <string name="home_nav_compat_sub_ready">核心作用域已齐全 · 当前共启用 %1$d 个作用域</string>
+    <string name="home_nav_compat_sub_missing">缺少 %1$d 项必选作用域（%2$s），点击前往维护</string>
+    <string name="home_nav_compat_sub_disconnected">未连接 LSPosed 服务，请在管理器中启用模块</string>
+    <string name="chip_goto">前往</string>
+    <string name="section_builtin">外屏交互特性</string>
+
+    <!-- Switches -->
+    <string name="sw_panel_title">外屏状态圈</string>
+    <string name="sw_panel_sub">镜头上方显示时间、电量与信号（联动开启小组件适配）</string>
+    <string name="sw_island_title">超级岛与小组件适配</string>
+    <string name="sw_island_sub">方形容器居中缩放，采用官方柔光玻璃材质</string>
+    <string name="sw_immersive_title">外屏应用全屏</string>
+    <string name="sw_immersive_sub">隐藏外屏状态栏并右移隐私绿点，展开内屏自动恢复（已打开的应用需重开生效）</string>
+    <string name="sw_compat_title">应用顶栏去留白</string>
+    <string name="sw_compat_sub">统一外屏应用顶部 30px 留白，兼顾全屏视觉与顶部点击（需重开对应应用生效）</string>
+    <string name="sw_ime_title">外屏微信输入法适配</string>
+    <string name="sw_ime_sub">仅针对微信输入法适配外屏高度、摄像头半圆避让与留白（重开键盘或输入法生效）</string>
+    <string name="section_orb">状态圈</string>
+    <string name="sw_battery_title">显示电量数字</string>
+    <string name="sw_battery_sub">电量环顶部显示百分比，充满显示插头</string>
+    <string name="sw_dual_title">显示双卡信号</string>
+    <string name="sw_dual_sub">双卡启用时显示双排信号点，单卡自动切换单排</string>
+    <string name="info_ime_avoid_title">键盘自动避让</string>
+    <string name="info_ime_avoid_sub">弹出键盘重叠时自动隐藏，收起后恢复</string>
+    <string name="section_window">全屏与去留白</string>
+    <string name="section_unblock">应用与通知限制解除</string>
+    <string name="section_desktop">桌面与组件</string>
+    <string name="sw_hide_names_title">隐藏桌面应用名称</string>
+    <string name="sw_hide_names_sub">仅显示桌面图标，隐藏下方文字标签（返回外屏桌面生效）</string>
+    <string name="sw_pinned_widget_title">小组件固定常用应用</string>
+    <string name="sw_pinned_widget_sub">将外屏最近应用小组件（2×2 网格）固定为自定义常用应用，无后台时亦常驻显示</string>
+    <string name="row_pinned_widget_apps_title">自定义固定应用（最多 4 个）</string>
+    <string name="row_pinned_widget_apps_empty">未设置固定应用，点击选择最多 4 个常用程序</string>
+    <string name="row_pinned_widget_apps_summary">已固定 %1$d/4：%2$s</string>
+    <string name="chip_configure">选择</string>
+    <string name="picker_pinned_title">选择固定的常用应用（最多 4 个）</string>
+    <string name="picker_pinned_sub">按勾选顺序固定在 2×2 应用图标小组件中；点击上方槽位可移除对应应用，未满 4 个时自动用最近任务补齐。</string>
+    <string name="picker_pinned_slot_empty">空位 %1$d</string>
+    <string name="picker_pinned_clear">清空已选</string>
+    <string name="filter_pinned_only">已固定</string>
+    <string name="tag_pinned_order">固定 #%1$d</string>
+    <string name="btn_save_pinned">保存固定图标</string>
+    <string name="msg_pinned_limit">最多可固定 4 个常用应用（可点击上方槽位或取消勾选后更换）</string>
+    <string name="msg_pinned_saved">已保存 %1$d 个固定常用应用，返回外屏即刻生效</string>
+    <string name="msg_pinned_cleared">已清空固定应用，恢复默认最近任务显示</string>
+    <string name="info_grid_title">五排网格与手势</string>
+    <string name="info_grid_sub">桌面采用五排对称图标；顶部左 1/3 下拉通知栏，右 2/3 下拉控制中心</string>
+
+    <!-- Compatibility page -->
+    <string name="section_ime_compat">输入法适配</string>
+    <string name="info_ime_scope_title">仅针对微信输入法（4.0.x）适配</string>
+    <string name="info_ime_scope_sub">外屏键盘布局、摄像头半圆避让与高度仅针对微信输入法适配；需将「微信输入法」加入模块作用域并重启输入法生效</string>
+    <string name="row_zero_blank_title">一键开启全屏去留白</string>
+    <string name="row_zero_blank_sub">同时开启外屏全屏与顶栏去留白并同步状态</string>
+    <string name="chip_enable">开启</string>
+    <string name="row_ext_scope_title">扩展应用作用域</string>
+    <string name="row_ext_scope_sub">按需勾选需深度适配的应用加入 LSPosed 作用域</string>
+    <string name="chip_manage">管理</string>
+    <string name="section_scope">作用域维护</string>
+    <string name="deep_compat_card_title">深度兼容应用提示</string>
+    <string name="deep_compat_status_connected">本机已安装 %1$d 款专项适配应用，已启用 %2$d 款</string>
+    <string name="deep_compat_status_disconnected">本机已安装 %1$d 款专项适配应用（启用模块后可勾选）</string>
+    <string name="deep_compat_status_none">暂未检测到本机安装内置专项适配应用</string>
+    <string name="deep_compat_card_body">• 普通应用已由系统框架自动完成外屏 30px 全屏去留白，无需逐个勾选。\n• 内置专项深度适配的应用（微信、QQ、美团、网易云音乐、系统日历、小米商城、小米运动健康、系统设置）或个别自带假状态栏占位的第三方应用，建议加入扩展作用域；勾选保存后强行停止或重开对应应用生效。\n• 超级小爱已默认预置为核心作用域；微信输入法由「外屏微信输入法适配」开关单独控制。</string>
+    <string name="deep_compat_card_action">筛选深度适配应用</string>
+    <string name="row_request_core_sub">申请 %1$d 项必选作用域：%2$s</string>
+    <string name="chip_request">申请</string>
+    <string name="row_reset_scope_title">重置核心作用域</string>
+    <string name="row_reset_scope_sub">移除额外扩展应用，仅保留 %1$d 项核心作用域</string>
+    <string name="chip_reset">重置</string>
+    <string name="scope_system">系统框架</string>
+    <string name="scope_systemui">系统界面</string>
+    <string name="scope_fliphome">外屏桌面</string>
+    <string name="scope_voiceassist">超级小爱</string>
+    <string name="scope_wetype">微信输入法</string>
+    <string name="list_separator">、</string>
+
+    <!-- Advanced -->
+    <string name="section_advanced">高级</string>
+    <string name="sw_verbose_title">详细日志</string>
+    <string name="sw_verbose_sub">在 logcat 输出调试信息，仅在排查问题时开启</string>
+    <string name="row_diag_log_title">查看与导出诊断日志</string>
+    <string name="row_diag_log_sub">汇总设备环境、配置状态与跨进程运行日志，支持一键复制或分享</string>
+    <string name="dialog_diag_log_title">诊断与运行日志</string>
+    <string name="dialog_diag_log_sub">已汇总：%1$s（共 %2$d 条日志）</string>
+    <string name="dialog_diag_log_empty">当前暂无新增运行日志（操作外屏或开启详细日志后点击「刷新」查看）</string>
+    <string name="btn_refresh_log">刷新</string>
+    <string name="btn_clear_log">清空</string>
+    <string name="btn_share_log">分享导出</string>
+    <string name="msg_log_copied">已复制诊断日志到剪贴板</string>
+    <string name="msg_log_cleared">已清空跨进程诊断日志</string>
+    <string name="row_restore_title">恢复系统默认</string>
+    <string name="row_restore_sub">停用状态栏覆盖层、重新启用搜狗外屏输入法，并关闭全屏去留白与微信输入法适配</string>
+    <string name="chip_restore">恢复</string>
+    <string name="row_adb_title">手动恢复命令</string>
+    <string name="row_adb_sub">模块已停用时可通过 adb 手动恢复</string>
+    <string name="chip_view">查看</string>
+
+    <!-- About -->
+    <string name="section_about">关于</string>
+    <string name="about_target_title">适配机型与系统</string>
+    <string name="about_target_sub">小米 MIX Flip 2 (bixi) · HyperOS 4</string>
+    <string name="about_version_title">版本</string>
+    <string name="about_version_sub">%1$s (%2$d)</string>
+    <string name="about_github_title">GitHub</string>
+    <string name="chip_open">打开</string>
+    <string name="about_license_title">开源许可</string>
+    <string name="about_license_sub">GNU General Public License v3.0 (GPL-3.0)</string>
+
+    <!-- Dialogs -->
+    <string name="dialog_restore_title">恢复系统默认？</string>
+    <string name="dialog_restore_message">将执行以下操作：\n• 停用外屏状态栏资源覆盖层\n• 重新启用系统自带的搜狗外屏输入法\n• 关闭外屏应用全屏、顶栏去留白与微信输入法适配\n\n此操作需要系统框架处于激活状态。若模块已被停用，请通过 adb 手动执行以下命令（长按复制）：</string>
+    <string name="dialog_adb_title">手动恢复命令</string>
+    <string name="dialog_adb_message">模块已停用或系统框架未激活时，在电脑上通过 adb 执行以下命令（长按复制）：</string>
+    <string name="dialog_reset_title">重置作用域？</string>
+    <string name="dialog_reset_message">将从模块作用域中移除 %1$d 个额外应用，仅保留：%2$s。</string>
+    <string name="btn_restore">恢复</string>
+    <string name="btn_cancel">取消</string>
+    <string name="btn_copy_all">复制全部</string>
+    <string name="btn_close">关闭</string>
+
+    <!-- Messages -->
+    <string name="msg_restore_sent">已发送恢复请求，外屏全屏去留白与微信输入法适配已关闭。</string>
+    <string name="msg_restore_failed">恢复请求发送失败：%1$s</string>
+    <string name="msg_reset_nothing">没有需要移除的额外作用域。</string>
+    <string name="msg_connect_failed">连接失败：%1$s</string>
+    <string name="msg_service_died">LSPosed 服务连接已断开</string>
+    <string name="msg_save_failed">保存失败：%1$s</string>
+    <string name="msg_zero_blank_done">已开启外屏全屏与顶栏去留白，重开应用即可生效。</string>
+    <string name="msg_no_apps">未查询到可启动应用。</string>
+    <string name="msg_scopes_complete">核心作用域已齐全，重开对应应用即可生效。</string>
+    <string name="msg_scope_request">请在 LSPosed 弹窗中允许新增 %1$d 项作用域。</string>
+    <string name="msg_scope_approved">已添加 %1$d 项作用域，重开应用生效。</string>
+    <string name="msg_scope_failed">作用域申请未完成：%1$s</string>
+    <string name="msg_request_failed">申请失败：%1$s</string>
+    <string name="msg_removed">已移除 %1$d 个应用的作用域。</string>
+    <string name="msg_remove_failed">移除作用域失败：%1$s</string>
+    <string name="msg_unchanged">作用域未变更。</string>
+    <string name="msg_pruned">已清理 %1$d 项扩展作用域。</string>
+    <string name="msg_prune_failed">清理失败：%1$s</string>
+    <string name="msg_open_failed">无法打开链接</string>
+
+    <!-- App picker -->
+    <string name="picker_title">选择扩展适配应用</string>
+    <string name="picker_sub">普通应用无需勾选；专项适配应用勾选保存后，强行停止或重开生效。</string>
+    <string name="picker_sub_deep">本机已安装的内置专项适配应用（含系统日历与设置），勾选保存后强行停止或重开生效。</string>
+    <string name="picker_search_hint">搜索应用名称或包名...</string>
+    <string name="filter_third">第三方应用</string>
+    <string name="filter_deep_compat">深度适配</string>
+    <string name="filter_all">全部应用</string>
+    <string name="filter_scoped">已加入作用域</string>
+    <string name="filter_system">系统应用</string>
+    <string name="picker_select_all">全选当前列表</string>
+    <string name="picker_empty">没有匹配的应用</string>
+    <string name="picker_loading">正在加载应用列表…</string>
+    <string name="tag_enabled">已启用</string>
+    <string name="tag_deep_compat">深度适配</string>
+    <string name="tag_ime_compat">输入法适配</string>
+    <string name="deep_desc_wechat">专项适配 · 微信 8.0.x 顶栏缓存同步与通讯录/发现页去留白</string>
+    <string name="deep_desc_qq">专项适配 · 消息/聊天顶栏紧凑布局与折叠状态栏缓存刷新</string>
+    <string name="deep_desc_meituan">专项适配 · 首页下拉顶栏、标签栏与二楼占位去留白</string>
+    <string name="deep_desc_cloudmusic">专项适配 · 保留原生外屏播放页挖孔布局与常规页面去留白</string>
+    <string name="deep_desc_calendar">专项适配 · 外屏月视图与紧凑顶栏偏移适配</string>
+    <string name="deep_desc_xiaomishop">专项适配 · 首页顶栏、搜索栏与状态栏高度缓存同步</string>
+    <string name="deep_desc_mihealth">专项适配 · 健康/运动/设备/我的全标签页顶栏紧凑对齐</string>
+    <string name="deep_desc_settings">专项适配 · 外屏直开与系统设置顶栏去留白适配</string>
+    <string name="deep_desc_wetype">输入法专项 · 外屏键盘高度与镜头避让（由「外屏微信输入法适配」开关控制）</string>
+    <string name="btn_save_scope">保存并申请作用域</string>
+
+    <!-- Accessibility -->
+    <string name="a11y_on">已开启</string>
+    <string name="a11y_off">已关闭</string>
+    <string name="sw_allow_all_title">外屏打开所有应用</string>
+    <string name="sw_allow_all_sub">解除「展开内屏继续操作」限制，设置等应用也可直接在外屏打开</string>
+    <string name="sw_notif_open_title">外屏通知直接打开</string>
+    <string name="sw_notif_open_sub">解除外屏点击通知弹出「在内屏查看」的限制，直接在外屏打开对应应用</string>
+    <string name="msg_effect_realtime">已实时生效</string>
+    <string name="msg_effect_launcher">已更新，返回外屏桌面即刻生效（若未刷新可重启外屏桌面）</string>
+    <string name="msg_effect_reopen_app">已更新，状态栏实时生效；已打开的外屏应用需重新打开后生效</string>
+    <string name="msg_effect_ime">已更新，收起并重新弹出键盘（或重启微信输入法）后生效</string>
+</resources>

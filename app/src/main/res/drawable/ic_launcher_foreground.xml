@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Minimalist Status Orb open ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M64.9,38.4A19,19 0 1,1 43.1,38.4" />
+    <!-- Top gap status dot -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M54,35m-3.6,0a3.6,3.6 0 1,1 7.2,0a3.6,3.6 0 1,1 -7.2,0" />
+    <!-- Center core dot -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,54m-4.2,0a4.2,4.2 0 1,1 8.4,0a4.2,4.2 0 1,1 -8.4,0" />
+</vector>
