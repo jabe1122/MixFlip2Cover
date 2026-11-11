@@ -1,7 +1,7 @@
 # MIX FLIP2外屏增强 · MIX Flip 2 Cover Enhancer
 
 [![Build](https://github.com/jabe1122/MixFlip2Cover/actions/workflows/build.yml/badge.svg)](https://github.com/jabe1122/MixFlip2Cover/actions/workflows/build.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/jabe1122/MixFlip2Cover/blob/main/LICENSE)
 
 一个专为 **小米 MIX Flip 2**（HyperOS 4）外屏（1208×1392）打造的 LSPosed 增强模块。
 
@@ -10,6 +10,20 @@
 > [!WARNING]
 > 本模块会 Hook `system_server`、系统界面和外屏桌面，**仅支持 MIX Flip 2（代号 `bixi`）上的 HyperOS 4**。
 > 其他机型或系统版本会自动停用，不安装任何 Hook。刷机或修改系统有风险，请先做好备份。
+
+## 界面与功能示意
+
+### 外屏功能分区与手势总览
+
+![外屏功能分区与手势示意](https://raw.githubusercontent.com/jabe1122/MixFlip2Cover/main/docs/images/cover-layout-overview.png)
+
+### 适配前后效果对比
+
+![适配前后效果对比示意](https://raw.githubusercontent.com/jabe1122/MixFlip2Cover/main/docs/images/before-after-compat.png)
+
+### 模块可视化设置界面（Material 3 Expressive）
+
+![模块设置界面示意](https://raw.githubusercontent.com/jabe1122/MixFlip2Cover/main/docs/images/app-settings-preview.png)
 
 ## 功能
 
@@ -39,7 +53,7 @@
 3. **重启手机**（系统框架 Hook 需要重启后才生效）。
 4. 打开 App，确认首页显示“运行正常 / 框架已就绪”。
 
-需要深度应用专项兼容（微信、QQ、美团、网易云音乐等）或微信输入法外屏适配时，可在 App 的“兼容”页管理扩展应用作用域，添加后重启对应应用即可生效。
+普通应用已由系统框架自动完成外屏 30px 全屏去留白，无需逐个勾选；需要深度应用专项兼容（微信、QQ、美团、网易云音乐、系统日历、小米商城、小米运动健康、系统设置等）或微信输入法外屏适配时，可在 App 的“兼容”页点击“筛选深度适配应用”按需加入扩展作用域，保存后强行停止或重开对应应用即可生效。
 
 ## 外屏微信输入法适配（可选）
 
@@ -89,7 +103,7 @@ adb logcat -s MF2C.Framework MF2C.Compat MF2C.ImeGuard MF2C.Overlay MF2C.SystemU
 
 ## 许可证
 
-[GPL-3.0](LICENSE) © jabe1122
+[GPL-3.0](https://github.com/jabe1122/MixFlip2Cover/blob/main/LICENSE) © jabe1122
 
 ---
 
@@ -99,6 +113,8 @@ An LSPosed module (libxposed API 101) that enhances the **Xiaomi MIX Flip 2** (`
 
 **Supported:** MIX Flip 2 (`bixi`) on HyperOS 4 only. On any other device or OS version the module stays inactive and installs no hooks.
 
+**Showcase:** See the bilingual [Cover Layout, Before/After & Module UI Diagrams](#界面与功能示意) above.
+
 **Features:**
 - **Fullscreen Cover Apps & Top-Gap Removal:** Handles status bar insets in the framework and unifies the top app gap to 30px while keeping top touch targets responsive; restores automatically when unfolded.
 - **Cover Status Orb:** Compact status orb above the cameras showing time, battery ring (optional percentage & full-charge plug), single/dual-SIM signal dots, charging, airplane mode, and hotspot, following system light/dark themes.
@@ -107,7 +123,7 @@ An LSPosed module (libxposed API 101) that enhances the **Xiaomi MIX Flip 2** (`
 - **Cover Launcher, Gestures & Compact Notifications:** Five-row symmetric icon grid aligned with the status orb, optional app label hiding, split top pull-down (left 1/3 for notifications, right 2/3 for Control Center), and top status-bar blank-space removal for both the pulled-down Notification Shade and Heads-Up pop-up notifications.
 - **App & Notification Unblocking:** Opens restricted apps (such as Settings) and notification taps directly on the cover screen without the "unfold / view on inner screen" prompt (enabled by default, configurable).
 - **Native Cover Layouts Preserved:** Activities declaring `miui.supportFlipFullScreen=0` (e.g., NetEase Cloud Music cover player) keep their native layout, cutout, and density.
-- **Deep App & WeType Keyboard Adaptation:** Fullscreen cover overlay & camera/orb avoidance for Super XiaoAi (`com.miui.voiceassist`), dedicated layout adapters for WeChat, QQ, Meituan, Xiaomi Shop, Mi Fitness, NetEase Cloud Music, Calendar, and Settings, plus optional cover keyboard adaptation for WeChat Input Method (`WeType` 4.0.x, off by default).
+- **Deep App & WeType Keyboard Adaptation:** Fullscreen cover overlay & camera/orb avoidance for Super XiaoAi (`com.miui.voiceassist`), dedicated layout adapters for WeChat, QQ, Meituan, Xiaomi Shop, Mi Fitness, NetEase Cloud Music, Calendar, and Settings (discoverable via the in-app *Filter deep-fit apps* guide; regular apps need no manual scope), plus optional cover keyboard adaptation for WeChat Input Method (`WeType` 4.0.x, off by default).
 
 **Install:** Install the APK, enable the module in LSPosed (core scopes `system`, `com.android.systemui`, `com.miui.fliphome`, and `com.miui.voiceassist` are preset), reboot, and verify that the app reports "Running".
 
@@ -121,4 +137,4 @@ adb shell pm enable com.sohu.inputmethod.sogou.xiaomi/com.sohu.inputmethod.sogou
 adb shell settings put secure default_input_method com.sohu.inputmethod.sogou.xiaomi/.SogouIME
 ```
 
-**License:** GPL-3.0.
+**License:** [GPL-3.0](https://github.com/jabe1122/MixFlip2Cover/blob/main/LICENSE).
