@@ -23,8 +23,8 @@ android {
         applicationId = "io.github.jabe1122.mixflip2cover"
         minSdk = 36
         targetSdk = 36
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 101
+        versionName = "1.0.1"
     }
 
     signingConfigs {

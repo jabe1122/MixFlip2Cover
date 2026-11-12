@@ -9,6 +9,7 @@ import android.util.Log;
 import android.view.Choreographer;
 import android.view.Display;
 import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.View;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -209,8 +210,23 @@ final class PanelMotion {
     }
 
     static float computePullDownDeltaX(float downRawX, int displayWidth) {
+        return computePullDownDeltaX(downRawX, displayWidth, Surface.ROTATION_0);
+    }
+
+    static float computePullDownDeltaX(float downRawX, int displayWidth, int rotation) {
         if (displayWidth <= 0) return 0f;
-        boolean toControl = CoverDisplay.isControlCenterPull(downRawX, displayWidth);
+        boolean toControl = CoverDisplay.isControlCenterPull(downRawX, displayWidth, rotation);
+        if (rotation == Surface.ROTATION_180) {
+            if (!toControl) {
+                float minNotifX = Math.round(displayWidth * 0.38f);
+                float maxNotifX = Math.round(displayWidth * 0.62f);
+                if (downRawX < minNotifX) return minNotifX - downRawX;
+                if (downRawX > maxNotifX) return maxNotifX - downRawX;
+                return 0f;
+            }
+            float minControlX = Math.round(displayWidth * 0.75f);
+            return downRawX < minControlX ? (minControlX - downRawX) : 0f;
+        }
         if (!toControl) {
             float maxNotifX = displayWidth * 0.42f;
             return downRawX > maxNotifX ? (maxNotifX - downRawX) : 0f;
@@ -250,11 +266,13 @@ final class PanelMotion {
                         event.getRawY())) {
                     return event;
                 }
+                int rotation = coverPullDisplayRotation(hostView);
                 int width = coverPullDisplayWidth(hostView);
                 float rawX = event.getRawX();
-                boolean toControl = CoverDisplay.isControlCenterPull(rawX, width);
-                float deltaX = computePullDownDeltaX(rawX, width);
-                ModLog.i(TAG, "pull-down split (" + source + ") x=" + Math.round(rawX)
+                boolean toControl = CoverDisplay.isControlCenterPull(rawX, width, rotation);
+                float deltaX = computePullDownDeltaX(rawX, width, rotation);
+                ModLog.i(TAG, "pull-down split (" + source + ") rot=" + rotation
+                        + " x=" + Math.round(rawX)
                         + " deltaX=" + Math.round(deltaX)
                         + " -> " + (toControl ? "control_center" : "notifications"));
                 if (Math.abs(deltaX) < 0.5f) {
@@ -389,6 +407,31 @@ final class PanelMotion {
         } catch (Throwable ignored) {
         }
         return SystemBarMask.anyOuterBar() || Boolean.TRUE.equals(CoverGeometry.defaultDisplayOuter());
+    }
+
+    private static int coverPullDisplayRotation(View hostView) {
+        try {
+            Display d = hostView != null ? hostView.getDisplay() : null;
+            Context c = context;
+            if (d == null && c != null) {
+                DisplayManager dm = c.getSystemService(DisplayManager.class);
+                d = dm != null ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
+                if (d == null) {
+                    try {
+                        d = c.getDisplay();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (d == null) {
+                    d = CoverGeometry.outerDisplay(c);
+                }
+            }
+            if (d != null) {
+                return d.getRotation();
+            }
+        } catch (Throwable ignored) {
+        }
+        return Surface.ROTATION_0;
     }
 
     private static int coverPullDisplayWidth(View hostView) {

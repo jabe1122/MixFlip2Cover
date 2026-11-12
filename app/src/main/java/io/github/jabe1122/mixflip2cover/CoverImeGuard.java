@@ -136,7 +136,11 @@ final class CoverImeGuard {
         long key = (outer ? 10 : 0) + rotation;
         if (key == lastDisplayKey) return;
         lastDisplayKey = key;
-        schedule();
+        Handler h = handler;
+        if (h != null) {
+            h.removeCallbacks(syncRunnable);
+        }
+        sync(c);
         Runnable listener = rotationChangeListener;
         if (listener != null) {
             try {
@@ -397,13 +401,9 @@ final class CoverImeGuard {
                         setSmallestScreenWidthDp.invoke(wct, token, swDp);
                     }
                 } else {
-                    android.graphics.Rect fullAppBounds = new android.graphics.Rect();
-                    if (d != null && d.getMode() != null) {
-                        fullAppBounds.set(0, 0, d.getMode().getPhysicalWidth(), d.getMode().getPhysicalHeight());
-                    }
                     for (Object token : entry.getValue()) {
                         setBounds.invoke(wct, token, empty);
-                        setAppBounds.invoke(wct, token, fullAppBounds.isEmpty() ? empty : fullAppBounds);
+                        setAppBounds.invoke(wct, token, empty);
                         setDensityDpi.invoke(wct, token, 0);
                         setScreenSizeDp.invoke(wct, token, 0, 0);
                         setSmallestScreenWidthDp.invoke(wct, token, 0);

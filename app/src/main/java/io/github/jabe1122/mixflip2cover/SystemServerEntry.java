@@ -1721,6 +1721,7 @@ public final class SystemServerEntry extends XposedModule {
                             adaptCoverImeConfiguration(cfg, rot);
                             syncProcessCompatForIme(wpc, true, rot);
                         } else {
+                            scrubInnerImeProcessConfig(wpc, cfg);
                             syncProcessCompatForIme(wpc, false, 0);
                         }
                     }
@@ -1810,6 +1811,7 @@ public final class SystemServerEntry extends XposedModule {
                             adaptCoverImeConfiguration(full, rot);
                             syncProcessCompatForIme(wpc, true, rot);
                         } else {
+                            scrubInnerImeProcessConfig(wpc, cfg);
                             syncProcessCompatForIme(wpc, false, 0);
                         }
                     }
@@ -1860,6 +1862,8 @@ public final class SystemServerEntry extends XposedModule {
                         int rot = getWindowRotation(win);
                         ensureCoverImeWindowAttrs(win, rot);
                         clampClientFramesHorizontally(chain.getArg(0), rot);
+                    } else if (imeHooksActive() && isThirdPartyImeWindow(win)) {
+                        restoreInnerImeWindowAttrs(win);
                     }
                 } catch (Throwable t) {
                     error(t);
@@ -2157,6 +2161,21 @@ public final class SystemServerEntry extends XposedModule {
         }
     }
 
+    private void restoreInnerImeWindowAttrs(Object win) {
+        try {
+            WindowManager.LayoutParams lp = (WindowManager.LayoutParams) attrs.get(win);
+            if (lp != null) {
+                if (lp.type == 2011 && CoverDisplay.isCoverImeWidth(lp.width)) {
+                    lp.width = WindowManager.LayoutParams.MATCH_PARENT;
+                    lp.x = 0;
+                }
+                lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+                lp.setFitInsetsTypes(lp.getFitInsetsTypes() | WindowInsets.Type.displayCutout());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void adaptCoverImeConfiguration(Configuration cfg, int rotation) throws ReflectiveOperationException {
         if (cfg == null) return;
         Rect safe = coverImeSafeBounds(rotation);
@@ -2179,28 +2198,59 @@ public final class SystemServerEntry extends XposedModule {
         cfg.orientation = Configuration.ORIENTATION_PORTRAIT;
     }
 
-    private void clearCoverImeOverride(Configuration reqOverride) throws ReflectiveOperationException {
-        if (reqOverride == null) return;
-        Object wc = windowConfigField.get(reqOverride);
+    private boolean hasCoverImeOverride(Configuration cfg) throws ReflectiveOperationException {
+        if (cfg == null) return false;
+        Object wc = windowConfigField.get(cfg);
         Rect b = wc != null ? (Rect) wcGetBounds.invoke(wc) : null;
-        if (reqOverride.densityDpi == CoverDisplay.IME_DENSITY_DPI_ROT0
-                || reqOverride.densityDpi == CoverDisplay.IME_DENSITY_DPI_WIDE
+        return cfg.densityDpi == CoverDisplay.IME_DENSITY_DPI_ROT0
+                || cfg.densityDpi == CoverDisplay.IME_DENSITY_DPI_WIDE
                 || (b != null && (CoverDisplay.isOuterDimensions(b.right, b.bottom)
-                || (b.width() == COVER_SAFE_WIDTH && b.height() == COVER_DISPLAY_HEIGHT)))) {
-            if (wc != null) {
-                wcSetBounds.invoke(wc, (Object) null);
-                wcSetAppBounds.invoke(wc, (Object) null);
-                if (wcSetMaxBounds != null) wcSetMaxBounds.invoke(wc, (Object) null);
-            }
-            reqOverride.densityDpi = Configuration.DENSITY_DPI_UNDEFINED;
-            reqOverride.screenWidthDp = Configuration.SCREEN_WIDTH_DP_UNDEFINED;
-            reqOverride.smallestScreenWidthDp = Configuration.SMALLEST_SCREEN_WIDTH_DP_UNDEFINED;
-            reqOverride.screenHeightDp = Configuration.SCREEN_HEIGHT_DP_UNDEFINED;
-            if (cfgCompatWField != null) cfgCompatWField.setInt(reqOverride, Configuration.SCREEN_WIDTH_DP_UNDEFINED);
-            if (cfgCompatSwField != null) cfgCompatSwField.setInt(reqOverride, Configuration.SMALLEST_SCREEN_WIDTH_DP_UNDEFINED);
-            if (cfgCompatHField != null) cfgCompatHField.setInt(reqOverride, Configuration.SCREEN_HEIGHT_DP_UNDEFINED);
-            reqOverride.orientation = Configuration.ORIENTATION_UNDEFINED;
+                || (b.width() == COVER_SAFE_WIDTH && b.height() == COVER_DISPLAY_HEIGHT)
+                || (b.width() == CoverDisplay.CAMERA_TOP && b.height() == CoverDisplay.WIDTH)));
+    }
+
+    private void scrubInnerImeProcessConfig(Object wpc, Configuration cfg) throws ReflectiveOperationException {
+        clearCoverImeOverride((Configuration) ccGetReqOverrideConfig.invoke(wpc));
+        clearCoverImeOverride((Configuration) ccGetResolvedOverrideConfig.invoke(wpc));
+        if (wpcInitConfigField != null) {
+            clearCoverImeOverride((Configuration) wpcInitConfigField.get(wpc));
         }
+        if (!isCoverFolded() && hasCoverImeOverride(cfg)) {
+            try {
+                Object s = service;
+                Object root = s != null ? serviceRoot.get(s) : null;
+                Object dc = root != null ? rootDisplay.invoke(root, 0) : null;
+                Configuration dcCfg = dc != null ? (Configuration) ccGetConfig.invoke(dc) : null;
+                if (dcCfg != null) {
+                    Configuration full = (Configuration) ccGetConfig.invoke(wpc);
+                    if (full != null) full.setTo(dcCfg);
+                    cfg.setTo(dcCfg);
+                    if (wpcInitConfigField != null) {
+                        Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
+                        if (initCfg != null) initCfg.setTo(dcCfg);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void clearCoverImeOverride(Configuration reqOverride) throws ReflectiveOperationException {
+        if (!hasCoverImeOverride(reqOverride)) return;
+        Object wc = windowConfigField.get(reqOverride);
+        if (wc != null) {
+            wcSetBounds.invoke(wc, (Object) null);
+            wcSetAppBounds.invoke(wc, (Object) null);
+            if (wcSetMaxBounds != null) wcSetMaxBounds.invoke(wc, (Object) null);
+        }
+        reqOverride.densityDpi = Configuration.DENSITY_DPI_UNDEFINED;
+        reqOverride.screenWidthDp = Configuration.SCREEN_WIDTH_DP_UNDEFINED;
+        reqOverride.smallestScreenWidthDp = Configuration.SMALLEST_SCREEN_WIDTH_DP_UNDEFINED;
+        reqOverride.screenHeightDp = Configuration.SCREEN_HEIGHT_DP_UNDEFINED;
+        if (cfgCompatWField != null) cfgCompatWField.setInt(reqOverride, Configuration.SCREEN_WIDTH_DP_UNDEFINED);
+        if (cfgCompatSwField != null) cfgCompatSwField.setInt(reqOverride, Configuration.SMALLEST_SCREEN_WIDTH_DP_UNDEFINED);
+        if (cfgCompatHField != null) cfgCompatHField.setInt(reqOverride, Configuration.SCREEN_HEIGHT_DP_UNDEFINED);
+        reqOverride.orientation = Configuration.ORIENTATION_UNDEFINED;
     }
 
     private void adaptMergedConfiguration(Object mergedCfg, int rotation) throws ReflectiveOperationException {
@@ -2367,7 +2417,11 @@ public final class SystemServerEntry extends XposedModule {
 
                 for (Object w : imeWindows) {
                     try {
-                        if (coverActive) ensureCoverImeWindowAttrs(w, rot);
+                        if (coverActive) {
+                            ensureCoverImeWindowAttrs(w, rot);
+                        } else {
+                            restoreInnerImeWindowAttrs(w);
+                        }
                         notifyInsets.invoke(w);
                     } catch (Throwable ignored) {
                     }

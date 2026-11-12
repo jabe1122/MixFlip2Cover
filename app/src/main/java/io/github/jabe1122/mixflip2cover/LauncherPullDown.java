@@ -159,7 +159,7 @@ final class LauncherPullDown {
                     gesture.y = eventRawY(event);
                     gesture.downTime = event.getDownTime();
                     gesture.intercepted = false;
-                    gesture.control = CoverDisplay.isControlCenterPull(gesture.x, width);
+                    gesture.control = CoverDisplay.isControlCenterPull(gesture.x, width, rotation);
                     gesture.eligible = gesture.x >= 0 && gesture.x < width
                             && gesture.y >= 0 && gesture.y < height
                             && !isMultiItemWidgetPagerTouch(view, gesture.x, gesture.y);
@@ -239,8 +239,8 @@ final class LauncherPullDown {
                 gesture.downTime = event.getDownTime();
                 gesture.intercepted = false;
                 float density = activity.getResources().getDisplayMetrics().density;
-                // Left third of the panel opens the notification shade, the right two-thirds open the control center.
-                gesture.control = CoverDisplay.isControlCenterPull(gesture.x, width);
+                // Upright: left 1/3 notifications, right 2/3 Control Center; inverted (ROTATION_180): middle 1/3 notifications, rightmost 1/3 Control Center.
+                gesture.control = CoverDisplay.isControlCenterPull(gesture.x, width, rotation);
                 boolean inCameraColumn = isInPortraitCameraColumn(gesture.x, rotation);
                 float topEdge = inCameraColumn
                         ? CoverResourceOverlay.NATIVE_COVER_STATUS_BAR_PX

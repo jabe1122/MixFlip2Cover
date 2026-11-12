@@ -685,4 +685,310 @@ public class ModuleLogicTest {
             finishedDeltaField.setFloat(null, 0f);
         }
     }
+
+    @Test
+    public void weTypeVersionSupport_andObfuscatedMethodTableFor400And401() {
+        // Below 4.0.0 (58000) and >= 60000 are outside verified m1 table range
+        assertFalse(AppCompatibility.isSupportedWeTypeM1Version(57999L));
+        assertFalse(AppCompatibility.isWeTypeV401(57999L));
+        assertFalse(AppCompatibility.isSupportedWeTypeM1Version(60000L));
+        assertFalse(AppCompatibility.isWeTypeV401(60000L));
+
+        // WeType 4.0.0 (58xxx)
+        assertTrue(AppCompatibility.isSupportedWeTypeM1Version(58000L));
+        assertTrue(AppCompatibility.isSupportedWeTypeM1Version(58999L));
+        assertFalse(AppCompatibility.isWeTypeV401(58000L));
+        assertFalse(AppCompatibility.isWeTypeV401(58999L));
+        assertEquals("h3", AppCompatibility.weTypeUpdateResourceLayoutMethod(58500L));
+        assertEquals("j3", AppCompatibility.weTypeModeFlowMethod(58500L));
+        assertEquals("e2", AppCompatibility.weTypeRebuildAllMethod(58500L));
+        assertEquals("i2", AppCompatibility.weTypeResetDataCacheMethod(58500L));
+        assertEquals("j0", AppCompatibility.weTypeDefaultBodyHeightMethod(58500L));
+        assertEquals("F2", AppCompatibility.weTypeSelfDrawScaleMethod(58500L));
+
+        // WeType 4.0.1 (59201, 59xxx)
+        assertTrue(AppCompatibility.isSupportedWeTypeM1Version(59000L));
+        assertTrue(AppCompatibility.isSupportedWeTypeM1Version(59201L));
+        assertTrue(AppCompatibility.isSupportedWeTypeM1Version(59999L));
+        assertTrue(AppCompatibility.isWeTypeV401(59000L));
+        assertTrue(AppCompatibility.isWeTypeV401(59201L));
+        assertTrue(AppCompatibility.isWeTypeV401(59999L));
+        assertEquals("f3", AppCompatibility.weTypeUpdateResourceLayoutMethod(59201L));
+        assertEquals("h3", AppCompatibility.weTypeModeFlowMethod(59201L));
+        assertEquals("c2", AppCompatibility.weTypeRebuildAllMethod(59201L));
+        assertEquals("g2", AppCompatibility.weTypeResetDataCacheMethod(59201L));
+        assertEquals("k0", AppCompatibility.weTypeDefaultBodyHeightMethod(59201L));
+        assertEquals("B2", AppCompatibility.weTypeSelfDrawScaleMethod(59201L));
+
+        android.view.ViewGroup fakeContainer = new android.widget.FrameLayout(null);
+        android.view.View fakeRoot = new android.view.View(null);
+        assertTrue(fakeRoot == AppCompatibility.weTypeResetInputViewArg(58100L, fakeContainer, fakeRoot));
+        assertTrue(fakeContainer == AppCompatibility.weTypeResetInputViewArg(59201L, fakeContainer, fakeRoot));
+    }
+
+    @Test
+    public void weTypeRotationResolution_rot0OverridesStaleRot180AndRestoresInnerScreen() {
+        // Flipping from inverted cover (ROTATION_180 = 2, 1208px) back to upright cover (ROTATION_0 = 0, 810px):
+        // live ROTATION_0 (0) must NOT be ignored by a > 0 check and must override stale currentImeRotation = 2
+        int rotBackToUpright = AppCompatibility.resolveImeRotationForConfig(
+                null, Surface.ROTATION_0, Surface.ROTATION_180);
+        assertEquals(Surface.ROTATION_0, rotBackToUpright);
+        assertEquals(810, CoverDisplay.coverImeWidth(rotBackToUpright));
+        assertEquals(0, CoverDisplay.coverImeCandidateLeftInset(rotBackToUpright));
+        assertTrue(CoverDisplay.isCoverImeWidth(810));
+        assertTrue(CoverDisplay.isCoverImeWidth(1208));
+        assertTrue(CoverDisplay.isCoverImeWidth(664));
+        assertTrue(CoverDisplay.isCoverImeWidth(1392));
+        assertFalse(CoverDisplay.isCoverImeWidth(1224));
+        assertFalse(CoverDisplay.isCoverImeWidth(-1));
+
+        // Inverting cover from ROTATION_0 (0) to ROTATION_180 (2): camera avoidance active (1208px wide, 398px left inset)
+        int rotToInverted = AppCompatibility.resolveImeRotationForConfig(
+                null, Surface.ROTATION_180, Surface.ROTATION_0);
+        assertEquals(Surface.ROTATION_180, rotToInverted);
+        assertEquals(1208, CoverDisplay.coverImeWidth(rotToInverted));
+        assertEquals(398, CoverDisplay.coverImeCandidateLeftInset(rotToInverted));
+        assertEquals(730, CoverDisplay.coverImeMaxHeight(rotToInverted));
+
+        // Unavailable live rotation (-1) preserves valid current rotation including ROTATION_0 (0)
+        assertEquals(Surface.ROTATION_0,
+                AppCompatibility.resolveImeRotationForConfig(null, -1, Surface.ROTATION_0));
+        assertEquals(Surface.ROTATION_180,
+                AppCompatibility.resolveImeRotationForConfig(null, -1, Surface.ROTATION_180));
+        assertEquals(Surface.ROTATION_0,
+                AppCompatibility.resolveImeRotationForConfig(null, -1, -1));
+
+        // Full Metrics + Configuration transition: Inner (1224x2912) -> ROTATION_180 (1208px) -> ROTATION_0 (810px) -> Inner
+        android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+        dm.widthPixels = 1224;
+        dm.heightPixels = 2912;
+        dm.densityDpi = 460;
+        dm.density = 460 / 160f;
+        dm.scaledDensity = dm.density;
+
+        android.content.res.Configuration cfg = new android.content.res.Configuration();
+        cfg.densityDpi = 460;
+        cfg.screenWidthDp = 425;
+        cfg.screenHeightDp = 1012;
+        cfg.smallestScreenWidthDp = 425;
+        cfg.orientation = android.content.res.Configuration.ORIENTATION_PORTRAIT;
+
+        // Step 1: Cover inverted (ROTATION_180)
+        AppCompatibility.overrideMetrics(dm,
+                CoverDisplay.coverImeWidth(Surface.ROTATION_180),
+                CoverDisplay.coverImeDisplayHeight(Surface.ROTATION_180),
+                CoverDisplay.coverImeDensityDpi(Surface.ROTATION_180));
+        AppCompatibility.adaptImeConfig(cfg, Surface.ROTATION_180);
+        assertEquals(1208, dm.widthPixels);
+        assertEquals(420, dm.densityDpi);
+        assertEquals(420, cfg.densityDpi);
+        assertEquals(372, cfg.screenWidthDp);
+        assertEquals(530, cfg.screenHeightDp);
+
+        // Step 2: Cover flipped upright back to ROTATION_0 (must shrink from 1208px to 810px safe column)
+        AppCompatibility.overrideMetrics(dm,
+                CoverDisplay.coverImeWidth(Surface.ROTATION_0),
+                CoverDisplay.coverImeDisplayHeight(Surface.ROTATION_0),
+                CoverDisplay.coverImeDensityDpi(Surface.ROTATION_0));
+        AppCompatibility.adaptImeConfig(cfg, Surface.ROTATION_0);
+        assertEquals(810, dm.widthPixels);
+        assertEquals(340, dm.densityDpi);
+        assertEquals(340, cfg.densityDpi);
+        assertEquals(372, cfg.screenWidthDp);
+        assertEquals(655, cfg.screenHeightDp);
+
+        // Step 3: Unfold back to inner screen (must restore full 1224x2912 @ 460dpi without stale 810/1208 width)
+        AppCompatibility.restoreOverrides(false);
+        assertEquals(1224, dm.widthPixels);
+        assertEquals(2912, dm.heightPixels);
+        assertEquals(460, dm.densityDpi);
+        assertEquals(460, cfg.densityDpi);
+        assertEquals(425, cfg.screenWidthDp);
+        assertEquals(1012, cfg.screenHeightDp);
+    }
+
+    @Test
+    public void invertedCoverPullDown_middleThirdOpensNotificationsAndRightThirdOpensControlCenter() {
+        final int w = CoverDisplay.WIDTH; // 1208
+
+        // Upright cover (ROTATION_0): left 1/3 (< 402.67) notifications, right 2/3 (>= 402.67) Control Center
+        assertEquals(w / 3f, CoverDisplay.controlCenterSplitX(w, Surface.ROTATION_0), 0.01f);
+        assertFalse(CoverDisplay.isControlCenterPull(200f, w, Surface.ROTATION_0));
+        assertFalse(CoverDisplay.isControlCenterPull(402f, w, Surface.ROTATION_0));
+        assertTrue(CoverDisplay.isControlCenterPull(403f, w, Surface.ROTATION_0));
+        assertTrue(CoverDisplay.isControlCenterPull(604f, w, Surface.ROTATION_0));
+        assertEquals(298f, PanelMotion.computePullDownDeltaX(403f, w, Surface.ROTATION_0), 0.01f);
+
+        // Inverted cover (ROTATION_180, camera occupies top-left [0..398]):
+        // middle 1/3 [403..805] (and any left touch < 805.33) -> Notification Center, clamped into [459..749]
+        // rightmost 1/3 (>= 805.33) -> Control Center, shifted to >= 906
+        assertEquals((w * 2f) / 3f, CoverDisplay.controlCenterSplitX(w, Surface.ROTATION_180), 0.01f);
+        assertFalse(CoverDisplay.isControlCenterPull(410f, w, Surface.ROTATION_180));
+        assertFalse(CoverDisplay.isControlCenterPull(604f, w, Surface.ROTATION_180));
+        assertFalse(CoverDisplay.isControlCenterPull(805f, w, Surface.ROTATION_180));
+        assertTrue(CoverDisplay.isControlCenterPull(806f, w, Surface.ROTATION_180));
+        assertTrue(CoverDisplay.isControlCenterPull(1100f, w, Surface.ROTATION_180));
+
+        // Near camera edge (x = 410) shifts right to 459 (safe inside MiuiSystemUI [398..803] notification zone)
+        assertEquals(49f, PanelMotion.computePullDownDeltaX(410f, w, Surface.ROTATION_180), 0.01f);
+        // Center of middle 1/3 (x = 604) needs no horizontal shift
+        assertEquals(0f, PanelMotion.computePullDownDeltaX(604f, w, Surface.ROTATION_180), 0.01f);
+        // Near right edge of middle 1/3 (x = 800) shifts left to 749 (safely < 803 Control Center boundary)
+        assertEquals(-51f, PanelMotion.computePullDownDeltaX(800f, w, Surface.ROTATION_180), 0.01f);
+        // Rightmost 1/3 boundary (x = 806) shifts right to 906 (safely > 803 Control Center boundary)
+        assertEquals(100f, PanelMotion.computePullDownDeltaX(806f, w, Surface.ROTATION_180), 0.01f);
+        // Far right (x = 1050) needs no shift
+        assertEquals(0f, PanelMotion.computePullDownDeltaX(1050f, w, Surface.ROTATION_180), 0.01f);
+    }
+
+    @Test
+    public void voiceAssistCoverHalo_normalizesUprightAndInvertedLayoutParamsAndRestoresInner() {
+        assertTrue(AppCompatibility.isVoiceAssistHaloWindowTitle("voice_assist_root"));
+        assertTrue(AppCompatibility.isVoiceAssistHaloWindowTitle("voice_assist_gesture_line_handoff_effect"));
+        assertFalse(AppCompatibility.isVoiceAssistHaloWindowTitle("com.miui.voiceassist/com.xiaomi.voiceassistant.tabhome.TabHomeActivity"));
+        assertFalse(AppCompatibility.isVoiceAssistHaloWindowTitle(""));
+        assertFalse(AppCompatibility.isVoiceAssistHaloWindowTitle(null));
+
+        // Rotation-aware physical cover corner radii [TL, TR, BR, BL]:
+        // Upright ROTATION_0 has 50px hinge at top, 130px outer bezel at bottom;
+        // Inverted ROTATION_180 has 130px outer bezel at top, 50px hinge at bottom.
+        assertArrayEquals(new int[]{50, 50, 130, 130}, CoverDisplay.outerCornerRadii(Surface.ROTATION_0));
+        assertArrayEquals(new int[]{50, 130, 130, 50}, CoverDisplay.outerCornerRadii(Surface.ROTATION_90));
+        assertArrayEquals(new int[]{130, 130, 50, 50}, CoverDisplay.outerCornerRadii(Surface.ROTATION_180));
+        assertArrayEquals(new int[]{130, 50, 50, 130}, CoverDisplay.outerCornerRadii(Surface.ROTATION_270));
+        assertEquals(0, CoverDisplay.outerCornerRadius(Surface.ROTATION_0, -1));
+        assertEquals(0, CoverDisplay.outerCornerRadius(Surface.ROTATION_0, 4));
+
+        assertTrue(AppCompatibility.isVoiceAssistFullscreenHaloWindow(
+                2017, "voice_assist_root", "android.widget.FrameLayout"));
+        assertTrue(AppCompatibility.isVoiceAssistFullscreenHaloWindow(
+                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                "",
+                "com.xiaomi.voiceassistant.mainui.board.FloatViewRootLayout"));
+        // Activity windows (< FIRST_SYSTEM_WINDOW) must never be treated as fullscreen halo overlays
+        assertFalse(AppCompatibility.isVoiceAssistFullscreenHaloWindow(
+                android.view.WindowManager.LayoutParams.TYPE_BASE_APPLICATION,
+                "voice_assist_root",
+                "com.xiaomi.voiceassistant.mainui.board.FloatViewRootLayout"));
+
+        // Simulate stale inner-screen / ROTATION_0 LayoutParams (1224x2912, Gravity.TOP, SHORT_EDGES)
+        android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams();
+        lp.type = 2017;
+        lp.width = 1224;
+        lp.height = 2912;
+        lp.x = -199;
+        lp.y = 0;
+        lp.gravity = android.view.Gravity.TOP;
+        lp.layoutInDisplayCutoutMode =
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+
+        // Upright cover (ROTATION_0): snaps to 1208x1392, TOP|START, CUTOUT_MODE_ALWAYS
+        assertTrue(AppCompatibility.normalizeVoiceAssistCoverHaloLayoutParams(lp, Surface.ROTATION_0));
+        assertEquals(CoverDisplay.WIDTH, lp.width);
+        assertEquals(CoverDisplay.HEIGHT, lp.height);
+        assertEquals(0, lp.x);
+        assertEquals(0, lp.y);
+        assertEquals(android.view.Gravity.TOP | android.view.Gravity.START, lp.gravity);
+        assertEquals(
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS,
+                lp.layoutInDisplayCutoutMode);
+        assertFalse(AppCompatibility.normalizeVoiceAssistCoverHaloLayoutParams(lp, Surface.ROTATION_0));
+
+        // Inverted cover (ROTATION_180): keeps 1208x1392, TOP|START, CUTOUT_MODE_ALWAYS
+        assertFalse(AppCompatibility.normalizeVoiceAssistCoverHaloLayoutParams(lp, Surface.ROTATION_180));
+        assertEquals(CoverDisplay.WIDTH, lp.width);
+        assertEquals(CoverDisplay.HEIGHT, lp.height);
+
+        // Landscape cover (ROTATION_90): swaps to 1392x1208
+        assertTrue(AppCompatibility.normalizeVoiceAssistCoverHaloLayoutParams(lp, Surface.ROTATION_90));
+        assertEquals(CoverDisplay.HEIGHT, lp.width);
+        assertEquals(CoverDisplay.WIDTH, lp.height);
+
+        // Unfolding back to inner screen (1224x2912 at ROTATION_0): restores 1224x2912 stock params
+        assertTrue(AppCompatibility.restoreVoiceAssistInnerHaloLayoutParams(lp, 1224, 2912, Surface.ROTATION_0));
+        assertEquals(1224, lp.width);
+        assertEquals(2912, lp.height);
+        assertEquals(android.view.Gravity.TOP, lp.gravity);
+        assertEquals(
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES,
+                lp.layoutInDisplayCutoutMode);
+        // Once restored to inner dimensions, repeated calls are no-ops
+        assertFalse(AppCompatibility.restoreVoiceAssistInnerHaloLayoutParams(lp, 1224, 2912, Surface.ROTATION_0));
+    }
+
+    @Test
+    public void weTypeInnerUnfoldSanitization_andSelfDrawKeyWidthStalenessDetection() {
+        // 1. During HyperOS's ~50ms unfold transition before ActivityThread.updateSizeCompatBounds(null),
+        // Display.getRealMetrics() can return cover-clamped 810x1392 @ 340dpi (or 0.8x 1011x1740 @ 416dpi)
+        // even though Display.Mode already reports physical 1224x2912.
+        android.util.DisplayMetrics clampedRot0 = new android.util.DisplayMetrics();
+        clampedRot0.widthPixels = 810;
+        clampedRot0.heightPixels = 1392;
+        clampedRot0.densityDpi = 340;
+        clampedRot0.density = 340 / 160f;
+        clampedRot0.scaledDensity = clampedRot0.density * 1.1f;
+
+        assertTrue(AppCompatibility.sanitizeInnerRealMetrics(
+                clampedRot0, 1224, 2912, Surface.ROTATION_0, 520));
+        assertEquals(1224, clampedRot0.widthPixels);
+        assertEquals(2912, clampedRot0.heightPixels);
+        assertEquals(520, clampedRot0.densityDpi);
+        assertEquals(520 / 160f, clampedRot0.density, 0.001f);
+        assertEquals((520 / 160f) * 1.1f, clampedRot0.scaledDensity, 0.001f);
+
+        // Landscape inner screen (ROTATION_90) synthesizes 2912x1224
+        android.util.DisplayMetrics clampedCompat = new android.util.DisplayMetrics();
+        clampedCompat.widthPixels = 1011;
+        clampedCompat.heightPixels = 1740;
+        clampedCompat.densityDpi = 416;
+        clampedCompat.density = 416 / 160f;
+        clampedCompat.scaledDensity = clampedCompat.density;
+
+        assertTrue(AppCompatibility.sanitizeInnerRealMetrics(
+                clampedCompat, 1224, 2912, Surface.ROTATION_90, 520));
+        assertEquals(2912, clampedCompat.widthPixels);
+        assertEquals(1224, clampedCompat.heightPixels);
+        assertEquals(520, clampedCompat.densityDpi);
+
+        // Valid inner metrics (including custom user DPI like 460) must be left untouched
+        android.util.DisplayMetrics healthyInner = new android.util.DisplayMetrics();
+        healthyInner.widthPixels = 1224;
+        healthyInner.heightPixels = 2912;
+        healthyInner.densityDpi = 460;
+        healthyInner.density = 460 / 160f;
+        healthyInner.scaledDensity = healthyInner.density;
+        assertFalse(AppCompatibility.sanitizeInnerRealMetrics(
+                healthyInner, 1224, 2912, Surface.ROTATION_0, 520));
+        assertEquals(460, healthyInner.densityDpi);
+
+        // 2. Full-row self-draw keyboard class filter (includes Qwerty/T9/Number/Symbol, excludes S11EmojiKeyboard & HandWrite)
+        assertTrue(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S2ChineseQwertyKeyboard"));
+        assertTrue(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S1ChineseT9Keyboard"));
+        assertTrue(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S3EnglishQwertyKeyboard"));
+        assertTrue(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S4NumberKeyboard"));
+        assertFalse(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S11EmojiKeyboard"));
+        assertFalse(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.keyboard.selfdraw.HandWriteFullScreenKeyboard"));
+        assertFalse(AppCompatibility.isFullRowWeTypeSelfDrawKeyboardClass(
+                "com.tencent.wetype.plugin.hld.symbol.ImeSymbolKeyboardView"));
+
+        // 3. Laid-out key row width (selfdraw.o.N) vs expected keyboard width (m1.I0):
+        // Stale 810px keys inside 1224px inner keyboard -> stale
+        assertTrue(AppCompatibility.isWeTypeLaidOutKeyWidthStale(806, 1224));
+        assertTrue(AppCompatibility.isWeTypeLaidOutKeyWidthStale(810, 1208));
+        assertTrue(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1204, 810));
+        // Healthy inner full-width (rounding diff <= 24px) -> not stale
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1208, 1224));
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1224, 1224));
+        // Healthy one-handed mode on inner screen (both m1.I0 and o.N shrink together) -> not stale
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(952, 960));
+        // Healthy cover ROTATION_0 and ROTATION_180 -> not stale
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(802, 810));
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1196, 1208));
+    }
 }

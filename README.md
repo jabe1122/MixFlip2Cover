@@ -33,13 +33,13 @@
 | 外屏状态圈 | 在外屏镜头上方显示紧凑的时间、电量环（可选电量百分比与充满插头）、单/双卡信号、充电、飞行模式、热点等状态，颜色跟随系统深浅色；应用请求全屏（如相机）时自动隐藏。 |
 | 超级岛与小组件适配 | 超级岛焦点通知与官方柔光玻璃小组件共用状态圈下方的方形区域，保留原生层级、点击和滑动，固定比例内容等比缩放适配。 |
 | 小组件固定常用应用 | 支持将外屏 2×2 应用图标小组件（最近任务小组件）自定义固定最多 **4 个常用应用**；按勾选顺序排列，未满 4 个时自动用不重复的最近任务补齐，无后台时亦常驻显示，支持实时同步与原生动画直接启动。 |
-| 外屏桌面与通知手势 | 状态圈与首排图标对齐，五排对称图标网格，支持隐藏桌面应用名称；顶部左 1/3 下拉通知栏，右 2/3 下拉控制中心；消除外屏下拉通知栏顶栏与悬浮弹出通知（Heads-Up）的顶部状态栏留白。 |
+| 外屏桌面与通知手势 | 状态圈与首排图标对齐，五排对称图标网格，支持隐藏桌面应用名称；顶部左 1/3 下拉通知栏、右 2/3 下拉控制中心（倒置握持时避开左上角摄像头，中间 1/3 下拉通知栏、最右 1/3 下拉控制中心）；消除外屏下拉通知栏顶栏与悬浮弹出通知（Heads-Up）的顶部状态栏留白。 |
 | 键盘自动避让 | 弹出键盘重叠时，状态圈与方形卡片自动隐藏，收起键盘后自动恢复。 |
 | 外屏打开所有应用（默认开启，可关） | 解除系统“展开内屏继续操作”限制，允许在外屏直接打开系统设置等被拦截的应用。 |
 | 外屏通知直接打开（默认开启，可关） | 解除外屏点击通知弹出“在内屏查看”的限制，直接在外屏打开对应应用。 |
 | 原生外屏适配页面保留 | 对声明了 `miui.supportFlipFullScreen=0` 的页面（如网易云音乐外屏播放页）保留其原生布局、真实挖孔和原始像素密度。 |
-| 深度应用兼容 | 针对超级小爱（外屏唤醒全屏铺满与镜头/状态圈避让）、微信、QQ、美团、小米商城、小米运动健康、网易云音乐、系统日历、系统设置等应用的顶栏/底栏与外屏布局专项适配。 |
-| 外屏微信输入法适配（可选，**默认关闭**） | 专门针对微信输入法（WeType 4.0.x）适配外屏高度、摄像头半圆避让与留白，并绕过系统强制切换搜狗输入法。 |
+| 深度应用兼容 | 针对超级小爱（外屏唤醒全屏铺满、呼出光环贴合外屏边框及镜头/状态圈避让）、微信、QQ、美团、小米商城、小米运动健康、网易云音乐、系统日历、系统设置等应用的顶栏/底栏与外屏布局专项适配。 |
+| 外屏微信输入法适配（可选，**默认关闭**） | 专门针对微信输入法（WeType 4.0.x）适配外屏正/倒置握持高度、左上/右下摄像头避让与展开内屏全宽恢复，并绕过系统强制切换搜狗输入法。 |
 
 ## 环境要求
 
@@ -120,10 +120,10 @@ An LSPosed module (libxposed API 101) that enhances the **Xiaomi MIX Flip 2** (`
 - **Cover Status Orb:** Compact status orb above the cameras showing time, battery ring (optional percentage & full-charge plug), single/dual-SIM signal dots, charging, airplane mode, and hotspot, following system light/dark themes.
 - **Super Island & Widget Adaptation:** Fits HyperOS focus notifications (Super Island) and stock frosted-glass widgets into the square area below the status orb.
 - **Pin Favorite Apps in Cover Widget:** Customize the 2×2 cover app-icon widget (`RecentTaskView`) by pinning up to **4 favorite apps** in your chosen order; unfilled slots auto-fill with non-duplicate recent tasks, and pinned icons stay visible even when recents are empty, with live sync and native launch animations.
-- **Cover Launcher, Gestures & Compact Notifications:** Five-row symmetric icon grid aligned with the status orb, optional app label hiding, split top pull-down (left 1/3 for notifications, right 2/3 for Control Center), and top status-bar blank-space removal for both the pulled-down Notification Shade and Heads-Up pop-up notifications.
+- **Cover Launcher, Gestures & Compact Notifications:** Five-row symmetric icon grid aligned with the status orb, optional app label hiding, rotation-aware top pull-down (upright: left 1/3 notifications, right 2/3 Control Center; inverted: middle 1/3 notifications, rightmost 1/3 Control Center), and top status-bar blank-space removal for both the pulled-down Notification Shade and Heads-Up pop-up notifications.
 - **App & Notification Unblocking:** Opens restricted apps (such as Settings) and notification taps directly on the cover screen without the "unfold / view on inner screen" prompt (enabled by default, configurable).
 - **Native Cover Layouts Preserved:** Activities declaring `miui.supportFlipFullScreen=0` (e.g., NetEase Cloud Music cover player) keep their native layout, cutout, and density.
-- **Deep App & WeType Keyboard Adaptation:** Fullscreen cover overlay & camera/orb avoidance for Super XiaoAi (`com.miui.voiceassist`), dedicated layout adapters for WeChat, QQ, Meituan, Xiaomi Shop, Mi Fitness, NetEase Cloud Music, Calendar, and Settings (discoverable via the in-app *Filter deep-fit apps* guide; regular apps need no manual scope), plus optional cover keyboard adaptation for WeChat Input Method (`WeType` 4.0.x, off by default).
+- **Deep App & WeType Keyboard Adaptation:** Fullscreen cover overlay, border halo alignment, and camera/orb avoidance for Super XiaoAi (`com.miui.voiceassist`), dedicated layout adapters for WeChat, QQ, Meituan, Xiaomi Shop, Mi Fitness, NetEase Cloud Music, Calendar, and Settings (discoverable via the in-app *Filter deep-fit apps* guide; regular apps need no manual scope), plus optional cover keyboard adaptation for WeChat Input Method (`WeType` 4.0.x, off by default).
 
 **Install:** Install the APK, enable the module in LSPosed (core scopes `system`, `com.android.systemui`, `com.miui.fliphome`, and `com.miui.voiceassist` are preset), reboot, and verify that the app reports "Running".
 

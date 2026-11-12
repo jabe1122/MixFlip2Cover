@@ -27,6 +27,10 @@ final class CoverDisplay {
     static final int CAMERA_TOP = 664;
     /** Safe inset width/depth (px) of the rear camera cutout block (1208 - 810 = 398). */
     static final int CAMERA_CUTOUT_INSET = WIDTH - CAMERA_LEFT;
+    /** Cover hinge-edge rounded corner radius (px) from bixi DevicesAndroidOverlay (rounded_corner_radius_bottom). */
+    static final int OUTER_HINGE_CORNER_RADIUS_PX = 50;
+    /** Cover outer-bezel rounded corner radius (px) from bixi DevicesAndroidOverlay (rounded_corner_radius_top). */
+    static final int OUTER_FRAME_CORNER_RADIUS_PX = 130;
     /** Cover third-party IME density in ROTATION_0 (810 px column left of the bottom-right camera). */
     static final int IME_DENSITY_DPI_ROT0 = 340;
     /** Cover third-party IME density in ROTATION_180 / landscape (full 1208 px width, matching native SogouIME). */
@@ -120,15 +124,32 @@ final class CoverDisplay {
         return rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180;
     }
 
-    /** Horizontal boundary (px) between the left 1/3 notification pull zone and right 2/3 control center pull zone. */
+    /** Horizontal boundary (px) between the notification pull zone and the Control Center pull zone. */
     static float controlCenterSplitX(int displayWidth) {
+        return controlCenterSplitX(displayWidth, Surface.ROTATION_0);
+    }
+
+    /**
+     * Rotation-aware horizontal boundary (px) between the notification pull zone and Control Center pull zone.
+     * - Upright cover (ROTATION_0, camera at bottom-right): left 1/3 notifications, right 2/3 Control Center.
+     * - Inverted cover (ROTATION_180, camera at top-left [0..398]): middle 1/3 notifications, rightmost 1/3 Control Center.
+     */
+    static float controlCenterSplitX(int displayWidth, int rotation) {
         int width = displayWidth > 0 ? displayWidth : WIDTH;
+        if (rotation == Surface.ROTATION_180) {
+            return (width * 2f) / 3f;
+        }
         return width / 3f;
     }
 
-    /** Returns true when rawX is in the right 2/3 top pull zone that opens the Control Center. */
+    /** Returns true when rawX is in the top pull zone that opens the Control Center (upright ROTATION_0 default). */
     static boolean isControlCenterPull(float rawX, int displayWidth) {
-        return rawX >= controlCenterSplitX(displayWidth);
+        return isControlCenterPull(rawX, displayWidth, Surface.ROTATION_0);
+    }
+
+    /** Returns true when rawX is in the top pull zone that opens the Control Center for the given rotation. */
+    static boolean isControlCenterPull(float rawX, int displayWidth, int rotation) {
+        return rawX >= controlCenterSplitX(displayWidth, rotation);
     }
 
     /**
@@ -159,6 +180,13 @@ final class CoverDisplay {
     /** Display height in the given cover rotation. */
     static int coverImeDisplayHeight(int rotation) {
         return isPortraitRotation(rotation) ? HEIGHT : WIDTH;
+    }
+
+    static boolean isCoverImeWidth(int width) {
+        return width == CAMERA_LEFT
+                || width == WIDTH
+                || width == CAMERA_TOP
+                || width == HEIGHT;
     }
 
     /**
@@ -251,6 +279,54 @@ final class CoverDisplay {
             case Surface.ROTATION_270 -> new android.view.DisplayCutout(safeInsets, null, null, null, rect);
             default -> new android.view.DisplayCutout(safeInsets, null, null, rect, null);
         };
+    }
+
+    /**
+     * Physical rounded corner radius (px) of the cover panel at {@code position}
+     * ({@code RoundedCorner.POSITION_TOP_LEFT=0 .. POSITION_BOTTOM_LEFT=3}) for the given rotation.
+     *
+     * On MIX Flip 2 ({@code installOrientation = ROTATION_180}), {@code mRoundedCorners} on {@code displayId=0}
+     * reports {@code radius=0} for all corners, causing callers such as Super XiaoAi's {@code PowerAnimConfigHelper}
+     * to fall back to unrotated {@code rounded_corner_radius_top=130px} / {@code rounded_corner_radius_bottom=50px}
+     * (which matches inverted {@code ROTATION_180} where the outer frame is on top, but is upside-down in upright
+     * {@code ROTATION_0} where the 50 px hinge edge is on top and the 130 px outer bezel is at the bottom).
+     */
+    static int outerCornerRadius(int rotation, int position) {
+        if (position < 0 || position > 3) return 0;
+        int r = switch (rotation) {
+            case Surface.ROTATION_90 -> 1;
+            case Surface.ROTATION_180 -> 2;
+            case Surface.ROTATION_270 -> 3;
+            default -> 0;
+        };
+        int uprightIndex = (position + r) & 3;
+        return (uprightIndex == 0 || uprightIndex == 1)
+                ? OUTER_HINGE_CORNER_RADIUS_PX
+                : OUTER_FRAME_CORNER_RADIUS_PX;
+    }
+
+    /** Returns {@code [topLeft, topRight, bottomRight, bottomLeft]} cover corner radii (px) for {@code rotation}. */
+    static int[] outerCornerRadii(int rotation) {
+        return new int[]{
+                outerCornerRadius(rotation, 0),
+                outerCornerRadius(rotation, 1),
+                outerCornerRadius(rotation, 2),
+                outerCornerRadius(rotation, 3)
+        };
+    }
+
+    /** Builds a physical cover {@link android.view.RoundedCorner} for {@code (rotation, position)}. */
+    static android.view.RoundedCorner buildOuterRoundedCorner(int rotation, int position) {
+        int r = outerCornerRadius(rotation, position);
+        if (r <= 0) return null;
+        boolean portrait = isPortraitRotation(rotation);
+        int w = portrait ? WIDTH : HEIGHT;
+        int h = portrait ? HEIGHT : WIDTH;
+        int cx = (position == android.view.RoundedCorner.POSITION_TOP_LEFT
+                || position == android.view.RoundedCorner.POSITION_BOTTOM_LEFT) ? r : (w - r);
+        int cy = (position == android.view.RoundedCorner.POSITION_TOP_LEFT
+                || position == android.view.RoundedCorner.POSITION_TOP_RIGHT) ? r : (h - r);
+        return new android.view.RoundedCorner(position, r, cx, cy);
     }
 
     static boolean isOuterPortrait(Display display) {

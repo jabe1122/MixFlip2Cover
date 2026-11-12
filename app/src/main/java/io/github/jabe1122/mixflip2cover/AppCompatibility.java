@@ -56,6 +56,14 @@ final class AppCompatibility {
     private static volatile java.lang.reflect.Method wcGetMaxBoundsMethod;
     private static volatile java.lang.reflect.Method wcGetBoundsMethod;
     private static volatile java.lang.reflect.Method getFlipFoldedCutoutMethod;
+    private static volatile java.lang.reflect.Field lpMiuiAlwaysDisplayInCutoutField;
+    private static volatile int lpMiuiAlwaysDisplayInCutoutState;
+    private static volatile Object cachedWindowManagerGlobal;
+    private static volatile java.lang.reflect.Method wmgUpdateViewLayoutMethod;
+    private static volatile boolean voiceAssistHaloSyncPending;
+    private static final Map<View, WindowManager.LayoutParams> voiceAssistHaloViews =
+            Collections.synchronizedMap(new WeakHashMap<>());
+    private static final ThreadLocal<Boolean> updatingVoiceAssistHaloLayout = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> resolvingDisplayCutout = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> dispatchingCompatWindowInsets = new ThreadLocal<>();
     private static final Set<Resources> compatActivityResources =
@@ -67,7 +75,10 @@ final class AppCompatibility {
     private static volatile boolean imeCoverActive;
     /** Resources.getDisplayMetrics/getConfiguration hooks are only needed by IMEs and natively adapted apps. */
     private static volatile boolean metricsHooksNeeded;
-    private static volatile int lastImeAdaptedWidth = -1;
+    /** 0 when not cover-adapted (inner screen); >0 holds the last cover pixel width applied to WeType. */
+    private static volatile int lastImeAdaptedWidth = 0;
+    /** Set whenever WeType observes the cover display; cleared once inner-screen cache reset completes. */
+    private static volatile boolean weTypeNeedsInnerReset;
     private static String packageName = "";
     private static long packageVersionCode = -1;
     private static final WeakHashMap<Activity, State> states = new WeakHashMap<>();
@@ -160,8 +171,10 @@ final class AppCompatibility {
 
     /** NetEase Cloud Music builds whose obfuscated MiMiniPlayerActivity.H8() was verified (9.6.x). */
     private static final long NETEASE_MIN = 9006000L, NETEASE_MAX_EXCLUSIVE = 9007000L;
-    /** WeChat Input Method builds whose obfuscated layout cache (utils.m1) was verified (4.0.x). */
-    private static final long WETYPE_MIN = 58000L, WETYPE_MAX_EXCLUSIVE = 59000L;
+    /** WeChat Input Method builds whose obfuscated layout cache (utils.m1) was verified (4.0.0: 58xxx, 4.0.1: 59xxx). */
+    static final long WETYPE_V400_MIN = 58000L;
+    static final long WETYPE_V401_MIN = 59000L;
+    static final long WETYPE_MIN = WETYPE_V400_MIN, WETYPE_MAX_EXCLUSIVE = 60000L;
 
     private static XposedModule hookModule;
     private static volatile boolean packageInspected;
@@ -222,6 +235,7 @@ final class AppCompatibility {
         }
         if (ime) {
             installImeClientHooks(hookModule);
+            registerImeDisplayListener(c);
         }
         if (voiceAssistProcess) {
             Context appCtx = c.getApplicationContext() != null ? c.getApplicationContext() : c;
@@ -235,6 +249,38 @@ final class AppCompatibility {
 
     private static boolean versionIn(long min, long maxExclusive) {
         return packageVersionCode >= min && packageVersionCode < maxExclusive;
+    }
+
+    static boolean isSupportedWeTypeM1Version(long versionCode) {
+        return versionCode >= WETYPE_MIN && versionCode < WETYPE_MAX_EXCLUSIVE;
+    }
+
+    static boolean isWeTypeV401(long versionCode) {
+        return versionCode >= WETYPE_V401_MIN && versionCode < WETYPE_MAX_EXCLUSIVE;
+    }
+
+    static String weTypeUpdateResourceLayoutMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "f3" : "h3";
+    }
+
+    static String weTypeModeFlowMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "h3" : "j3";
+    }
+
+    static String weTypeRebuildAllMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "c2" : "e2";
+    }
+
+    static String weTypeResetDataCacheMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "g2" : "i2";
+    }
+
+    static String weTypeDefaultBodyHeightMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "k0" : "j0";
+    }
+
+    static String weTypeSelfDrawScaleMethod(long versionCode) {
+        return isWeTypeV401(versionCode) ? "B2" : "F2";
     }
 
     static boolean isModuleOverriddenMetrics(android.util.DisplayMetrics dm) {
@@ -331,14 +377,66 @@ final class AppCompatibility {
         }
     }
 
+    private static void copyConfig(android.content.res.Configuration dst, android.content.res.Configuration src) {
+        if (dst == null || src == null) return;
+        dst.setTo(src);
+        dst.densityDpi = src.densityDpi;
+        dst.screenWidthDp = src.screenWidthDp;
+        dst.screenHeightDp = src.screenHeightDp;
+        dst.smallestScreenWidthDp = src.smallestScreenWidthDp;
+        dst.orientation = src.orientation;
+    }
+
     /** Remembers the latest system-provided Configuration before it is overwritten in place. */
     static void rememberConfig(android.content.res.Configuration cfg) {
         if (cfg == null) return;
         synchronized (overriddenOriginals) {
             if (!isModuleOverriddenConfig(cfg)) {
-                overriddenOriginals.put(cfg, new android.content.res.Configuration(cfg));
+                android.content.res.Configuration copy = new android.content.res.Configuration(cfg);
+                copyConfig(copy, cfg);
+                overriddenOriginals.put(cfg, copy);
             }
         }
+    }
+
+    /**
+     * Synthesizes true inner-screen DisplayMetrics from hardware Display.Mode dimensions when HyperOS
+     * ActivityThread.sizeCompatBounds momentarily clamps Display.getRealMetrics() to cover bounds (e.g. 810x1392)
+     * during the ~50ms unfold transition window before updateSizeCompatBounds(null) executes on the main Looper.
+     */
+    static boolean sanitizeInnerRealMetrics(
+            android.util.DisplayMetrics real, int modePhysW, int modePhysH, int rotation, int fallbackDpi) {
+        if (real == null) return false;
+        boolean clampedOrInvalid = real.widthPixels <= 0
+                || real.heightPixels <= 0
+                || isCoverSizedMetrics(real)
+                || Math.max(real.widthPixels, real.heightPixels) < INNER_DISPLAY_MIN_LONG_EDGE;
+        if (!clampedOrInvalid || modePhysW <= 0 || modePhysH <= 0) {
+            return false;
+        }
+        int shortSide = Math.min(modePhysW, modePhysH);
+        int longSide = Math.max(modePhysW, modePhysH);
+        if (longSide < INNER_DISPLAY_MIN_LONG_EDGE) {
+            return false;
+        }
+        boolean portrait = CoverDisplay.isPortraitRotation(rotation);
+        float fontScale = real.density > 0 && real.scaledDensity > 0
+                ? real.scaledDensity / real.density : 1f;
+        real.widthPixels = portrait ? shortSide : longSide;
+        real.heightPixels = portrait ? longSide : shortSide;
+        int compatScaledDpi = Math.round(CoverDisplay.DENSITY_DPI * 0.8f);
+        if (real.densityDpi <= 0
+                || real.densityDpi == CoverDisplay.IME_DENSITY_DPI_ROT0
+                || real.densityDpi == CoverDisplay.IME_DENSITY_DPI_WIDE
+                || real.densityDpi == compatScaledDpi) {
+            int dpi = fallbackDpi > 0 ? fallbackDpi : CoverDisplay.DENSITY_DPI;
+            real.densityDpi = dpi;
+            real.density = dpi / 160f;
+            real.scaledDensity = real.density * fontScale;
+            if (real.xdpi <= 0f) real.xdpi = dpi;
+            if (real.ydpi <= 0f) real.ydpi = dpi;
+        }
+        return true;
     }
 
     private static android.util.DisplayMetrics queryInnerRealMetrics() {
@@ -347,15 +445,66 @@ final class AppCompatibility {
             if (d != null && !CoverDisplay.isOuterDisplay(d)) {
                 android.util.DisplayMetrics real = new android.util.DisplayMetrics();
                 d.getRealMetrics(real);
-                if (real.widthPixels > 0 && real.heightPixels > 0) return real;
+                int physW = 0;
+                int physH = 0;
+                Display.Mode mode = d.getMode();
+                if (mode != null) {
+                    physW = mode.getPhysicalWidth();
+                    physH = mode.getPhysicalHeight();
+                }
+                int rot = getLiveImeDisplayRotation(false);
+                if (rot < 0) rot = d.getRotation();
+                int sysDpi = 0;
+                try {
+                    int d0 = Resources.getSystem().getConfiguration().densityDpi;
+                    if (d0 > 0
+                            && d0 != CoverDisplay.IME_DENSITY_DPI_ROT0
+                            && d0 != CoverDisplay.IME_DENSITY_DPI_WIDE
+                            && d0 != Math.round(CoverDisplay.DENSITY_DPI * 0.8f)) {
+                        sysDpi = d0;
+                    }
+                } catch (Throwable ignored) {
+                }
+                int fallbackDpi = sysDpi > 0 ? sysDpi
+                        : (android.util.DisplayMetrics.DENSITY_DEVICE_STABLE > 0
+                                ? android.util.DisplayMetrics.DENSITY_DEVICE_STABLE
+                                : CoverDisplay.DENSITY_DPI);
+                sanitizeInnerRealMetrics(real, physW, physH, rot, fallbackDpi);
+                if (real.widthPixels > 0 && real.heightPixels > 0 && !isCoverSizedMetrics(real)) {
+                    return real;
+                }
             }
         } catch (Throwable ignored) {
         }
         return null;
     }
 
+    private static void applyInnerRealToMetrics(
+            android.util.DisplayMetrics dm, android.util.DisplayMetrics innerReal) {
+        if (dm == null || innerReal == null) return;
+        float fontScale = dm.density > 0 && dm.scaledDensity > 0 ? dm.scaledDensity / dm.density : 1f;
+        copyMetrics(dm, innerReal);
+        dm.scaledDensity = dm.density * fontScale;
+    }
+
+    private static void applyInnerRealToConfig(
+            android.content.res.Configuration cfg, android.util.DisplayMetrics innerReal) {
+        if (cfg == null || innerReal == null || innerReal.densityDpi <= 0) return;
+        int wDp = Math.round(innerReal.widthPixels * 160f / innerReal.densityDpi);
+        int hDp = Math.round(innerReal.heightPixels * 160f / innerReal.densityDpi);
+        cfg.densityDpi = innerReal.densityDpi;
+        cfg.screenWidthDp = wDp;
+        cfg.screenHeightDp = hDp;
+        cfg.smallestScreenWidthDp = Math.min(wDp, hDp);
+        cfg.orientation = innerReal.widthPixels <= innerReal.heightPixels
+                ? android.content.res.Configuration.ORIENTATION_PORTRAIT
+                : android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        setWindowBounds(cfg, new Rect(0, 0, innerReal.widthPixels, innerReal.heightPixels));
+    }
+
     /** Restores every DisplayMetrics/Configuration still holding a module override. */
     static void restoreOverrides(boolean nowOnCover) {
+        lastImeBoundsRotation = -1;
         if (overriddenOriginals.isEmpty()) return;
         android.util.DisplayMetrics innerReal = nowOnCover ? null : queryInnerRealMetrics();
         boolean restored = false;
@@ -367,12 +516,7 @@ final class AppCompatibility {
                             && e.getValue() instanceof android.util.DisplayMetrics orig) {
                         if (!isModuleOverriddenMetrics(dm)) continue;
                         if (!nowOnCover && isCoverSizedMetrics(orig)) {
-                            if (innerReal != null) {
-                                float fontScale = dm.density > 0 && dm.scaledDensity > 0
-                                        ? dm.scaledDensity / dm.density : 1f;
-                                copyMetrics(dm, innerReal);
-                                dm.scaledDensity = dm.density * fontScale;
-                            }
+                            applyInnerRealToMetrics(dm, innerReal);
                         } else {
                             copyMetrics(dm, orig);
                         }
@@ -380,17 +524,9 @@ final class AppCompatibility {
                             && e.getValue() instanceof android.content.res.Configuration orig) {
                         if (!isModuleOverriddenConfig(cfg)) continue;
                         if (!nowOnCover && isCoverSizedConfig(orig)) {
-                            if (innerReal != null && innerReal.densityDpi > 0) {
-                                int wDp = Math.round(innerReal.widthPixels * 160f / innerReal.densityDpi);
-                                int hDp = Math.round(innerReal.heightPixels * 160f / innerReal.densityDpi);
-                                cfg.densityDpi = innerReal.densityDpi;
-                                cfg.screenWidthDp = wDp;
-                                cfg.screenHeightDp = hDp;
-                                cfg.smallestScreenWidthDp = Math.min(wDp, hDp);
-                                setWindowBounds(cfg, new Rect(0, 0, innerReal.widthPixels, innerReal.heightPixels));
-                            }
+                            applyInnerRealToConfig(cfg, innerReal);
                         } else {
-                            cfg.setTo(orig);
+                            copyConfig(cfg, orig);
                         }
                     }
                 } catch (Throwable ignored) {
@@ -935,7 +1071,7 @@ final class AppCompatibility {
                         Object cfgArg = chain.getArg(0);
                         if (cfgArg instanceof android.content.res.Configuration cfg && isImeOnCoverDisplay(ctx)
                                 && ModuleConfig.coverThirdPartyImeEnabled()) {
-                            adaptImeConfig(cfg, getDisplayRotation(ctx));
+                            adaptImeConfig(cfg, getDisplayRotation(ctx, true));
                         }
                         adaptImeServiceContextAndWindow(ctx, false);
                     }
@@ -987,7 +1123,7 @@ final class AppCompatibility {
                                 && isImeOnCoverDisplay(ctx)) {
                             Object outInsets = chain.getArg(0);
                             if (outInsets != null) {
-                                int rot = getDisplayRotation(ctx);
+                                int rot = getDisplayRotation(ctx, true);
                                 int minTop = CoverDisplay.coverImeMinTop(rot);
                                 if (minTop > 0) {
                                     int ct = contentTopField.getInt(outInsets);
@@ -1029,8 +1165,11 @@ final class AppCompatibility {
     }
 
     private static volatile Object dmgInstance;
-    private static volatile java.lang.reflect.Method dmgGetDisplayInfoMethod;
-    private static volatile java.lang.reflect.Field displayInfoRotationField;
+    private static volatile Object wmsInstance;
+    private static volatile java.lang.reflect.Method wmsGetDefaultDisplayRotationMethod;
+    private static volatile int liveImeDisplayRotation = -1;
+    private static volatile long liveImeDisplayRotationUptimeMs;
+    private static volatile boolean imeDisplayListenerRegistered;
     private static volatile java.lang.reflect.Method wcGetDisplayRotationMethod;
     private static volatile java.lang.reflect.Method wcGetRotationMethod;
 
@@ -1062,54 +1201,203 @@ final class AppCompatibility {
         return -1;
     }
 
+    /**
+     * Queries DisplayContent(DEFAULT_DISPLAY).getRotation() directly from WindowManagerService via
+     * IWindowManager.getDefaultDisplayRotation(). Unlike DisplayManagerGlobal.getDisplayInfo(0) on HyperOS 4 (whose
+     * client-side DisplayInfo cache can report rotation = 0 while DisplayContent(0) is in ROTATION_180), WMS always
+     * reflects the true logical rotation (2 in ROTATION_180, 0 in ROTATION_0).
+     */
+    private static int queryWindowManagerRotation() {
+        try {
+            Object wms = wmsInstance;
+            if (wms == null) {
+                wms = Class.forName("android.view.WindowManagerGlobal")
+                        .getDeclaredMethod("getWindowManagerService")
+                        .invoke(null);
+                wmsInstance = wms;
+            }
+            if (wms != null) {
+                java.lang.reflect.Method m = wmsGetDefaultDisplayRotationMethod;
+                if (m == null) {
+                    m = Class.forName("android.view.IWindowManager")
+                            .getMethod("getDefaultDisplayRotation");
+                    wmsGetDefaultDisplayRotationMethod = m;
+                }
+                int r = (Integer) m.invoke(wms);
+                if (r >= 0) {
+                    liveImeDisplayRotation = r;
+                    liveImeDisplayRotationUptimeMs = android.os.SystemClock.uptimeMillis();
+                    return r;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static int getLiveImeDisplayRotation(boolean forceRefresh) {
+        long now = android.os.SystemClock.uptimeMillis();
+        int cached = liveImeDisplayRotation;
+        if (!forceRefresh && cached >= 0 && (now - liveImeDisplayRotationUptimeMs) < 150L) {
+            return cached;
+        }
+        return queryWindowManagerRotation();
+    }
+
     private static int getDisplayRotation(Context ctx) {
-        int candidate = -1;
+        return getDisplayRotation(ctx, false);
+    }
+
+    /**
+     * Resolves the authoritative cover display rotation, preferring WindowManagerService's live default-display
+     * rotation (and Configuration.windowConfiguration.getDisplayRotation() as fallback) so both ROTATION_180 (2) and
+     * transitions back to ROTATION_0 (0) are tracked accurately.
+     */
+    private static int getDisplayRotation(Context ctx, boolean forceRefresh) {
+        int wmRot = getLiveImeDisplayRotation(forceRefresh);
+        if (wmRot >= 0) return wmRot;
         Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
         for (Context c : new Context[]{ctx, svc}) {
             if (c == null) continue;
             try {
                 int r = getConfigRotation(c.getResources().getConfiguration());
-                if (r > 0) return r;
-                if (r == 0) candidate = 0;
+                if (r >= 0) return r;
             } catch (Throwable ignored) {
             }
         }
         try {
             int r = getConfigRotation(Resources.getSystem().getConfiguration());
-            if (r > 0) return r;
-            if (r == 0) candidate = 0;
+            if (r >= 0) return r;
         } catch (Throwable ignored) {
         }
+        for (Context c : new Context[]{ctx, svc}) {
+            if (c == null) continue;
+            try {
+                Display d = c.getDisplay();
+                if (d != null) {
+                    int r = d.getRotation();
+                    if (r >= 0) return r;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return imeRotation >= 0 ? imeRotation : android.view.Surface.ROTATION_0;
+    }
+
+    private static void registerImeDisplayListener(Context ctx) {
+        if (ctx == null || imeDisplayListenerRegistered) return;
         try {
-            Object dmg = dmgInstance;
-            if (dmg == null) {
-                dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
-                        .getDeclaredMethod("getInstance").invoke(null);
-                dmgInstance = dmg;
-            }
-            if (dmg != null) {
-                java.lang.reflect.Method getInfo = dmgGetDisplayInfoMethod;
-                if (getInfo == null) {
-                    getInfo = dmg.getClass().getDeclaredMethod("getDisplayInfo", int.class);
-                    getInfo.setAccessible(true);
-                    dmgGetDisplayInfoMethod = getInfo;
-                }
-                Object di = getInfo.invoke(dmg, Display.DEFAULT_DISPLAY);
-                if (di != null) {
-                    java.lang.reflect.Field rotField = displayInfoRotationField;
-                    if (rotField == null) {
-                        rotField = di.getClass().getDeclaredField("rotation");
-                        rotField.setAccessible(true);
-                        displayInfoRotationField = rotField;
+            Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            DisplayManager dm = appCtx.getSystemService(DisplayManager.class);
+            if (dm == null) return;
+            WeakReference<Context> fallbackRef = new WeakReference<>(appCtx);
+            imeDisplayListenerRegistered = true;
+            dm.registerDisplayListener(new DisplayManager.DisplayListener() {
+                @Override
+                public void onDisplayAdded(int displayId) {
+                    if (displayId == Display.DEFAULT_DISPLAY) {
+                        onImeDisplayChanged(fallbackRef.get());
                     }
-                    int r = rotField.getInt(di);
-                    if (r > 0) return r;
-                    if (r == 0) candidate = 0;
+                }
+
+                @Override
+                public void onDisplayRemoved(int displayId) {
+                    if (displayId == Display.DEFAULT_DISPLAY) {
+                        onImeDisplayChanged(fallbackRef.get());
+                    }
+                }
+
+                @Override
+                public void onDisplayChanged(int displayId) {
+                    if (displayId == Display.DEFAULT_DISPLAY) {
+                        onImeDisplayChanged(fallbackRef.get());
+                    }
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (Throwable t) {
+            Log.w(TAG, "IME display listener skipped", t);
+        }
+    }
+
+    private static volatile boolean innerImeSettlementPending;
+
+    private static void scheduleInnerImeSettlement(Context fallbackCtx) {
+        if (innerImeSettlementPending) return;
+        innerImeSettlementPending = true;
+        WeakReference<Context> fallbackRef = fallbackCtx != null ? new WeakReference<>(fallbackCtx) : null;
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            innerImeSettlementPending = false;
+            try {
+                Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
+                Context targetCtx = svc != null ? svc : (fallbackRef != null ? fallbackRef.get() : null);
+                if (targetCtx == null || isImeOnCoverDisplay(targetCtx)) return;
+                if (svc != null) {
+                    adaptImeServiceContextAndWindow(svc, true);
+                } else if ("com.tencent.wetype".equals(packageName)) {
+                    refreshWeTypeCoverState(targetCtx);
+                    if (!imeCoverActive) {
+                        syncWeTypeResources(targetCtx);
+                        if (weTypeNeedsInnerReset || isWeTypeWidthCacheStaleForInner(targetCtx)) {
+                            updateWeTypeCache(targetCtx, 0);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }, 250L);
+    }
+
+    private static void onImeDisplayChanged(Context fallbackCtx) {
+        try {
+            int liveRot = queryWindowManagerRotation();
+            Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
+            Context targetCtx = svc != null ? svc : fallbackCtx;
+            if (targetCtx == null) return;
+            boolean wantCover = ModuleConfig.coverThirdPartyImeEnabled() && isImeOnCoverDisplay(targetCtx);
+            if (svc != null) {
+                boolean transitioningToInner = !wantCover
+                        && (imeCoverActive || lastImeAdaptedWidth > 0 || weTypeNeedsInnerReset);
+                if (wantCover != imeCoverActive
+                        || (wantCover && liveRot >= 0 && liveRot != imeRotation)
+                        || transitioningToInner) {
+                    adaptImeServiceContextAndWindow(svc, true);
+                    if (transitioningToInner) {
+                        scheduleInnerImeSettlement(svc);
+                    }
+                }
+            } else if ("com.tencent.wetype".equals(packageName)) {
+                boolean wasCover = imeCoverActive;
+                refreshWeTypeCoverState(targetCtx);
+                if (imeCoverActive) {
+                    syncWeTypeResources(targetCtx);
+                    int targetW = CoverDisplay.coverImeWidth(imeRotation);
+                    if (lastImeAdaptedWidth != targetW) {
+                        updateWeTypeCache(targetCtx, targetW);
+                    }
+                } else if (wasCover || lastImeAdaptedWidth > 0 || weTypeNeedsInnerReset) {
+                    lastImeBoundsRotation = -1;
+                    restoreOverrides(false);
+                    syncWeTypeResources(targetCtx);
+                    if (!isImeOnCoverDisplay(targetCtx)) {
+                        updateWeTypeCache(targetCtx, 0);
+                        scheduleInnerImeSettlement(targetCtx);
+                    }
                 }
             }
         } catch (Throwable ignored) {
         }
-        return candidate >= 0 ? candidate : android.view.Surface.ROTATION_0;
+    }
+
+    static int resolveImeRotationForConfig(
+            android.content.res.Configuration cfg, int liveDisplayRotation, int currentImeRotation) {
+        if (liveDisplayRotation >= 0) {
+            return liveDisplayRotation;
+        }
+        int cfgRot = getConfigRotation(cfg);
+        if (cfgRot >= 0) {
+            return cfgRot;
+        }
+        return currentImeRotation >= 0 ? currentImeRotation : android.view.Surface.ROTATION_0;
     }
 
     private static volatile int imeRotation;
@@ -1122,6 +1410,7 @@ final class AppCompatibility {
     private static volatile WeakReference<View> lastWeTypeAdaptedRootRef;
     private static volatile boolean rebuildingWeType;
     private static final WeakHashMap<View, android.graphics.drawable.Drawable> savedCandidateBackgrounds = new WeakHashMap<>();
+    private static final WeakHashMap<View, Integer> savedContainerWidths = new WeakHashMap<>();
     /**
      * Measured top-edge y-offsets (px relative to keyboard top y = 662) every 20 px across x = 0..400 from native
      * Xiaomi SogouIME's cover candidate bar (candidate_flip_bg.png) in ROTATION_180, forming the concave camera
@@ -1160,7 +1449,7 @@ final class AppCompatibility {
         }
     }
 
-    private static void adaptImeConfig(android.content.res.Configuration cfg, int rotation) {
+    static void adaptImeConfig(android.content.res.Configuration cfg, int rotation) {
         if (cfg == null) return;
         int dpi = CoverDisplay.coverImeDensityDpi(rotation);
         int widthDp = CoverDisplay.coverImeScreenWidthDp(rotation);
@@ -1187,16 +1476,25 @@ final class AppCompatibility {
         if (ctx == null) return;
         try {
             activeImeServiceRef = new WeakReference<>(ctx);
-            if ("com.tencent.wetype".equals(packageName)) {
-                ensureWeTypeCoverHooks(ctx);
-            }
+            registerImeDisplayListener(ctx);
+            boolean wasCover = imeCoverActive;
+            int prevAdaptedWidth = lastImeAdaptedWidth;
             boolean enabled = ModuleConfig.coverThirdPartyImeEnabled();
             boolean physicalOuter = isImeOnCoverDisplay(ctx);
+            if (physicalOuter) {
+                weTypeNeedsInnerReset = true;
+            }
             boolean outer = enabled && physicalOuter;
-            boolean wasCover = imeCoverActive;
+            int rotation = outer ? getDisplayRotation(ctx, true) : android.view.Surface.ROTATION_0;
             imeCoverActive = outer;
+            if (outer) {
+                imeRotation = rotation;
+            }
+            if ("com.tencent.wetype".equals(packageName)) {
+                ensureWeTypeCoverHooksInstalled(ctx);
+            }
             if (!outer) {
-                if (wasCover) {
+                if (wasCover || !overriddenOriginals.isEmpty() || (!physicalOuter && hasCoverSizedWeTypeResources(ctx))) {
                     lastImeBoundsRotation = -1;
                     restoreOverrides(physicalOuter);
                     syncWeTypeResources(ctx);
@@ -1219,11 +1517,20 @@ final class AppCompatibility {
                         imeWindowOverridden = false;
                     }
                 }
-                if (includeWindow && lastImeAdaptedWidth > 0) updateWeTypeCache(ctx, 0);
+                if ("com.tencent.wetype".equals(packageName)) {
+                    if (wasCover
+                            || prevAdaptedWidth > 0
+                            || (!physicalOuter && (weTypeNeedsInnerReset || isWeTypeWidthCacheStaleForInner(ctx)))) {
+                        updateWeTypeCache(ctx, 0);
+                    } else {
+                        View curRoot = lastWeTypeRootViewRef != null ? lastWeTypeRootViewRef.get() : null;
+                        if (curRoot != null) {
+                            applyWeTypeCoverLayoutState(curRoot);
+                        }
+                    }
+                }
                 return;
             }
-            int rotation = getDisplayRotation(ctx);
-            imeRotation = rotation;
             int targetWidth = CoverDisplay.coverImeWidth(rotation);
             int targetHeight = CoverDisplay.coverImeDisplayHeight(rotation);
             int targetDpi = CoverDisplay.coverImeDensityDpi(rotation);
@@ -1275,7 +1582,7 @@ final class AppCompatibility {
     }
 
     private static Resources getWeTypeResources(Context ctx, String methodName) {
-        if (!"com.tencent.wetype".equals(packageName) || !versionIn(WETYPE_MIN, WETYPE_MAX_EXCLUSIVE)) {
+        if (ctx == null || !"com.tencent.wetype".equals(packageName)) {
             return null;
         }
         try {
@@ -1286,16 +1593,209 @@ final class AppCompatibility {
         return null;
     }
 
+    private static boolean hasCoverSizedWeTypeResources(Context ctx) {
+        if (ctx == null || !"com.tencent.wetype".equals(packageName)) return false;
+        try {
+            for (Resources res : new Resources[]{
+                    ctx.getResources(),
+                    Resources.getSystem(),
+                    getWeTypeResources(ctx, "j"),
+                    getWeTypeResources(ctx, "g")}) {
+                if (res != null && isCoverSizedMetrics(res.getDisplayMetrics())) {
+                    return true;
+                }
+            }
+            Class<?> b7aClass = ctx.getClassLoader().loadClass("b7.a");
+            for (String fieldName : new String[]{"d", "e"}) {
+                java.lang.reflect.Field f = b7aClass.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                if (f.get(null) instanceof android.util.DisplayMetrics staticDm && isCoverSizedMetrics(staticDm)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static volatile long lastInnerStaleResetUptimeMs;
+    private static volatile Class<?> cachedWeTypeSelfDrawOClass;
+    private static volatile java.lang.reflect.Field cachedWeTypeSelfDrawONField;
+    private static volatile java.lang.reflect.Method cachedWeTypeGetKeyboardTypeMethod;
+    private static volatile Object cachedWeTypeM1Instance;
+    private static volatile java.lang.reflect.Method cachedWeTypeM1I0Method;
+    private static volatile java.lang.reflect.Method cachedWeTypeM1YMethod;
+    private static volatile WeakReference<View> lastRebuiltStaleKeyboardRef;
+
+    static boolean isFullRowWeTypeSelfDrawKeyboardClass(String className) {
+        if (className == null) return false;
+        final String prefix = "com.tencent.wetype.plugin.hld.keyboard.selfdraw.S";
+        if (!className.startsWith(prefix) || !className.endsWith("Keyboard")) {
+            return false;
+        }
+        return !"com.tencent.wetype.plugin.hld.keyboard.selfdraw.S11EmojiKeyboard".equals(className);
+    }
+
+    static boolean isWeTypeLaidOutKeyWidthStale(int laidOutRowWidth, int expectedKeyboardWidth) {
+        // Full-row self-drawn keyboards always span at least CoverDisplay.CAMERA_LEFT (~810px minus rounding);
+        // row-0 rounding vs m1.I0(t) is <= 24px (including in user one-handed mode where m1.I0(t) itself shrinks),
+        // whereas cover <-> inner or ROTATION_0 <-> ROTATION_180 staleness differs by >= 200..414px.
+        if (laidOutRowWidth < 720 || expectedKeyboardWidth < 720) {
+            return false;
+        }
+        return Math.abs(expectedKeyboardWidth - laidOutRowWidth) > 96;
+    }
+
+    private static boolean ensureWeTypeSelfDrawInspectors(ClassLoader cl) {
+        if (cl == null) return false;
+        if (cachedWeTypeSelfDrawONField != null
+                && cachedWeTypeGetKeyboardTypeMethod != null
+                && cachedWeTypeM1Instance != null
+                && cachedWeTypeM1I0Method != null
+                && cachedWeTypeM1YMethod != null) {
+            return true;
+        }
+        try {
+            Class<?> oCls = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.selfdraw.o");
+            java.lang.reflect.Field nField = oCls.getDeclaredField("N");
+            nField.setAccessible(true);
+            java.lang.reflect.Method getKbType = oCls.getMethod("getKeyboardType");
+            Class<?> tCls = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.t");
+            Class<?> m1Cls = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1");
+            Object m1Inst = m1Cls.getDeclaredField("a").get(null);
+            if (m1Inst == null) return false;
+            java.lang.reflect.Method i0Method = m1Cls.getDeclaredMethod("I0", tCls);
+            java.lang.reflect.Method yMethod = m1Cls.getDeclaredMethod("y", boolean.class);
+            cachedWeTypeSelfDrawOClass = oCls;
+            cachedWeTypeSelfDrawONField = nField;
+            cachedWeTypeGetKeyboardTypeMethod = getKbType;
+            cachedWeTypeM1Instance = m1Inst;
+            cachedWeTypeM1I0Method = i0Method;
+            cachedWeTypeM1YMethod = yMethod;
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static View findStaleWeTypeKeyboardInTree(View node, int coverTargetWidth) {
+        if (node == null || node.getVisibility() != View.VISIBLE) return null;
+        String clsName = node.getClass().getName();
+        if (isFullRowWeTypeSelfDrawKeyboardClass(clsName)) {
+            if (lastRebuiltStaleKeyboardRef != null && lastRebuiltStaleKeyboardRef.get() == node) {
+                return null;
+            }
+            ClassLoader cl = node.getClass().getClassLoader();
+            if (ensureWeTypeSelfDrawInspectors(cl)
+                    && cachedWeTypeSelfDrawOClass != null
+                    && cachedWeTypeSelfDrawOClass.isInstance(node)) {
+                try {
+                    int laidOutW = cachedWeTypeSelfDrawONField.getInt(node);
+                    if (laidOutW > 0) {
+                        if (coverTargetWidth > 0) {
+                            Object yObj = cachedWeTypeM1YMethod.invoke(cachedWeTypeM1Instance, false);
+                            if (yObj instanceof Integer yw && yw > 0 && Math.abs(yw - coverTargetWidth) > 24) {
+                                return node;
+                            }
+                        }
+                        Object kbType = cachedWeTypeGetKeyboardTypeMethod.invoke(node);
+                        if (kbType != null) {
+                            Object expObj = cachedWeTypeM1I0Method.invoke(cachedWeTypeM1Instance, kbType);
+                            int expectedW = expObj instanceof Integer ew && ew > 0 ? ew : coverTargetWidth;
+                            if (isWeTypeLaidOutKeyWidthStale(laidOutW, expectedW)) {
+                                return node;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            return null;
+        }
+        if (node instanceof ViewGroup vg) {
+            int count = vg.getChildCount();
+            for (int i = 0; i < count; i++) {
+                View found = findStaleWeTypeKeyboardInTree(vg.getChildAt(i), coverTargetWidth);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasStaleWeTypeSelfDrawKeyboardWidth(View rootView, int coverTargetWidth) {
+        if (rootView == null
+                || rebuildingWeType
+                || !"com.tencent.wetype".equals(packageName)
+                || !isWeTypeV401(packageVersionCode)) {
+            return false;
+        }
+        View stale = findStaleWeTypeKeyboardInTree(rootView, coverTargetWidth);
+        if (stale != null) {
+            lastRebuiltStaleKeyboardRef = new WeakReference<>(stale);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isWeTypeWidthCacheStaleForInner(Context ctx) {
+        if (ctx == null
+                || rebuildingWeType
+                || !"com.tencent.wetype".equals(packageName)
+                || !isWeTypeV401(packageVersionCode)) {
+            return false;
+        }
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastInnerStaleResetUptimeMs < 200L) {
+            return false;
+        }
+        try {
+            android.util.DisplayMetrics innerReal = queryInnerRealMetrics();
+            int expectedMinW = innerReal != null
+                    ? Math.min(innerReal.widthPixels, innerReal.heightPixels)
+                    : CoverDisplay.WIDTH + 1;
+            if (expectedMinW <= CoverDisplay.WIDTH) return false;
+            ClassLoader cl = ctx.getClassLoader();
+            Class<?> m1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1");
+            Object m1Instance = m1Class.getDeclaredField("a").get(null);
+            if (m1Instance == null) return false;
+            Object widthObj = m1Class.getDeclaredMethod("y", boolean.class).invoke(m1Instance, false);
+            if (widthObj instanceof Integer cachedW && cachedW > 0 && cachedW < expectedMinW) {
+                lastInnerStaleResetUptimeMs = now;
+                return true;
+            }
+            View root = lastWeTypeRootViewRef != null ? lastWeTypeRootViewRef.get() : null;
+            View staleKb = findStaleWeTypeKeyboardInTree(root, 0);
+            if (staleKb == null) {
+                try {
+                    Class<?> nClass = cl.loadClass("com.tencent.wetype.plugin.hld.model.N");
+                    java.lang.reflect.Field hField = nClass.getDeclaredField("h");
+                    hField.setAccessible(true);
+                    if (hField.get(null) instanceof View modelRoot && modelRoot != root) {
+                        staleKb = findStaleWeTypeKeyboardInTree(modelRoot, 0);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (staleKb != null) {
+                lastRebuiltStaleKeyboardRef = new WeakReference<>(staleKb);
+                lastInnerStaleResetUptimeMs = now;
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     /**
      * Synchronizes both Android's internal ResourcesImpl.mMetrics (used by Resources.getDimensionPixelSize) and
      * WeType's custom MMDensityManager (b7.a) / MMResources (b7.b) DisplayMetrics fields. Note that
-     * b7.b.updateConfiguration invokes b7.a.C(cfg, dm) at the end of its body, which re-reads hardware display
-     * metrics into b7.a.d and b7.a.e; we therefore re-apply overrideMetrics to b7.a's fields immediately AFTER
-     * calling updateConfiguration.
+     * b7.b.updateConfiguration invokes BOTH wrapped MiuiResources.updateConfiguration (jRes / bWrapped) AND
+     * b7.a.C(cfg, dm); we therefore place gRes BEFORE jRes / bWrapped so jRes and bWrapped are sanitized after
+     * gRes.updateConfiguration completes, and re-apply overrides to b7.a's fields immediately afterward.
      */
     @SuppressWarnings("deprecation")
     private static void syncWeTypeResources(Context ctx) {
-        if (ctx == null || !"com.tencent.wetype".equals(packageName) || !versionIn(WETYPE_MIN, WETYPE_MAX_EXCLUSIVE)) {
+        if (ctx == null || !"com.tencent.wetype".equals(packageName)) {
             return;
         }
         try {
@@ -1315,9 +1815,9 @@ final class AppCompatibility {
                     ctx.getResources(),
                     ctx.getApplicationContext() != null ? ctx.getApplicationContext().getResources() : null,
                     Resources.getSystem(),
+                    gRes,
                     jRes,
-                    bWrapped,
-                    gRes
+                    bWrapped
             };
             if (imeCoverActive) {
                 int targetWidth = CoverDisplay.coverImeWidth(imeRotation);
@@ -1360,10 +1860,56 @@ final class AppCompatibility {
                 } catch (Throwable ignored) {
                 }
             } else {
+                android.util.DisplayMetrics innerReal = isImeOnCoverDisplay(ctx) ? null : queryInnerRealMetrics();
                 for (Resources res : allRes) {
                     if (res == null) continue;
                     try {
-                        res.updateConfiguration(res.getConfiguration(), res.getDisplayMetrics());
+                        android.util.DisplayMetrics dm = res.getDisplayMetrics();
+                        android.content.res.Configuration cfg = res.getConfiguration();
+                        if (innerReal != null) {
+                            if (isCoverSizedMetrics(dm)) {
+                                applyInnerRealToMetrics(dm, innerReal);
+                            }
+                            if (isCoverSizedConfig(cfg)) {
+                                applyInnerRealToConfig(cfg, innerReal);
+                            }
+                        }
+                        res.updateConfiguration(cfg, dm);
+                        if (innerReal != null) {
+                            if (isCoverSizedMetrics(res.getDisplayMetrics())) {
+                                applyInnerRealToMetrics(res.getDisplayMetrics(), innerReal);
+                            }
+                            if (isCoverSizedConfig(res.getConfiguration())) {
+                                applyInnerRealToConfig(res.getConfiguration(), innerReal);
+                            }
+                            if ("b7.b".equals(res.getClass().getName())) {
+                                java.lang.reflect.Field dField = res.getClass().getDeclaredField("d");
+                                dField.setAccessible(true);
+                                Object b7aObj = dField.get(res);
+                                if (b7aObj != null) {
+                                    java.lang.reflect.Field aField = b7aObj.getClass().getDeclaredField("a");
+                                    aField.setAccessible(true);
+                                    if (aField.get(b7aObj) instanceof android.util.DisplayMetrics aDm
+                                            && isCoverSizedMetrics(aDm)) {
+                                        applyInnerRealToMetrics(aDm, innerReal);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (innerReal != null) {
+                    try {
+                        Class<?> b7aClass = cl.loadClass("b7.a");
+                        for (String fieldName : new String[]{"d", "e"}) {
+                            java.lang.reflect.Field f = b7aClass.getDeclaredField(fieldName);
+                            f.setAccessible(true);
+                            if (f.get(null) instanceof android.util.DisplayMetrics staticDm
+                                    && isCoverSizedMetrics(staticDm)) {
+                                applyInnerRealToMetrics(staticDm, innerReal);
+                            }
+                        }
                     } catch (Throwable ignored) {
                     }
                 }
@@ -1373,10 +1919,16 @@ final class AppCompatibility {
     }
 
     private static void updateWeTypeCache(Context ctx, int targetWidth) {
-        if (!"com.tencent.wetype".equals(packageName)) return;
+        if (!"com.tencent.wetype".equals(packageName) || rebuildingWeType) return;
         View curRoot = lastWeTypeRootViewRef != null ? lastWeTypeRootViewRef.get() : null;
-        boolean widthChanged = lastImeAdaptedWidth != targetWidth;
-        boolean rootChanged = curRoot != null
+        boolean forceInnerReset = targetWidth <= 0
+                && (weTypeNeedsInnerReset || isWeTypeWidthCacheStaleForInner(ctx));
+        boolean staleCoverKeyboard = targetWidth > 0
+                && curRoot != null
+                && hasStaleWeTypeSelfDrawKeyboardWidth(curRoot, targetWidth);
+        boolean widthChanged = lastImeAdaptedWidth != targetWidth || forceInnerReset || staleCoverKeyboard;
+        boolean rootChanged = targetWidth > 0
+                && curRoot != null
                 && (lastWeTypeAdaptedRootRef == null || lastWeTypeAdaptedRootRef.get() != curRoot);
         if (!widthChanged && !rootChanged) {
             if (curRoot != null) {
@@ -1384,7 +1936,7 @@ final class AppCompatibility {
             }
             return;
         }
-        lastImeAdaptedWidth = targetWidth;
+        lastImeAdaptedWidth = Math.max(targetWidth, 0);
         if (targetWidth <= 0) {
             lastWeTypeAdaptedRootRef = null;
         } else if (curRoot != null) {
@@ -1403,12 +1955,8 @@ final class AppCompatibility {
             java.util.Collections.newSetFromMap(new WeakHashMap<>());
     private static volatile boolean weTypeViewHooksInstalled;
 
-    private static void ensureWeTypeCoverHooks(Context c) {
+    private static void ensureWeTypeCoverHooksInstalled(Context c) {
         if (c == null || hookModule == null || !"com.tencent.wetype".equals(packageName)) return;
-        refreshWeTypeCoverState(c);
-        if (imeCoverActive) {
-            syncWeTypeResources(c);
-        }
         ClassLoader cl = c.getClassLoader();
         if (cl != null) {
             boolean shouldInstall;
@@ -1421,24 +1969,27 @@ final class AppCompatibility {
         }
     }
 
+    private static void ensureWeTypeCoverHooks(Context c) {
+        if (c == null || hookModule == null || !"com.tencent.wetype".equals(packageName)) return;
+        refreshWeTypeCoverState(c);
+        if (imeCoverActive) {
+            syncWeTypeResources(c);
+        }
+        ensureWeTypeCoverHooksInstalled(c);
+    }
+
     private static void refreshWeTypeCoverState(Context ctx) {
         if (ctx == null || !"com.tencent.wetype".equals(packageName)) return;
         try {
             boolean enabled = ModuleConfig.coverThirdPartyImeEnabled();
             boolean physicalOuter = isImeOnCoverDisplay(ctx);
-            if (!physicalOuter) {
-                try {
-                    android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-                    if (dm != null && isCoverSizedMetrics(dm)) {
-                        physicalOuter = true;
-                    }
-                } catch (Throwable ignored) {
-                }
+            if (physicalOuter) {
+                weTypeNeedsInnerReset = true;
             }
             boolean outer = enabled && physicalOuter;
-            int rot = getDisplayRotation(ctx);
-            if (imeCoverActive != outer || (outer && imeRotation != rot)) {
-                lastImeAdaptedWidth = -1;
+            int rot = outer ? getDisplayRotation(ctx, true) : android.view.Surface.ROTATION_0;
+            if (outer && (!imeCoverActive || imeRotation != rot)) {
+                lastImeAdaptedWidth = 0;
             }
             imeCoverActive = outer;
             if (outer) {
@@ -1460,26 +2011,42 @@ final class AppCompatibility {
         }
     }
 
+    static View weTypeResetInputViewArg(long versionCode, ViewGroup container, View rootView) {
+        // WeType 4.0.1 (59xxx) refactored WxHldService.Q(View) so its parameter is ignoreView
+        // (returning early without attaching when targetChildView == ignoreView); 4.0.0 (58xxx) passed rv directly.
+        return isWeTypeV401(versionCode) ? container : rootView;
+    }
+
     /**
      * WeChat Input Method caches keyboard dimensions in the obfuscated singleton utils.m1 and pre-builds its
-     * ImeRootView / ImeCandidateView / keyboard views in model.N. The member names were verified on WeType 4.0.x
-     * only; other versions are skipped.
+     * ImeRootView / ImeCandidateView / keyboard views in model.N. The member names were verified on WeType 4.0.0
+     * (58xxx) and 4.0.1 (59xxx); other versions skip direct m1 manipulation.
      */
     private static void invalidateWeTypeCachedDimensions(
             Context ctx, android.content.res.Configuration cfg, boolean viewReady) {
-        if (!versionIn(WETYPE_MIN, WETYPE_MAX_EXCLUSIVE) || rebuildingWeType) return;
+        if (!isSupportedWeTypeM1Version(packageVersionCode) || rebuildingWeType) return;
         rebuildingWeType = true;
         try {
-            ensureWeTypeCoverHooks(ctx);
+            ensureWeTypeCoverHooksInstalled(ctx);
             ClassLoader cl = ctx.getClassLoader();
             Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
             syncWeTypeResources(ctx);
             if (imeCoverActive && cfg != null) {
                 adaptImeConfig(cfg, imeRotation);
+            } else if (!imeCoverActive && cfg != null && !isImeOnCoverDisplay(ctx) && isCoverSizedConfig(cfg)) {
+                applyInnerRealToConfig(cfg, queryInnerRealMetrics());
             }
             Class<?> m1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1");
             Object m1Instance = m1Class.getDeclaredField("a").get(null);
             if (m1Instance == null || m1Instance.getClass() != m1Class) return;
+            if (isWeTypeV401(packageVersionCode)) {
+                try {
+                    java.lang.reflect.Method resetFoldState = m1Class.getDeclaredMethod("e2", boolean.class);
+                    resetFoldState.setAccessible(true);
+                    resetFoldState.invoke(m1Instance, false);
+                } catch (Throwable ignored) {
+                }
+            }
             if (cfg != null) {
                 try {
                     java.lang.reflect.Field rField = m1Class.getDeclaredField("r");
@@ -1488,15 +2055,17 @@ final class AppCompatibility {
                 } catch (Throwable ignored) {
                 }
             }
+            String updateResLayoutName = weTypeUpdateResourceLayoutMethod(packageVersionCode);
             try {
-                m1Class.getDeclaredMethod("h3", Context.class, android.content.res.Configuration.class)
+                m1Class.getDeclaredMethod(updateResLayoutName, Context.class, android.content.res.Configuration.class)
                         .invoke(m1Instance, appCtx, cfg);
             } catch (Throwable ignored) {
             }
+            String modeFlowName = weTypeModeFlowMethod(packageVersionCode);
             try {
-                java.lang.reflect.Method j3Method = m1Class.getDeclaredMethod("j3");
-                j3Method.setAccessible(true);
-                j3Method.invoke(m1Instance);
+                java.lang.reflect.Method modeFlowMethod = m1Class.getDeclaredMethod(modeFlowName);
+                modeFlowMethod.setAccessible(true);
+                modeFlowMethod.invoke(m1Instance);
             } catch (Throwable ignored) {
             }
             syncWeTypeResources(ctx);
@@ -1510,19 +2079,21 @@ final class AppCompatibility {
                 existingRoot = hField.get(null);
             } catch (Throwable ignored) {
             }
+            String rebuildAllName = weTypeRebuildAllMethod(packageVersionCode);
+            String resetDataCacheName = weTypeResetDataCacheMethod(packageVersionCode);
             if (viewReady || existingRoot != null) {
-                boolean rebuiltByE2 = false;
+                boolean rebuiltAll = false;
                 try {
-                    java.lang.reflect.Method e2 = m1Class.getDeclaredMethod(
-                            "e2", Context.class, boolean.class, boolean.class, boolean.class, boolean.class);
-                    e2.setAccessible(true);
-                    e2.invoke(m1Instance, appCtx, true, true, false, false);
-                    rebuiltByE2 = true;
+                    java.lang.reflect.Method rebuildAll = m1Class.getDeclaredMethod(
+                            rebuildAllName, Context.class, boolean.class, boolean.class, boolean.class, boolean.class);
+                    rebuildAll.setAccessible(true);
+                    rebuildAll.invoke(m1Instance, appCtx, true, true, false, false);
+                    rebuiltAll = true;
                 } catch (Throwable ignored) {
                 }
-                if (!rebuiltByE2) {
+                if (!rebuiltAll) {
                     try {
-                        m1Class.getDeclaredMethod("i2", Context.class, boolean.class)
+                        m1Class.getDeclaredMethod(resetDataCacheName, Context.class, boolean.class)
                                 .invoke(m1Instance, appCtx, false);
                     } catch (Throwable ignored) {
                     }
@@ -1549,18 +2120,21 @@ final class AppCompatibility {
                                     if (rv.getParent() != container) {
                                         java.lang.reflect.Method qMethod = svc.getClass().getDeclaredMethod("Q", View.class);
                                         qMethod.setAccessible(true);
-                                        qMethod.invoke(svc, rv);
-                                    } else {
-                                        java.lang.reflect.Field wField = svc.getClass().getDeclaredField("w");
-                                        wField.setAccessible(true);
-                                        Object proxy = wField.get(svc);
-                                        if (proxy != null) {
-                                            int targetH = (Integer) proxy.getClass().getDeclaredMethod("a").invoke(proxy);
-                                            ViewGroup.LayoutParams lp = rv.getLayoutParams();
-                                            if (lp != null && targetH > 0 && lp.height != targetH) {
-                                                lp.height = targetH;
-                                                rv.setLayoutParams(lp);
-                                            }
+                                        View qArg = weTypeResetInputViewArg(packageVersionCode, container, rv);
+                                        qMethod.invoke(svc, qArg);
+                                        if (rv.getParent() != container && qArg != container) {
+                                            qMethod.invoke(svc, container);
+                                        }
+                                    }
+                                    java.lang.reflect.Field wField = svc.getClass().getDeclaredField("w");
+                                    wField.setAccessible(true);
+                                    Object proxy = wField.get(svc);
+                                    if (proxy != null) {
+                                        int targetH = (Integer) proxy.getClass().getMethod("a").invoke(proxy);
+                                        ViewGroup.LayoutParams lp = rv.getLayoutParams();
+                                        if (lp != null && targetH > 0 && lp.height != targetH) {
+                                            lp.height = targetH;
+                                            rv.setLayoutParams(lp);
                                         }
                                     }
                                 }
@@ -1571,10 +2145,21 @@ final class AppCompatibility {
                 }
             } else {
                 try {
-                    m1Class.getDeclaredMethod("i2", Context.class, boolean.class)
+                    m1Class.getDeclaredMethod(resetDataCacheName, Context.class, boolean.class)
                             .invoke(m1Instance, appCtx, false);
                 } catch (Throwable ignored) {
                 }
+            }
+            if (isWeTypeV401(packageVersionCode)) {
+                try {
+                    java.lang.reflect.Method syncLastFields = m1Class.getDeclaredMethod("i2");
+                    syncLastFields.setAccessible(true);
+                    syncLastFields.invoke(m1Instance);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (!imeCoverActive && !isImeOnCoverDisplay(ctx)) {
+                weTypeNeedsInnerReset = false;
             }
         } catch (Throwable ignored) {
         } finally {
@@ -1583,7 +2168,6 @@ final class AppCompatibility {
     }
 
     private static void installWeTypeCoverHooks(XposedModule module, ClassLoader cl) {
-        if (!versionIn(WETYPE_MIN, WETYPE_MAX_EXCLUSIVE)) return;
         try {
             if (cl != null) {
                 try {
@@ -1591,13 +2175,28 @@ final class AppCompatibility {
                     module.hook(b7bClass.getDeclaredMethod("getDisplayMetrics")).intercept(chain -> {
                         Object res = chain.proceed();
                         try {
-                            if (imeCoverActive && res instanceof android.util.DisplayMetrics dm) {
-                                int rot = getDisplayRotation(null);
-                                imeRotation = rot;
-                                overrideMetrics(dm,
-                                        CoverDisplay.coverImeWidth(rot),
-                                        CoverDisplay.coverImeDisplayHeight(rot),
-                                        CoverDisplay.coverImeDensityDpi(rot));
+                            if (imeCoverActive) {
+                                if (isLiveDefaultDisplayInner()) {
+                                    imeCoverActive = false;
+                                    lastImeBoundsRotation = -1;
+                                    restoreOverrides(false);
+                                    if (res instanceof android.util.DisplayMetrics dm && isCoverSizedMetrics(dm)) {
+                                        applyInnerRealToMetrics(dm, queryInnerRealMetrics());
+                                    }
+                                    return res;
+                                }
+                                if (res instanceof android.util.DisplayMetrics dm) {
+                                    int rot = getDisplayRotation(null);
+                                    imeRotation = rot;
+                                    overrideMetrics(dm,
+                                            CoverDisplay.coverImeWidth(rot),
+                                            CoverDisplay.coverImeDisplayHeight(rot),
+                                            CoverDisplay.coverImeDensityDpi(rot));
+                                }
+                            } else if (res instanceof android.util.DisplayMetrics dm
+                                    && isCoverSizedMetrics(dm)
+                                    && isLiveDefaultDisplayInner()) {
+                                applyInnerRealToMetrics(dm, queryInnerRealMetrics());
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1624,213 +2223,313 @@ final class AppCompatibility {
                     });
                     module.hook(appLikeClass.getDeclaredMethod(
                             "onConfigurationChanged", android.content.res.Configuration.class)).intercept(chain -> {
+                        Context appCtx = null;
+                        boolean wasCover = imeCoverActive;
                         try {
                             Object self = chain.getThisObject();
-                            Context appCtx = self != null && getAppMethod.invoke(self) instanceof Context c ? c : null;
+                            appCtx = self != null && getAppMethod.invoke(self) instanceof Context c ? c : null;
                             if (appCtx != null) {
                                 refreshWeTypeCoverState(appCtx);
                             }
+                            Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
+                            Context syncCtx = svc != null ? svc : appCtx;
                             if (imeCoverActive) {
                                 if (chain.getArg(0) instanceof android.content.res.Configuration cfg) {
                                     adaptImeConfig(cfg, imeRotation);
                                 }
-                                Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : appCtx;
-                                if (svc != null) syncWeTypeResources(svc);
-                                if (lastImeAdaptedWidth == CoverDisplay.coverImeWidth(imeRotation)) {
-                                    // Prevent HldApplicationLike.onConfigurationChanged -> m1.C2 from calling
-                                    // requestHideSelf(0) and closing the active cover keyboard mid-input.
+                                if (syncCtx != null) syncWeTypeResources(syncCtx);
+                                int targetW = CoverDisplay.coverImeWidth(imeRotation);
+                                if (lastImeAdaptedWidth != targetW) {
+                                    if (svc != null) {
+                                        adaptImeServiceContextAndWindow(svc, true);
+                                    } else if (appCtx != null) {
+                                        updateWeTypeCache(appCtx, targetW);
+                                    }
+                                }
+                                if (lastImeAdaptedWidth == targetW) {
+                                    // Prevent HldApplicationLike.onConfigurationChanged -> m1.C2/A2 from calling
+                                    // requestHideSelf(0) and closing the active cover keyboard mid-input or mid-rotation.
                                     return null;
                                 }
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                        return chain.proceed();
-                    });
-                } catch (Throwable ignored) {
-                }
-
-                try {
-                    Class<?> m1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1");
-                    module.hook(m1Class.getDeclaredMethod(
-                            "h3", Context.class, android.content.res.Configuration.class)).intercept(chain -> {
-                        Context ctxArg = chain.getArg(0) instanceof Context c ? c : null;
-                        try {
-                            if (ctxArg != null && activeImeServiceRef == null) {
-                                refreshWeTypeCoverState(ctxArg);
-                            }
-                            if (imeCoverActive) {
-                                if (chain.getArg(1) instanceof android.content.res.Configuration cfg) {
-                                    adaptImeConfig(cfg, imeRotation);
+                            } else {
+                                if (wasCover || !overriddenOriginals.isEmpty()
+                                        || (syncCtx != null && !isImeOnCoverDisplay(syncCtx) && hasCoverSizedWeTypeResources(syncCtx))) {
+                                    lastImeBoundsRotation = -1;
+                                    restoreOverrides(false);
+                                    if (syncCtx != null) syncWeTypeResources(syncCtx);
                                 }
-                                if (ctxArg != null) syncWeTypeResources(ctxArg);
+                                if (chain.getArg(0) instanceof android.content.res.Configuration cfg
+                                        && syncCtx != null
+                                        && !isImeOnCoverDisplay(syncCtx)
+                                        && isCoverSizedConfig(cfg)) {
+                                    applyInnerRealToConfig(cfg, queryInnerRealMetrics());
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
                         Object res = chain.proceed();
                         try {
-                            if (imeCoverActive && ctxArg != null) {
-                                syncWeTypeResources(ctxArg);
+                            Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
+                            if (imeCoverActive) {
+                                int targetW = CoverDisplay.coverImeWidth(imeRotation);
+                                if (svc != null && lastImeAdaptedWidth != targetW) {
+                                    adaptImeServiceContextAndWindow(svc, true);
+                                } else if (appCtx != null && lastImeAdaptedWidth != targetW) {
+                                    updateWeTypeCache(appCtx, targetW);
+                                }
+                            } else {
+                                if (svc != null
+                                        && (wasCover
+                                                || lastImeAdaptedWidth > 0
+                                                || weTypeNeedsInnerReset
+                                                || isWeTypeWidthCacheStaleForInner(svc))) {
+                                    adaptImeServiceContextAndWindow(svc, true);
+                                } else if (appCtx != null
+                                        && !isImeOnCoverDisplay(appCtx)
+                                        && (wasCover
+                                                || lastImeAdaptedWidth > 0
+                                                || weTypeNeedsInnerReset
+                                                || isWeTypeWidthCacheStaleForInner(appCtx))) {
+                                    updateWeTypeCache(appCtx, 0);
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
                         return res;
                     });
-                    final double coverHeightScale = CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX / 160.0d;
-                    final int coverBodyHeight = CoverDisplay.IME_TARGET_HEIGHT_PX - CoverDisplay.IME_BOTTOM_CHIN_PX;
-                    module.hook(m1Class.getDeclaredMethod("s0")).intercept(chain -> {
-                        if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                            return coverHeightScale;
-                        }
-                        return chain.proceed();
-                    });
+                } catch (Throwable ignored) {
+                }
+
+                if (isSupportedWeTypeM1Version(packageVersionCode)) {
                     try {
-                        Class<?> m1XClass = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$X");
-                        module.hook(m1XClass.getDeclaredMethod("c")).intercept(chain -> {
+                        Class<?> m1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1");
+                        String updateResLayoutName = weTypeUpdateResourceLayoutMethod(packageVersionCode);
+                        module.hook(m1Class.getDeclaredMethod(
+                                updateResLayoutName, Context.class, android.content.res.Configuration.class)).intercept(chain -> {
+                            Context ctxArg = chain.getArg(0) instanceof Context c ? c : null;
+                            try {
+                                if (ctxArg != null && activeImeServiceRef == null) {
+                                    refreshWeTypeCoverState(ctxArg);
+                                }
+                                if (imeCoverActive) {
+                                    if (chain.getArg(1) instanceof android.content.res.Configuration cfg) {
+                                        adaptImeConfig(cfg, imeRotation);
+                                    }
+                                    if (ctxArg != null) syncWeTypeResources(ctxArg);
+                                } else if (ctxArg != null && !isImeOnCoverDisplay(ctxArg)) {
+                                    if (chain.getArg(1) instanceof android.content.res.Configuration cfg
+                                            && isCoverSizedConfig(cfg)) {
+                                        applyInnerRealToConfig(cfg, queryInnerRealMetrics());
+                                    }
+                                    if (hasCoverSizedWeTypeResources(ctxArg)) {
+                                        syncWeTypeResources(ctxArg);
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            Object res = chain.proceed();
+                            try {
+                                if (ctxArg != null) {
+                                    syncWeTypeResources(ctxArg);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            return res;
+                        });
+                        final double coverHeightScale = CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX / 160.0d;
+                        final int coverBodyHeight = CoverDisplay.IME_TARGET_HEIGHT_PX - CoverDisplay.IME_BOTTOM_CHIN_PX;
+                        module.hook(m1Class.getDeclaredMethod("s0")).intercept(chain -> {
                             if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
                                 return coverHeightScale;
                             }
                             return chain.proceed();
                         });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        Class<?> m1f0Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$f0");
-                        module.hook(m1f0Class.getDeclaredMethod("get")).intercept(chain -> {
-                            Object self = chain.getThisObject();
-                            if (imeCoverActive
-                                    && imeRotation == android.view.Surface.ROTATION_180
-                                    && self != null
-                                    && "com.tencent.wetype.plugin.hld.utils.m1$X".equals(self.getClass().getName())) {
-                                return coverHeightScale;
+                        if (isWeTypeV401(packageVersionCode)) {
+                            try {
+                                module.hook(m1Class.getDeclaredMethod("g1")).intercept(chain -> {
+                                    if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                        return coverHeightScale;
+                                    }
+                                    return chain.proceed();
+                                });
+                            } catch (Throwable ignored) {
                             }
-                            return chain.proceed();
-                        });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        Class<?> selfDrawOClass = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.selfdraw.o");
-                        module.hook(selfDrawOClass.getDeclaredMethod("F2", Float.class)).intercept(chain -> {
-                            if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                                return chain.getArg(0) instanceof Float f
-                                        ? (float) (f * coverHeightScale)
-                                        : 0f;
-                            }
-                            return chain.proceed();
-                        });
-                    } catch (Throwable ignored) {
-                    }
-
-                    Class<?> tClass = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.t");
-                    module.hook(m1Class.getDeclaredMethod("R", tClass)).intercept(chain -> {
-                        if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                            return CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX;
                         }
-                        return chain.proceed();
-                    });
-                    try {
-                        module.hook(m1Class.getDeclaredMethod("S", m1Class, tClass, int.class, Object.class)).intercept(chain -> {
+                        final Set<Class<?>> heightScaleCacheClasses =
+                                Collections.newSetFromMap(new ConcurrentHashMap<>());
+                        if (isWeTypeV401(packageVersionCode)) {
+                            for (String fieldName : new String[]{"D", "E"}) {
+                                try {
+                                    java.lang.reflect.Field f = m1Class.getDeclaredField(fieldName);
+                                    f.setAccessible(true);
+                                    Object item = f.get(null);
+                                    if (item != null) {
+                                        heightScaleCacheClasses.add(item.getClass());
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        } else {
+                            try {
+                                heightScaleCacheClasses.add(cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$X"));
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        for (Class<?> scaleCls : heightScaleCacheClasses) {
+                            try {
+                                module.hook(scaleCls.getDeclaredMethod("c")).intercept(chain -> {
+                                    if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                        return coverHeightScale;
+                                    }
+                                    return chain.proceed();
+                                });
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        try {
+                            Class<?> m1f0Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$f0");
+                            module.hook(m1f0Class.getDeclaredMethod("get")).intercept(chain -> {
+                                Object self = chain.getThisObject();
+                                if (imeCoverActive
+                                        && imeRotation == android.view.Surface.ROTATION_180
+                                        && self != null
+                                        && heightScaleCacheClasses.contains(self.getClass())) {
+                                    return coverHeightScale;
+                                }
+                                return chain.proceed();
+                            });
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            Class<?> selfDrawOClass = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.selfdraw.o");
+                            String selfDrawScaleMethod = weTypeSelfDrawScaleMethod(packageVersionCode);
+                            module.hook(selfDrawOClass.getDeclaredMethod(selfDrawScaleMethod, Float.class)).intercept(chain -> {
+                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                    return chain.getArg(0) instanceof Float f
+                                            ? (float) (f * coverHeightScale)
+                                            : 0f;
+                                }
+                                return chain.proceed();
+                            });
+                        } catch (Throwable ignored) {
+                        }
+
+                        Class<?> tClass = cl.loadClass("com.tencent.wetype.plugin.hld.keyboard.t");
+                        module.hook(m1Class.getDeclaredMethod("R", tClass)).intercept(chain -> {
                             if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
                                 return CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX;
                             }
                             return chain.proceed();
                         });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        Class<?> m1cClass = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$c");
-                        module.hook(m1cClass.getDeclaredMethod("a", tClass)).intercept(chain -> {
-                            if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                                return CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX;
+                        try {
+                            module.hook(m1Class.getDeclaredMethod("S", m1Class, tClass, int.class, Object.class)).intercept(chain -> {
+                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                    return CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX;
+                                }
+                                return chain.proceed();
+                            });
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            Class<?> m1cClass = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$c");
+                            module.hook(m1cClass.getDeclaredMethod("a", tClass)).intercept(chain -> {
+                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                    return CoverDisplay.IME_TARGET_CANDIDATE_HEIGHT_PX;
+                                }
+                                return chain.proceed();
+                            });
+                        } catch (Throwable ignored) {
+                        }
+
+                        for (String methodName : new String[]{
+                                "D0", weTypeDefaultBodyHeightMethod(packageVersionCode)}) {
+                            try {
+                                module.hook(m1Class.getDeclaredMethod(methodName, tClass)).intercept(chain -> {
+                                    if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                        return coverBodyHeight;
+                                    }
+                                    return chain.proceed();
+                                });
+                            } catch (Throwable ignored) {
                             }
-                            return chain.proceed();
-                        });
-                    } catch (Throwable ignored) {
-                    }
+                        }
+                        String[] syntheticBodyHeightMethods = isWeTypeV401(packageVersionCode)
+                                ? new String[]{"E0"}
+                                : new String[]{"E0", "k0"};
+                        for (String methodName : syntheticBodyHeightMethods) {
+                            try {
+                                module.hook(m1Class.getDeclaredMethod(methodName, m1Class, tClass, int.class, Object.class)).intercept(chain -> {
+                                    if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                        return coverBodyHeight;
+                                    }
+                                    return chain.proceed();
+                                });
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        for (String subClsName : new String[]{
+                                "com.tencent.wetype.plugin.hld.utils.m1$J",
+                                "com.tencent.wetype.plugin.hld.utils.m1$n"}) {
+                            try {
+                                Class<?> subCls = cl.loadClass(subClsName);
+                                module.hook(subCls.getDeclaredMethod("a", tClass)).intercept(chain -> {
+                                    if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
+                                        return coverBodyHeight;
+                                    }
+                                    return chain.proceed();
+                                });
+                            } catch (Throwable ignored) {
+                            }
+                        }
 
-                    for (String methodName : new String[]{"D0", "j0"}) {
+                        Class<?> i1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.i1");
+                        Class<?> a7bClass = cl.loadClass("a7.b");
+                        java.lang.reflect.Field dField = a7bClass.getDeclaredField("d");
+                        java.lang.reflect.Field eField = a7bClass.getDeclaredField("e");
+                        dField.setAccessible(true);
+                        eField.setAccessible(true);
+                        module.hook(i1Class.getDeclaredMethod("W0", tClass)).intercept(chain -> {
+                            Object q = chain.proceed();
+                            adjustWeTypeHeightModel(q, dField, eField);
+                            return q;
+                        });
                         try {
-                            module.hook(m1Class.getDeclaredMethod(methodName, tClass)).intercept(chain -> {
-                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                                    return coverBodyHeight;
-                                }
-                                return chain.proceed();
+                            module.hook(i1Class.getDeclaredMethod("Y0", tClass, boolean.class)).intercept(chain -> {
+                                Object q = chain.proceed();
+                                adjustWeTypeHeightModel(q, dField, eField);
+                                return q;
                             });
                         } catch (Throwable ignored) {
                         }
-                    }
-                    for (String methodName : new String[]{"E0", "k0"}) {
                         try {
-                            module.hook(m1Class.getDeclaredMethod(methodName, m1Class, tClass, int.class, Object.class)).intercept(chain -> {
-                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                                    return coverBodyHeight;
-                                }
-                                return chain.proceed();
+                            module.hook(m1Class.getDeclaredMethod("G0", tClass)).intercept(chain -> {
+                                Object q = chain.proceed();
+                                adjustWeTypeHeightModel(q, dField, eField);
+                                return q;
                             });
                         } catch (Throwable ignored) {
                         }
-                    }
-                    for (String subClsName : new String[]{
-                            "com.tencent.wetype.plugin.hld.utils.m1$J",
-                            "com.tencent.wetype.plugin.hld.utils.m1$n"}) {
                         try {
-                            Class<?> subCls = cl.loadClass(subClsName);
-                            module.hook(subCls.getDeclaredMethod("a", tClass)).intercept(chain -> {
-                                if (imeCoverActive && imeRotation == android.view.Surface.ROTATION_180) {
-                                    return coverBodyHeight;
-                                }
-                                return chain.proceed();
+                            module.hook(m1Class.getDeclaredMethod("H0", m1Class, tClass, int.class, Object.class)).intercept(chain -> {
+                                Object q = chain.proceed();
+                                adjustWeTypeHeightModel(q, dField, eField);
+                                return q;
                             });
                         } catch (Throwable ignored) {
                         }
+                        try {
+                            Class<?> m1LClass = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$L");
+                            module.hook(m1LClass.getDeclaredMethod("a", tClass)).intercept(chain -> {
+                                Object q = chain.proceed();
+                                adjustWeTypeHeightModel(q, dField, eField);
+                                return q;
+                            });
+                        } catch (Throwable ignored) {
+                        }
+                        ModLog.i(TAG, "installed WeType classLoader hooks cl=" + cl + " ver=" + packageVersionCode);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "WeType m1 hooks failed for cl=" + cl, t);
                     }
-
-                    Class<?> i1Class = cl.loadClass("com.tencent.wetype.plugin.hld.utils.i1");
-                    Class<?> a7bClass = cl.loadClass("a7.b");
-                    java.lang.reflect.Field dField = a7bClass.getDeclaredField("d");
-                    java.lang.reflect.Field eField = a7bClass.getDeclaredField("e");
-                    dField.setAccessible(true);
-                    eField.setAccessible(true);
-                    module.hook(i1Class.getDeclaredMethod("W0", tClass)).intercept(chain -> {
-                        Object q = chain.proceed();
-                        adjustWeTypeHeightModel(q, dField, eField);
-                        return q;
-                    });
-                    try {
-                        module.hook(i1Class.getDeclaredMethod("Y0", tClass, boolean.class)).intercept(chain -> {
-                            Object q = chain.proceed();
-                            adjustWeTypeHeightModel(q, dField, eField);
-                            return q;
-                        });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        module.hook(m1Class.getDeclaredMethod("G0", tClass)).intercept(chain -> {
-                            Object q = chain.proceed();
-                            adjustWeTypeHeightModel(q, dField, eField);
-                            return q;
-                        });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        module.hook(m1Class.getDeclaredMethod("H0", m1Class, tClass, int.class, Object.class)).intercept(chain -> {
-                            Object q = chain.proceed();
-                            adjustWeTypeHeightModel(q, dField, eField);
-                            return q;
-                        });
-                    } catch (Throwable ignored) {
-                    }
-                    try {
-                        Class<?> m1LClass = cl.loadClass("com.tencent.wetype.plugin.hld.utils.m1$L");
-                        module.hook(m1LClass.getDeclaredMethod("a", tClass)).intercept(chain -> {
-                            Object q = chain.proceed();
-                            adjustWeTypeHeightModel(q, dField, eField);
-                            return q;
-                        });
-                    } catch (Throwable ignored) {
-                    }
-                    ModLog.i(TAG, "installed WeType classLoader hooks cl=" + cl);
-                } catch (Throwable t) {
-                    Log.w(TAG, "WeType m1 hooks failed for cl=" + cl, t);
                 }
             }
 
@@ -1844,35 +2543,52 @@ final class AppCompatibility {
                         boolean isImeRoot = "com.tencent.wetype.plugin.hld.view.ImeRootView".equals(clsName);
                         boolean isDecor = imeProcess && "com.android.internal.policy.DecorView".equals(clsName);
                         if (isDecor && imeCoverActive) {
-                            int liveRot = getDisplayRotation(v.getContext());
-                            if (liveRot != imeRotation) {
-                                Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
-                                adaptImeServiceContextAndWindow(svc != null ? svc : v.getContext(), true);
-                            }
-                            View curRoot = lastWeTypeRootViewRef != null ? lastWeTypeRootViewRef.get() : null;
-                            if (curRoot != null) {
-                                applyWeTypeCoverLayoutState(curRoot);
-                            }
-                            int targetW = CoverDisplay.coverImeWidth(imeRotation);
-                            int wSpec = (Integer) chain.getArg(0);
-                            if (View.MeasureSpec.getSize(wSpec) != targetW) {
-                                int newWSpec = View.MeasureSpec.makeMeasureSpec(targetW, View.MeasureSpec.EXACTLY);
-                                return chain.proceed(new Object[]{newWSpec, chain.getArg(1)});
+                            Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
+                            Context targetCtx = svc != null ? svc : v.getContext();
+                            if (isLiveDefaultDisplayInner()) {
+                                adaptImeServiceContextAndWindow(targetCtx, true);
+                            } else {
+                                int liveRot = getDisplayRotation(targetCtx, true);
+                                if (liveRot != imeRotation) {
+                                    adaptImeServiceContextAndWindow(targetCtx, true);
+                                }
+                                View curRoot = lastWeTypeRootViewRef != null ? lastWeTypeRootViewRef.get() : null;
+                                if (curRoot != null) {
+                                    applyWeTypeCoverLayoutState(curRoot);
+                                }
+                                if (imeCoverActive) {
+                                    int targetW = CoverDisplay.coverImeWidth(imeRotation);
+                                    int wSpec = (Integer) chain.getArg(0);
+                                    if (View.MeasureSpec.getSize(wSpec) != targetW) {
+                                        int newWSpec = View.MeasureSpec.makeMeasureSpec(targetW, View.MeasureSpec.EXACTLY);
+                                        return chain.proceed(new Object[]{newWSpec, chain.getArg(1)});
+                                    }
+                                }
                             }
                         } else if (isImeRoot) {
                             lastWeTypeRootViewRef = new WeakReference<>(v);
-                            int liveRot = getDisplayRotation(v.getContext());
                             Context svc = activeImeServiceRef != null ? activeImeServiceRef.get() : null;
-                            if (imeCoverActive && liveRot != imeRotation) {
-                                adaptImeServiceContextAndWindow(svc != null ? svc : v.getContext(), true);
+                            Context targetCtx = svc != null ? svc : v.getContext();
+                            if (imeCoverActive && isLiveDefaultDisplayInner()) {
+                                adaptImeServiceContextAndWindow(targetCtx, true);
+                            } else if (imeCoverActive) {
+                                int liveRot = getDisplayRotation(targetCtx, true);
+                                if (liveRot != imeRotation) {
+                                    adaptImeServiceContextAndWindow(targetCtx, true);
+                                }
                             }
                             if (imeCoverActive
                                     && (lastWeTypeAdaptedRootRef == null
                                             || lastWeTypeAdaptedRootRef.get() != v
-                                            || lastImeAdaptedWidth != CoverDisplay.coverImeWidth(imeRotation))) {
-                                updateWeTypeCache(svc != null ? svc : v.getContext(), CoverDisplay.coverImeWidth(imeRotation));
-                            } else if (!imeCoverActive && lastImeAdaptedWidth > 0) {
-                                updateWeTypeCache(svc != null ? svc : v.getContext(), 0);
+                                            || lastImeAdaptedWidth != CoverDisplay.coverImeWidth(imeRotation)
+                                            || hasStaleWeTypeSelfDrawKeyboardWidth(
+                                                    v, CoverDisplay.coverImeWidth(imeRotation)))) {
+                                updateWeTypeCache(targetCtx, CoverDisplay.coverImeWidth(imeRotation));
+                            } else if (!imeCoverActive
+                                    && (lastImeAdaptedWidth > 0
+                                            || weTypeNeedsInnerReset
+                                            || (!isImeOnCoverDisplay(targetCtx) && isWeTypeWidthCacheStaleForInner(targetCtx)))) {
+                                updateWeTypeCache(targetCtx, 0);
                             }
                             applyWeTypeCoverLayoutState(v);
                             if (imeCoverActive) {
@@ -1903,6 +2619,11 @@ final class AppCompatibility {
                         && chain.getArg(0) instanceof android.graphics.Canvas canvas) {
                     try {
                         lastWeTypeRootViewRef = new WeakReference<>(v);
+                        if (imeCoverActive && isLiveDefaultDisplayInner()) {
+                            imeCoverActive = false;
+                            lastImeBoundsRotation = -1;
+                            restoreOverrides(false);
+                        }
                         applyWeTypeCoverLayoutState(v);
                         if (imeCoverActive) {
                             int w = v.getWidth();
@@ -1989,12 +2710,31 @@ final class AppCompatibility {
                     upper.setAlpha(wantAlpha);
                 }
             }
-            if (imeCoverActive && containerRl != null) {
-                int targetW = CoverDisplay.coverImeWidth(imeRotation);
+            if (containerRl != null) {
                 ViewGroup.LayoutParams clp = containerRl.getLayoutParams();
-                if (clp != null && clp.width != targetW) {
-                    clp.width = targetW;
-                    containerRl.setLayoutParams(clp);
+                if (clp != null) {
+                    if (imeCoverActive) {
+                        int targetW = CoverDisplay.coverImeWidth(imeRotation);
+                        if (clp.width != targetW) {
+                            synchronized (savedContainerWidths) {
+                                savedContainerWidths.putIfAbsent(containerRl, clp.width);
+                            }
+                            clp.width = targetW;
+                            containerRl.setLayoutParams(clp);
+                        }
+                    } else {
+                        Integer origWidth;
+                        synchronized (savedContainerWidths) {
+                            origWidth = savedContainerWidths.remove(containerRl);
+                        }
+                        int wantW = origWidth != null ? origWidth : ViewGroup.LayoutParams.MATCH_PARENT;
+                        if (origWidth != null || CoverDisplay.isCoverImeWidth(clp.width)) {
+                            if (clp.width != wantW) {
+                                clp.width = wantW;
+                                containerRl.setLayoutParams(clp);
+                            }
+                        }
+                    }
                 }
             }
         } catch (Throwable ignored) {
@@ -2266,6 +3006,7 @@ final class AppCompatibility {
             if (wasOuter) {
                 restoreOverrides(false);
             }
+            syncVoiceAssistHaloWindows(d, false);
             return;
         }
         int[] t = nativeCoverTarget(portraitProcess);
@@ -2277,6 +3018,261 @@ final class AppCompatibility {
             if (res == null || isCompatActivityResources(res)) continue;
             overrideMetrics(res.getDisplayMetrics(), t[0], t[1], CoverDisplay.DENSITY_DPI);
             adaptNativeCoverConfig(res.getConfiguration(), t);
+        }
+        syncVoiceAssistHaloWindows(d, true);
+    }
+
+    static boolean isVoiceAssistHaloWindowTitle(CharSequence title) {
+        if (title == null) return false;
+        String s = title.toString();
+        return "voice_assist_root".equals(s)
+                || "voice_assist_gesture_line_handoff_effect".equals(s);
+    }
+
+    static boolean isVoiceAssistFullscreenHaloWindow(
+            int windowType, CharSequence title, String viewClassName) {
+        if (windowType < WindowManager.LayoutParams.FIRST_SYSTEM_WINDOW) {
+            return false;
+        }
+        if (isVoiceAssistHaloWindowTitle(title)) {
+            return true;
+        }
+        return "com.xiaomi.voiceassistant.mainui.board.FloatViewRootLayout".equals(viewClassName);
+    }
+
+    private static boolean isVoiceAssistFullscreenHaloWindow(
+            WindowManager.LayoutParams lp, View view) {
+        if (lp == null) return false;
+        CharSequence title = null;
+        try {
+            title = lp.getTitle();
+        } catch (Throwable ignored) {
+        }
+        String viewCls = view != null ? view.getClass().getName() : null;
+        return isVoiceAssistFullscreenHaloWindow(lp.type, title, viewCls);
+    }
+
+    private static boolean setMiuiAlwaysDisplayInCutout(
+            WindowManager.LayoutParams lp, boolean value) {
+        if (lp == null) return false;
+        int state = lpMiuiAlwaysDisplayInCutoutState;
+        if (state < 0) return false;
+        try {
+            java.lang.reflect.Field f = lpMiuiAlwaysDisplayInCutoutField;
+            if (f == null) {
+                f = WindowManager.LayoutParams.class.getDeclaredField("miuiAlwaysDisplayInCutout");
+                f.setAccessible(true);
+                lpMiuiAlwaysDisplayInCutoutField = f;
+                lpMiuiAlwaysDisplayInCutoutState = 1;
+            }
+            if (f.getBoolean(lp) != value) {
+                f.setBoolean(lp, value);
+                return true;
+            }
+        } catch (Throwable ignored) {
+            if (lpMiuiAlwaysDisplayInCutoutState == 0) {
+                lpMiuiAlwaysDisplayInCutoutState = -1;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Normalizes Super XiaoAi's fullscreen halo overlay LayoutParams on the folded cover screen:
+     * 1) Full 1208x1392 (portrait) or 1392x1208 (landscape) bounds even if VoiceService folded from
+     *    1224x2912 at ROTATION_0 without changing rotation (where s1.reMeasureViews skips relayout).
+     * 2) Gravity.TOP | Gravity.START (0x00800033) instead of Gravity.TOP (0x30 / CENTER_HORIZONTAL
+     *    used by un1.b in ROTATION_0) so client-side WindowLayout.computeFrames never shifts the
+     *    1208px window -199px off-screen inside an 810px cutout-safe frame.
+     * 3) LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS + miuiAlwaysDisplayInCutout=true so both WMS and
+     *    client-side WindowLayoutStubImpl span the full physical cover panel on all 4 edges.
+     */
+    static boolean normalizeVoiceAssistCoverHaloLayoutParams(
+            WindowManager.LayoutParams lp, int rotation) {
+        if (lp == null) return false;
+        boolean portrait = CoverDisplay.isPortraitRotation(rotation);
+        int targetW = portrait ? CoverDisplay.WIDTH : CoverDisplay.HEIGHT;
+        int targetH = portrait ? CoverDisplay.HEIGHT : CoverDisplay.WIDTH;
+        int targetGravity = android.view.Gravity.TOP | android.view.Gravity.START;
+        int targetCutout = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        boolean changed = false;
+        if (lp.width != targetW) {
+            lp.width = targetW;
+            changed = true;
+        }
+        if (lp.height != targetH) {
+            lp.height = targetH;
+            changed = true;
+        }
+        if (lp.x != 0) {
+            lp.x = 0;
+            changed = true;
+        }
+        if (lp.y != 0) {
+            lp.y = 0;
+            changed = true;
+        }
+        if (lp.gravity != targetGravity) {
+            lp.gravity = targetGravity;
+            changed = true;
+        }
+        if (lp.layoutInDisplayCutoutMode != targetCutout) {
+            lp.layoutInDisplayCutoutMode = targetCutout;
+            changed = true;
+        }
+        if (setMiuiAlwaysDisplayInCutout(lp, true)) {
+            changed = true;
+        }
+        return changed;
+    }
+
+    /**
+     * Restores Super XiaoAi's fullscreen halo overlay LayoutParams back to inner-screen bounds
+     * when unfolding from 1208x1392 cover (ROTATION_0) to 1224x2912 inner screen (ROTATION_0).
+     */
+    static boolean restoreVoiceAssistInnerHaloLayoutParams(
+            WindowManager.LayoutParams lp, int physicalWidth, int physicalHeight, int rotation) {
+        if (lp == null || physicalWidth <= 0 || physicalHeight <= 0) return false;
+        if (CoverDisplay.isOuterDimensions(physicalWidth, physicalHeight)) return false;
+        if (!CoverDisplay.isOuterDimensions(lp.width, lp.height)) return false;
+        int shortSide = Math.min(physicalWidth, physicalHeight);
+        int longSide = Math.max(physicalWidth, physicalHeight);
+        boolean portrait = CoverDisplay.isPortraitRotation(rotation);
+        int targetW = portrait ? shortSide : longSide;
+        int targetH = portrait ? longSide : shortSide;
+        int targetGravity = rotation == android.view.Surface.ROTATION_0
+                ? android.view.Gravity.TOP
+                : (android.view.Gravity.TOP | android.view.Gravity.START);
+        int targetCutout = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        boolean changed = false;
+        if (lp.width != targetW) {
+            lp.width = targetW;
+            changed = true;
+        }
+        if (lp.height != targetH) {
+            lp.height = targetH;
+            changed = true;
+        }
+        if (lp.x != 0) {
+            lp.x = 0;
+            changed = true;
+        }
+        if (lp.y != 0) {
+            lp.y = 0;
+            changed = true;
+        }
+        if (lp.gravity != targetGravity) {
+            lp.gravity = targetGravity;
+            changed = true;
+        }
+        if (lp.layoutInDisplayCutoutMode != targetCutout) {
+            lp.layoutInDisplayCutoutMode = targetCutout;
+            changed = true;
+        }
+        if (setMiuiAlwaysDisplayInCutout(lp, false)) {
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static void invokeWindowManagerGlobalUpdateViewLayout(
+            View view, WindowManager.LayoutParams lp) {
+        if (view == null || lp == null) return;
+        try {
+            Object wmg = cachedWindowManagerGlobal;
+            if (wmg == null) {
+                wmg = Class.forName("android.view.WindowManagerGlobal")
+                        .getDeclaredMethod("getInstance")
+                        .invoke(null);
+                cachedWindowManagerGlobal = wmg;
+            }
+            if (wmg == null) return;
+            java.lang.reflect.Method m = wmgUpdateViewLayoutMethod;
+            if (m == null) {
+                m = wmg.getClass().getDeclaredMethod(
+                        "updateViewLayout", View.class, ViewGroup.LayoutParams.class);
+                m.setAccessible(true);
+                wmgUpdateViewLayoutMethod = m;
+            }
+            m.invoke(wmg, view, lp);
+        } catch (Throwable ignored) {
+            voiceAssistHaloViews.remove(view);
+        }
+    }
+
+    private static void syncVoiceAssistHaloWindows(Display display, boolean isOuter) {
+        if (voiceAssistHaloViews.isEmpty()) return;
+        if (Boolean.TRUE.equals(updatingVoiceAssistHaloLayout.get())) return;
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (!voiceAssistHaloSyncPending) {
+                voiceAssistHaloSyncPending = true;
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    voiceAssistHaloSyncPending = false;
+                    try {
+                        Display live = resolveRealDefaultDisplay();
+                        if (live != null) {
+                            syncVoiceAssistHaloWindows(live, CoverDisplay.isOuterDisplay(live));
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                });
+            }
+            return;
+        }
+        Display d = display != null ? display : resolveRealDefaultDisplay();
+        if (d == null) return;
+        List<Map.Entry<View, WindowManager.LayoutParams>> snapshot;
+        synchronized (voiceAssistHaloViews) {
+            if (voiceAssistHaloViews.isEmpty()) return;
+            snapshot = new ArrayList<>(voiceAssistHaloViews.entrySet());
+        }
+        updatingVoiceAssistHaloLayout.set(Boolean.TRUE);
+        try {
+            int rot = d.getRotation();
+            int physW = 0;
+            int physH = 0;
+            if (!isOuter) {
+                try {
+                    Display.Mode mode = d.getMode();
+                    if (mode != null) {
+                        physW = mode.getPhysicalWidth();
+                        physH = mode.getPhysicalHeight();
+                    }
+                    if (physW <= 0 || physH <= 0) {
+                        Point p = new Point();
+                        d.getRealSize(p);
+                        physW = p.x;
+                        physH = p.y;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            boolean adaptingCover = isOuter && voiceAssistOverlayAdapting();
+            for (Map.Entry<View, WindowManager.LayoutParams> entry : snapshot) {
+                View view = entry.getKey();
+                WindowManager.LayoutParams lp = entry.getValue();
+                if (view == null || lp == null || view.getParent() == null) continue;
+                if (adaptingCover) {
+                    boolean changed = normalizeVoiceAssistCoverHaloLayoutParams(lp, rot);
+                    boolean sizeMismatch = view.getWidth() > 0 && view.getHeight() > 0
+                            && (view.getWidth() != lp.width || view.getHeight() != lp.height);
+                    if (changed || sizeMismatch) {
+                        invokeWindowManagerGlobalUpdateViewLayout(view, lp);
+                        view.requestLayout();
+                    }
+                } else if (!isOuter) {
+                    boolean changed = restoreVoiceAssistInnerHaloLayoutParams(lp, physW, physH, rot);
+                    boolean sizeMismatch = CoverDisplay.isOuterDimensions(view.getWidth(), view.getHeight())
+                            && (view.getWidth() != lp.width || view.getHeight() != lp.height);
+                    if (changed || sizeMismatch) {
+                        invokeWindowManagerGlobalUpdateViewLayout(view, lp);
+                        view.requestLayout();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            updatingVoiceAssistHaloLayout.remove();
         }
     }
 
@@ -2373,6 +3369,31 @@ final class AppCompatibility {
         }
 
         try {
+            module.hook(Display.class.getDeclaredMethod("getRoundedCorner", int.class)).intercept(chain -> {
+                Object result = chain.proceed();
+                try {
+                    if ((result == null || (result instanceof android.view.RoundedCorner rc && rc.getRadius() <= 0))
+                            && chain.getThisObject() instanceof Display d
+                            && d.getDisplayId() == Display.DEFAULT_DISPLAY
+                            && CoverDisplay.isOuterDisplay(d)
+                            && voiceAssistOverlayAdapting()
+                            && !isDisplayUsingCompatResources(d)) {
+                        int position = (Integer) chain.getArg(0);
+                        android.view.RoundedCorner corner =
+                                CoverDisplay.buildOuterRoundedCorner(d.getRotation(), position);
+                        if (corner != null) {
+                            return corner;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "Display.getRoundedCorner hook unavailable", t);
+        }
+
+        try {
             module.hook(Display.class.getDeclaredMethod("getRealMetrics", android.util.DisplayMetrics.class)).intercept(chain -> {
                 Object result = chain.proceed();
                 try {
@@ -2388,6 +3409,7 @@ final class AppCompatibility {
                                     voiceAssistCompatActivityActive = false;
                                     restoreOverrides(false);
                                 }
+                                syncVoiceAssistHaloWindows(d, false);
                                 return result;
                             }
                             outerProcess = true;
@@ -2396,6 +3418,9 @@ final class AppCompatibility {
                         if (isOuter && out != null && voiceAssistOverlayAdapting() && !isDisplayUsingCompatResources(d)) {
                             int[] t = nativeCoverTarget(CoverDisplay.isPortraitRotation(d.getRotation()));
                             applyRealCoverMetrics(out, t);
+                            if (d.getDisplayId() == Display.DEFAULT_DISPLAY) {
+                                syncVoiceAssistHaloWindows(d, true);
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -2422,6 +3447,7 @@ final class AppCompatibility {
                                     voiceAssistCompatActivityActive = false;
                                     restoreOverrides(false);
                                 }
+                                syncVoiceAssistHaloWindows(d, false);
                                 return result;
                             }
                             outerProcess = true;
@@ -2430,6 +3456,9 @@ final class AppCompatibility {
                         if (isOuter && out != null && voiceAssistOverlayAdapting() && !isDisplayUsingCompatResources(d)) {
                             int[] t = nativeCoverTarget(CoverDisplay.isPortraitRotation(d.getRotation()));
                             out.set(t[0], t[1]);
+                            if (d.getDisplayId() == Display.DEFAULT_DISPLAY) {
+                                syncVoiceAssistHaloWindows(d, true);
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -2438,6 +3467,76 @@ final class AppCompatibility {
             });
         } catch (Throwable t) {
             Log.w(TAG, "Display.getRealSize hook unavailable", t);
+        }
+
+        try {
+            Class<?> wmgCls = Class.forName("android.view.WindowManagerGlobal");
+            for (java.lang.reflect.Method m : wmgCls.getDeclaredMethods()) {
+                String name = m.getName();
+                if ("addView".equals(name)) {
+                    module.hook(m).intercept(chain -> {
+                        try {
+                            if (chain.getArg(0) instanceof View v
+                                    && chain.getArg(1) instanceof WindowManager.LayoutParams lp
+                                    && isVoiceAssistFullscreenHaloWindow(lp, v)) {
+                                voiceAssistHaloViews.put(v, lp);
+                                Display d = chain.getArgs().size() > 2 && chain.getArg(2) instanceof Display disp
+                                        ? disp : resolveRealDefaultDisplay();
+                                if (d != null) {
+                                    if (CoverDisplay.isOuterDisplay(d) && voiceAssistOverlayAdapting()) {
+                                        normalizeVoiceAssistCoverHaloLayoutParams(lp, d.getRotation());
+                                    } else if (!CoverDisplay.isOuterDisplay(d) && d.getMode() != null) {
+                                        restoreVoiceAssistInnerHaloLayoutParams(
+                                                lp,
+                                                d.getMode().getPhysicalWidth(),
+                                                d.getMode().getPhysicalHeight(),
+                                                d.getRotation());
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    });
+                } else if ("updateViewLayout".equals(name) && m.getParameterCount() == 2) {
+                    module.hook(m).intercept(chain -> {
+                        try {
+                            if (!Boolean.TRUE.equals(updatingVoiceAssistHaloLayout.get())
+                                    && chain.getArg(0) instanceof View v
+                                    && chain.getArg(1) instanceof WindowManager.LayoutParams lp
+                                    && isVoiceAssistFullscreenHaloWindow(lp, v)) {
+                                voiceAssistHaloViews.put(v, lp);
+                                Display d = resolveRealDefaultDisplay();
+                                if (d != null) {
+                                    if (CoverDisplay.isOuterDisplay(d) && voiceAssistOverlayAdapting()) {
+                                        normalizeVoiceAssistCoverHaloLayoutParams(lp, d.getRotation());
+                                    } else if (!CoverDisplay.isOuterDisplay(d) && d.getMode() != null) {
+                                        restoreVoiceAssistInnerHaloLayoutParams(
+                                                lp,
+                                                d.getMode().getPhysicalWidth(),
+                                                d.getMode().getPhysicalHeight(),
+                                                d.getRotation());
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    });
+                } else if ("removeView".equals(name) && m.getParameterCount() == 2) {
+                    module.hook(m).intercept(chain -> {
+                        try {
+                            if (chain.getArg(0) instanceof View v) {
+                                voiceAssistHaloViews.remove(v);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    });
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "WindowManagerGlobal voiceassist halo hook unavailable", t);
         }
 
         try {
@@ -2575,6 +3674,15 @@ final class AppCompatibility {
             Object res = chain.proceed();
             try {
                 if (imeCoverActive) {
+                    if (isLiveDefaultDisplayInner()) {
+                        imeCoverActive = false;
+                        lastImeBoundsRotation = -1;
+                        restoreOverrides(false);
+                        if (res instanceof android.util.DisplayMetrics dm && isCoverSizedMetrics(dm)) {
+                            applyInnerRealToMetrics(dm, queryInnerRealMetrics());
+                        }
+                        return res;
+                    }
                     if (res instanceof android.util.DisplayMetrics dm) {
                         int rot = getDisplayRotation(null);
                         imeRotation = rot;
@@ -2583,6 +3691,11 @@ final class AppCompatibility {
                                 CoverDisplay.coverImeDisplayHeight(rot),
                                 CoverDisplay.coverImeDensityDpi(rot));
                     }
+                } else if (imeProcess
+                        && res instanceof android.util.DisplayMetrics dm
+                        && isCoverSizedMetrics(dm)
+                        && isLiveDefaultDisplayInner()) {
+                    applyInnerRealToMetrics(dm, queryInnerRealMetrics());
                 } else if (outerProcess
                         && ((nativeCoverActivityActive && nativeCoverCompatEnabled())
                                 || (voiceAssistOverlayAdapting() && !isCompatActivityResources((Resources) chain.getThisObject())))
@@ -2599,11 +3712,27 @@ final class AppCompatibility {
             Object res = chain.proceed();
             try {
                 if (imeCoverActive) {
-                    if (res instanceof android.content.res.Configuration cfg) {
-                        int rot = getConfigRotation(cfg);
-                        if (rot > 0) imeRotation = rot;
-                        adaptImeConfig(cfg, imeRotation);
+                    if (isLiveDefaultDisplayInner()) {
+                        imeCoverActive = false;
+                        lastImeBoundsRotation = -1;
+                        restoreOverrides(false);
+                        if (res instanceof android.content.res.Configuration cfg && isCoverSizedConfig(cfg)) {
+                            applyInnerRealToConfig(cfg, queryInnerRealMetrics());
+                        }
+                        return res;
                     }
+                    if (res instanceof android.content.res.Configuration cfg) {
+                        int cfgRot = getConfigRotation(cfg);
+                        int liveRot = getLiveImeDisplayRotation(cfgRot >= 0 && cfgRot != liveImeDisplayRotation);
+                        int rot = resolveImeRotationForConfig(cfg, liveRot, imeRotation);
+                        imeRotation = rot;
+                        adaptImeConfig(cfg, rot);
+                    }
+                } else if (imeProcess
+                        && res instanceof android.content.res.Configuration cfg
+                        && isCoverSizedConfig(cfg)
+                        && isLiveDefaultDisplayInner()) {
+                    applyInnerRealToConfig(cfg, queryInnerRealMetrics());
                 } else if (outerProcess
                         && ((nativeCoverActivityActive && nativeCoverCompatEnabled())
                                 || (voiceAssistOverlayAdapting() && !isCompatActivityResources((Resources) chain.getThisObject())))

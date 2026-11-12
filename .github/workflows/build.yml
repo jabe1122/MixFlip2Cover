@@ -71,7 +71,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :app:assembleRelease --no-daemon
-          cp app/build/outputs/apk/release/app-release.apk MixFlip2Cover-release.apk
+          VN=$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n1)
+          APK_NAME="MixFlip2Cover-${VN}-release.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$APK_NAME"
+          echo "APK_NAME=$APK_NAME" >> "$GITHUB_ENV"
 
       - name: Remove temporary signing key
         if: always() && env.HAS_SIGNING_KEY == 'true'
@@ -81,7 +84,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
         run: |
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)
-          CERT_INFO=$("$APKSIGNER" verify --min-sdk-version 24 --verbose --print-certs MixFlip2Cover-release.apk)
+          CERT_INFO=$("$APKSIGNER" verify --min-sdk-version 24 --verbose --print-certs "$APK_NAME")
           echo "$CERT_INFO"
           if grep -q "CN=Android Debug" <<< "$CERT_INFO"; then
             echo "::error::Refusing to publish debug-signed APK on tag release."
@@ -99,11 +102,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: MixFlip2Cover-${{ github.sha }}
-          path: MixFlip2Cover-release.apk
+          path: ${{ env.APK_NAME }}
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: MixFlip2Cover-release.apk
+          files: ${{ env.APK_NAME }}
           generate_release_notes: true
