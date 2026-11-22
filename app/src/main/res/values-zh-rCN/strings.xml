@@ -58,8 +58,8 @@
     <string name="sw_immersive_sub">隐藏外屏状态栏并右移隐私绿点，展开内屏自动恢复（已打开的应用需重开生效）</string>
     <string name="sw_compat_title">应用顶栏去留白</string>
     <string name="sw_compat_sub">统一外屏应用顶部 30px 留白，兼顾全屏视觉与顶部点击（需重开对应应用生效）</string>
-    <string name="sw_ime_title">外屏微信输入法适配</string>
-    <string name="sw_ime_sub">仅针对微信输入法适配外屏高度、摄像头半圆避让与留白（重开键盘或输入法生效）</string>
+    <string name="sw_ime_title">外屏第三方输入法适配</string>
+    <string name="sw_ime_sub">保持微信输入法、Gboard、百度、讯飞等默认输入法在外屏可用，并绕过系统强制切回搜狗</string>
     <string name="section_orb">状态圈</string>
     <string name="sw_battery_title">显示电量数字</string>
     <string name="sw_battery_sub">电量环顶部显示百分比，充满显示插头</string>
@@ -79,11 +79,24 @@
     <string name="row_pinned_widget_apps_summary">已固定 %1$d/4：%2$s</string>
     <string name="chip_configure">选择</string>
     <string name="picker_pinned_title">选择固定的常用应用（最多 4 个）</string>
-    <string name="picker_pinned_sub">按勾选顺序固定在 2×2 应用图标小组件中；点击上方槽位可移除对应应用，未满 4 个时自动用最近任务补齐。</string>
+    <string name="picker_pinned_sub">按勾选顺序固定在 2×2 应用图标小组件中；点击上方槽位可调整顺序或移除，未满 4 个时自动用最近任务补齐。</string>
     <string name="picker_pinned_slot_empty">空位 %1$d</string>
     <string name="picker_pinned_clear">清空已选</string>
     <string name="filter_pinned_only">已固定</string>
+    <string name="filter_selected">已选择</string>
     <string name="tag_pinned_order">固定 #%1$d</string>
+    <string name="tag_dual_app">双开</string>
+    <string name="dual_app_name_fmt">%1$s（双开）</string>
+    <string name="slot_numbered_fmt">%1$d. %2$s</string>
+    <string name="tag_uninstalled">已卸载</string>
+    <string name="btn_slot_move_up">↑ 前移</string>
+    <string name="btn_slot_move_down">↓ 后移</string>
+    <string name="btn_slot_remove">移除</string>
+    <string name="a11y_slot_move_prev">向前移动槽位</string>
+    <string name="a11y_slot_move_next">向后移动槽位</string>
+    <string name="banner_uninstalled_found">检测到 %1$d 个已卸载应用</string>
+    <string name="btn_prune_uninstalled">一键清理</string>
+    <string name="msg_uninstalled_pruned">已清理 %1$d 个已卸载应用</string>
     <string name="btn_save_pinned">保存固定图标</string>
     <string name="msg_pinned_limit">最多可固定 4 个常用应用（可点击上方槽位或取消勾选后更换）</string>
     <string name="msg_pinned_saved">已保存 %1$d 个固定常用应用，返回外屏即刻生效</string>
@@ -93,8 +106,8 @@
 
     <!-- Compatibility page -->
     <string name="section_ime_compat">输入法适配</string>
-    <string name="info_ime_scope_title">仅针对微信输入法（4.0.x）适配</string>
-    <string name="info_ime_scope_sub">外屏键盘布局、摄像头半圆避让与高度仅针对微信输入法适配；需将「微信输入法」加入模块作用域并重启输入法生效</string>
+    <string name="info_ime_scope_title">通用第三方输入法 + 微信输入法专项适配</string>
+    <string name="info_ime_scope_sub">系统框架已为所有第三方输入法自动裁切外屏宽度与 DPI，可随时微调高度/缩放/避让；未加固的输入法建议加入作用域以获得更佳顶栏避让</string>
     <string name="row_zero_blank_title">一键开启全屏去留白</string>
     <string name="row_zero_blank_sub">同时开启外屏全屏与顶栏去留白并同步状态</string>
     <string name="chip_enable">开启</string>
@@ -129,6 +142,8 @@
     <string name="dialog_diag_log_title">诊断与运行日志</string>
     <string name="dialog_diag_log_sub">已汇总：%1$s（共 %2$d 条日志）</string>
     <string name="dialog_diag_log_empty">当前暂无新增运行日志（操作外屏或开启详细日志后点击「刷新」查看）</string>
+    <string name="diag_log_redact_title">隐私脱敏</string>
+    <string name="diag_log_redact_sub">预览、复制与分享时隐藏非系统个人应用包名</string>
     <string name="btn_refresh_log">刷新</string>
     <string name="btn_clear_log">清空</string>
     <string name="btn_share_log">分享导出</string>
@@ -154,7 +169,7 @@
 
     <!-- Dialogs -->
     <string name="dialog_restore_title">恢复系统默认？</string>
-    <string name="dialog_restore_message">将执行以下操作：\n• 停用外屏状态栏资源覆盖层\n• 重新启用系统自带的搜狗外屏输入法\n• 关闭外屏应用全屏、顶栏去留白与微信输入法适配\n\n此操作需要系统框架处于激活状态。若模块已被停用，请通过 adb 手动执行以下命令（长按复制）：</string>
+    <string name="dialog_restore_message">将执行以下操作：\n• 停用外屏状态栏资源覆盖层\n• 重新启用系统自带的搜狗外屏输入法\n• 关闭外屏应用全屏、顶栏去留白、四宫格快捷按键组件与微信输入法适配\n\n此操作需要系统框架处于激活状态。若模块已被停用，请通过 adb 手动执行以下命令（长按复制）：</string>
     <string name="dialog_adb_title">手动恢复命令</string>
     <string name="dialog_adb_message">模块已停用或系统框架未激活时，在电脑上通过 adb 执行以下命令（长按复制）：</string>
     <string name="dialog_reset_title">重置作用域？</string>
@@ -189,7 +204,7 @@
     <string name="picker_title">选择扩展适配应用</string>
     <string name="picker_sub">普通应用无需勾选；专项适配应用勾选保存后，强行停止或重开生效。</string>
     <string name="picker_sub_deep">本机已安装的内置专项适配应用（含系统日历与设置），勾选保存后强行停止或重开生效。</string>
-    <string name="picker_search_hint">搜索应用名称或包名...</string>
+    <string name="picker_search_hint">搜索应用名称或包名…</string>
     <string name="filter_third">第三方应用</string>
     <string name="filter_deep_compat">深度适配</string>
     <string name="filter_all">全部应用</string>
@@ -223,4 +238,143 @@
     <string name="msg_effect_launcher">已更新，返回外屏桌面即刻生效（若未刷新可重启外屏桌面）</string>
     <string name="msg_effect_reopen_app">已更新，状态栏实时生效；已打开的外屏应用需重新打开后生效</string>
     <string name="msg_effect_ime">已更新，收起并重新弹出键盘（或重启微信输入法）后生效</string>
+
+    <!-- 2x2 Quick Actions Widget -->
+    <string name="sw_quick_widget_title">四宫格快捷按键组件</string>
+    <string name="sw_quick_widget_sub">独立 2×2 外屏柔雾毛玻璃组件，支持主页键、任务键、锁屏键、返回键及自定义快捷功能</string>
+    <string name="row_quick_widget_slots_title">自定义四宫格功能</string>
+    <string name="row_quick_widget_slots_summary">%1$s · %2$s · %3$s · %4$s</string>
+    <string name="picker_quick_title">自定义四宫格按键</string>
+    <string name="picker_quick_sub">点击上方四宫格选中槽位，再点击下方功能即可分配</string>
+    <string name="picker_quick_editing_slot">正在编辑：槽位 %1$d（%2$s）</string>
+    <string name="picker_quick_slot_pos_1">左上</string>
+    <string name="picker_quick_slot_pos_2">右上</string>
+    <string name="picker_quick_slot_pos_3">左下</string>
+    <string name="picker_quick_slot_pos_4">右下</string>
+    <string name="qa_group_nav">核心导航与锁屏</string>
+    <string name="qa_group_ctrl">快捷控制与应用</string>
+    <string name="qa_action_home">主页键</string>
+    <string name="qa_action_home_desc">返回外屏桌面主页</string>
+    <string name="qa_action_recents">任务键</string>
+    <string name="qa_action_recents_desc">打开或退出外屏最近任务</string>
+    <string name="qa_action_lock">锁屏键</string>
+    <string name="qa_action_lock_desc">立即熄屏并锁定外屏</string>
+    <string name="qa_action_back">返回键</string>
+    <string name="qa_action_back_desc">在当前外屏界面执行返回操作</string>
+    <string name="qa_action_notifications">通知栏</string>
+    <string name="qa_action_notifications_desc">展开外屏通知中心</string>
+    <string name="qa_action_control_center">控制中心</string>
+    <string name="qa_action_control_center_desc">展开外屏控制中心</string>
+    <string name="qa_action_torch">手电筒</string>
+    <string name="qa_action_torch_desc">一键开关闪光灯并实时高亮状态</string>
+    <string name="qa_action_screenshot">截屏</string>
+    <string name="qa_action_screenshot_desc">截取当前外屏画面</string>
+    <string name="qa_action_ringer">响铃模式</string>
+    <string name="qa_action_ringer_desc">循环切换响铃 / 振动 / 静音</string>
+    <string name="qa_action_rotation_lock">方向锁定</string>
+    <string name="qa_action_rotation_lock_desc">切换自动旋转并锁定当前屏幕方向</string>
+    <string name="qa_action_media_play_pause">播放 / 暂停</string>
+    <string name="qa_action_media_play_pause_desc">控制当前媒体播放或暂停</string>
+    <string name="qa_action_brightness">外屏亮度</string>
+    <string name="qa_action_brightness_desc">循环切换自动 / 低 / 中 / 高外屏亮度</string>
+    <string name="qa_action_scan">扫一扫</string>
+    <string name="qa_action_scan_desc">直达微信扫一扫（未安装时回退支付宝）</string>
+    <string name="qa_action_app">启动指定应用…</string>
+    <string name="qa_action_app_desc">为此槽位绑定任意已安装应用</string>
+    <string name="qa_action_app_fmt">应用：%1$s</string>
+    <string name="picker_quick_app_title">为槽位 %1$d 选择应用</string>
+    <string name="btn_reset_default">恢复默认</string>
+    <string name="btn_save_quick_slots">保存</string>
+    <string name="msg_quick_slots_saved">四宫格快捷组件已更新（%1$s）</string>
+
+    <!-- Feature 1: Fold-close seamless continuity -->
+    <string name="section_fold_continuity">合盖无缝续屏</string>
+    <string name="row_fold_mode_title">合盖续屏模式</string>
+    <string name="fold_mode_system">跟随系统默认设置</string>
+    <string name="fold_mode_selected">仅选定应用合盖直亮续屏</string>
+    <string name="fold_mode_selected_fmt">仅选定应用（已选 %1$d 个）合盖直亮续屏</string>
+    <string name="fold_mode_all">全局应用合盖直亮续屏</string>
+    <string name="row_fold_apps_title">自定义合盖续屏应用</string>
+    <string name="row_fold_apps_empty">暂未选择应用，点击勾选合盖时直接续接外屏的程序</string>
+    <string name="row_fold_apps_summary">已选 %1$d 个：%2$s</string>
+    <string name="picker_fold_apps_title">选择合盖直亮续屏应用</string>
+    <string name="picker_fold_apps_sub">在前台运行已选应用时合盖，外屏将保持唤醒并直接续接显示，无需解锁或上滑</string>
+    <string name="btn_save_fold_apps">保存续屏应用</string>
+    <string name="msg_fold_apps_saved">已保存 %1$d 个合盖续屏应用</string>
+    <string name="sw_fold_pocket_title">合盖口袋防误触保护</string>
+    <string name="sw_fold_pocket_sub">合盖续屏后检测外屏背部接近传感器，放入口袋或被遮挡时自动息屏锁屏</string>
+
+    <!-- Feature 2: Launcher unlock, double-tap lock & StatusOrb actions -->
+    <string name="sw_unlock_launcher_title">解锁外屏桌面全部应用</string>
+    <string name="sw_unlock_launcher_sub">解除外屏桌面编辑页白名单/黑名单过滤，支持添加任意应用及双开应用</string>
+    <string name="sw_double_tap_lock_title">外屏空白处双击锁屏</string>
+    <string name="sw_double_tap_lock_sub">在外屏桌面或镜头列空白处双击，立即息屏并锁定外屏</string>
+    <string name="row_orb_tap_title">单击状态圈动作</string>
+    <string name="row_orb_long_title">长按状态圈动作</string>
+    <string name="orb_action_none">无（仅展示状态）</string>
+    <string name="orb_action_none_desc">保持状态圈不可点击，触摸事件直接穿透到底层界面</string>
+    <string name="picker_orb_tap_title">选择单击状态圈动作</string>
+    <string name="picker_orb_long_title">选择长按状态圈动作</string>
+    <string name="picker_orb_tap_app_title">选择单击状态圈启动应用</string>
+    <string name="picker_orb_long_app_title">选择长按状态圈启动应用</string>
+    <string name="picker_orb_sub">在状态圈区域向下滑动仍可正常展开通知栏或控制中心</string>
+    <string name="msg_orb_action_saved">已更新状态圈动作：%1$s</string>
+
+    <!-- Feature 4: Universal cover IME tuning -->
+    <string name="row_ime_tuning_title">外屏键盘参数微调</string>
+    <string name="row_ime_tuning_summary">缩放 %1$d%% · 高度 %2$d%% · 镜头避让 %3$s</string>
+    <string name="dialog_ime_tuning_title">外屏键盘参数微调</string>
+    <string name="ime_tuning_scale_label">键盘界面缩放（DPI）</string>
+    <string name="ime_tuning_height_label">键盘高度比例</string>
+    <string name="ime_tuning_inset_label">正握（镜头左上）候选栏避让宽度</string>
+    <string name="ime_inset_auto">自动（398px）</string>
+    <string name="ime_inset_none">不避让（0px）</string>
+    <string name="ime_inset_compact">紧凑（260px）</string>
+    <string name="ime_inset_standard">标准（398px）</string>
+    <string name="ime_inset_wide">加宽（430px）</string>
+    <string name="btn_switch_ime">切换输入法</string>
+    <string name="msg_ime_tuning_saved">已保存外屏键盘参数，收起并重新弹出键盘后生效</string>
+
+    <!-- Feature 6: Per-app cover rules & JSON share/import -->
+    <string name="section_per_app_rules">分应用外屏规则</string>
+    <string name="row_per_app_rules_title">单应用覆盖规则面板</string>
+    <string name="row_per_app_rules_empty">暂未配置单应用覆盖规则，点击为任意应用单独设置留白、宽度与缩放</string>
+    <string name="row_per_app_rules_summary">已自定义 %1$d 个应用规则</string>
+    <string name="row_rules_json_title">规则 JSON 分享与导入</string>
+    <string name="row_rules_json_sub">导出、复制、分享或粘贴导入分应用外屏适配规则配置</string>
+    <string name="picker_rules_title">单应用外屏规则</string>
+    <string name="picker_rules_sub">点击任意应用可单独配置顶部留白、渲染宽度模式及界面缩放比例</string>
+    <string name="filter_has_rules">已配规则</string>
+    <string name="tag_rule_default">默认</string>
+    <string name="rule_editor_title">外屏规则：%1$s</string>
+    <string name="rule_top_gap_label">顶部留白高度（px）</string>
+    <string name="rule_top_gap_default">跟随默认（30px）</string>
+    <string name="rule_top_gap_zero">0px 零留白</string>
+    <string name="rule_top_gap_30">30px 黄金微留白</string>
+    <string name="rule_top_gap_60">60px 宽松</string>
+    <string name="rule_top_gap_114">114px 原生高度</string>
+    <string name="rule_top_gap_custom">自定义…</string>
+    <string name="rule_gap_custom_hint">输入 0～160 px</string>
+    <string name="rule_width_label">渲染宽度模式</string>
+    <string name="rule_width_default">跟随系统默认</string>
+    <string name="rule_width_column">避让镜头列（810px）</string>
+    <string name="rule_width_full">全宽铺满（1208px）</string>
+    <string name="rule_scale_label">外屏界面缩放</string>
+    <string name="rule_scale_default">跟随系统默认</string>
+    <string name="rule_scale_fmt">%1$d%%</string>
+    <string name="btn_save_rule">保存规则</string>
+    <string name="btn_launch_cover_test">外屏打开测试</string>
+    <string name="msg_launch_app_failed">无法启动该应用</string>
+    <string name="msg_rule_saved">已保存「%1$s」外屏规则（修改宽度或缩放需重开应用生效）</string>
+    <string name="msg_rule_cleared">已恢复「%1$s」默认外屏规则</string>
+    <string name="dialog_rules_json_title">分应用规则 JSON</string>
+    <string name="dialog_rules_json_sub">当前共 %1$d 条自定义规则；可在下方粘贴 JSON 进行合并或覆盖导入</string>
+    <string name="dialog_rules_json_hint">在此粘贴 mixflip2cover.rules.v1 格式 JSON…</string>
+    <string name="btn_copy_json">复制 JSON</string>
+    <string name="btn_share_json">分享</string>
+    <string name="btn_import_merge">合并导入</string>
+    <string name="btn_import_replace">覆盖导入</string>
+    <string name="msg_json_copied">已复制规则 JSON 到剪贴板</string>
+    <string name="msg_json_imported">已成功导入 %1$d 条分应用规则</string>
+    <string name="msg_json_invalid">JSON 格式无效：%1$s</string>
 </resources>

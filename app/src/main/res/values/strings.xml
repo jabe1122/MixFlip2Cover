@@ -58,8 +58,8 @@
     <string name="sw_immersive_sub">Hides the cover status bar and moves the privacy dot; restored automatically when unfolded</string>
     <string name="sw_compat_title">Remove app top gap</string>
     <string name="sw_compat_sub">Uses a uniform 30px top gap in cover apps, balancing the fullscreen look and top taps</string>
-    <string name="sw_ime_title">WeType cover keyboard</string>
-    <string name="sw_ime_sub">Exclusively adapts WeChat Input Method (WeType) for the cover screen and bypasses forced Sogou switching</string>
+    <string name="sw_ime_title">Third-party cover keyboard</string>
+    <string name="sw_ime_sub">Keeps your preferred keyboard (WeType, Gboard, Baidu, iFlytek, etc.) on the cover screen and bypasses forced Sogou switching</string>
     <string name="section_orb">Status orb</string>
     <string name="sw_battery_title">Battery percentage</string>
     <string name="sw_battery_sub">Shows the percentage on top of the battery ring, and a plug when fully charged</string>
@@ -79,11 +79,24 @@
     <string name="row_pinned_widget_apps_summary">Pinned %1$d/4: %2$s</string>
     <string name="chip_configure">Select</string>
     <string name="picker_pinned_title">Pin favorite apps (up to 4)</string>
-    <string name="picker_pinned_sub">Apps are placed in the 2×2 cover widget in selection order. Tap a slot above to remove it; unfilled slots use recent apps.</string>
+    <string name="picker_pinned_sub">Apps are placed in the 2×2 cover widget in selection order. Tap a slot above to reorder or remove; unfilled slots use recent apps.</string>
     <string name="picker_pinned_slot_empty">Slot %1$d</string>
     <string name="picker_pinned_clear">Clear all</string>
     <string name="filter_pinned_only">Pinned</string>
+    <string name="filter_selected">Selected</string>
     <string name="tag_pinned_order">Pin #%1$d</string>
+    <string name="tag_dual_app">Dual</string>
+    <string name="dual_app_name_fmt">%1$s (Dual)</string>
+    <string name="slot_numbered_fmt">%1$d. %2$s</string>
+    <string name="tag_uninstalled">Uninstalled</string>
+    <string name="btn_slot_move_up">↑ Up</string>
+    <string name="btn_slot_move_down">↓ Down</string>
+    <string name="btn_slot_remove">Remove</string>
+    <string name="a11y_slot_move_prev">Move slot earlier</string>
+    <string name="a11y_slot_move_next">Move slot later</string>
+    <string name="banner_uninstalled_found">%1$d uninstalled app(s) detected</string>
+    <string name="btn_prune_uninstalled">Clean up</string>
+    <string name="msg_uninstalled_pruned">Cleaned %1$d uninstalled app(s)</string>
     <string name="btn_save_pinned">Save pinned apps</string>
     <string name="msg_pinned_limit">Up to 4 apps can be pinned (tap a slot above or uncheck an app to replace it)</string>
     <string name="msg_pinned_saved">Saved %1$d pinned app(s); takes effect immediately on the cover screen</string>
@@ -93,8 +106,8 @@
 
     <!-- Compatibility page -->
     <string name="section_ime_compat">Input method adaptation</string>
-    <string name="info_ime_scope_title">Adapted for WeChat Input Method (WeType) only</string>
-    <string name="info_ime_scope_sub">Cover keyboard height, camera cutout curve and layout are adapted exclusively for WeType (4.0.x); add WeType to the module scope and restart it to apply</string>
+    <string name="info_ime_scope_title">Universal cover keyboard &amp; WeType deep fit</string>
+    <string name="info_ime_scope_sub">Cover DisplayArea bounds and DPI apply to all third-party IMEs; WeType 4.0.x also gets concave camera-curve layout. Add unpacked IMEs to scope if needed</string>
     <string name="row_zero_blank_title">Enable fullscreen &amp; gap removal</string>
     <string name="row_zero_blank_sub">Turns on fullscreen cover apps and top-gap removal together</string>
     <string name="chip_enable">Enable</string>
@@ -129,6 +142,8 @@
     <string name="dialog_diag_log_title">Diagnostic &amp; Runtime Logs</string>
     <string name="dialog_diag_log_sub">Sources: %1$s (%2$d log entries)</string>
     <string name="dialog_diag_log_empty">No runtime log entries yet (use the cover screen or enable verbose log, then tap Refresh)</string>
+    <string name="diag_log_redact_title">Redact personal packages</string>
+    <string name="diag_log_redact_sub">Hide non-system personal app package names in preview, copy &amp; share</string>
     <string name="btn_refresh_log">Refresh</string>
     <string name="btn_clear_log">Clear</string>
     <string name="btn_share_log">Share</string>
@@ -154,7 +169,7 @@
 
     <!-- Dialogs -->
     <string name="dialog_restore_title">Restore system defaults?</string>
-    <string name="dialog_restore_message">This will:\n• disable the cover status-bar resource overlay\n• re-enable the stock Sogou cover keyboard\n• turn off fullscreen cover apps, top-gap removal and WeType cover keyboard adaptation\n\nThe framework hooks must be active. If the module is already disabled, run these commands via adb instead (long-press to copy):</string>
+    <string name="dialog_restore_message">This will:\n• disable the cover status-bar resource overlay\n• re-enable the stock Sogou cover keyboard\n• turn off fullscreen cover apps, top-gap removal, Quick Actions widget and WeType cover keyboard adaptation\n\nThe framework hooks must be active. If the module is already disabled, run these commands via adb instead (long-press to copy):</string>
     <string name="dialog_adb_title">Manual recovery commands</string>
     <string name="dialog_adb_message">If the module is disabled or the framework is not active, run these adb commands from a computer (long-press to copy):</string>
     <string name="dialog_reset_title">Reset scopes?</string>
@@ -223,4 +238,143 @@
     <string name="msg_effect_launcher">Updated; takes effect when returning to the cover launcher</string>
     <string name="msg_effect_reopen_app">Updated; reopen running cover apps for window layout changes to take effect</string>
     <string name="msg_effect_ime">Updated; reopen the keyboard or restart WeType to apply</string>
+
+    <!-- 2x2 Quick Actions Widget -->
+    <string name="sw_quick_widget_title">Four-grid quick actions widget</string>
+    <string name="sw_quick_widget_sub">Standalone 2×2 frosted cover widget with customizable Home, Recents, Lock &amp; Back keys</string>
+    <string name="row_quick_widget_slots_title">Customize four-grid buttons</string>
+    <string name="row_quick_widget_slots_summary">%1$s · %2$s · %3$s · %4$s</string>
+    <string name="picker_quick_title">Customize 2×2 Quick Actions</string>
+    <string name="picker_quick_sub">Tap a slot in the 2×2 preview above, then choose a function below</string>
+    <string name="picker_quick_editing_slot">Editing slot %1$d (%2$s)</string>
+    <string name="picker_quick_slot_pos_1">Top-left</string>
+    <string name="picker_quick_slot_pos_2">Top-right</string>
+    <string name="picker_quick_slot_pos_3">Bottom-left</string>
+    <string name="picker_quick_slot_pos_4">Bottom-right</string>
+    <string name="qa_group_nav">Navigation &amp; lock</string>
+    <string name="qa_group_ctrl">Quick controls &amp; app</string>
+    <string name="qa_action_home">Home</string>
+    <string name="qa_action_home_desc">Return to the cover home screen</string>
+    <string name="qa_action_recents">Recents</string>
+    <string name="qa_action_recents_desc">Open or close cover recent tasks</string>
+    <string name="qa_action_lock">Lock screen</string>
+    <string name="qa_action_lock_desc">Turn off and lock the cover display</string>
+    <string name="qa_action_back">Back</string>
+    <string name="qa_action_back_desc">Navigate back in the current cover app</string>
+    <string name="qa_action_notifications">Notification shade</string>
+    <string name="qa_action_notifications_desc">Pull down cover notifications</string>
+    <string name="qa_action_control_center">Control Center</string>
+    <string name="qa_action_control_center_desc">Expand cover quick settings</string>
+    <string name="qa_action_torch">Flashlight</string>
+    <string name="qa_action_torch_desc">Toggle rear flashlight with live highlight</string>
+    <string name="qa_action_screenshot">Screenshot</string>
+    <string name="qa_action_screenshot_desc">Capture the current cover screen</string>
+    <string name="qa_action_ringer">Sound mode</string>
+    <string name="qa_action_ringer_desc">Cycle ring / vibrate / silent mode</string>
+    <string name="qa_action_rotation_lock">Rotation lock</string>
+    <string name="qa_action_rotation_lock_desc">Toggle auto-rotate and lock current orientation</string>
+    <string name="qa_action_media_play_pause">Play / Pause</string>
+    <string name="qa_action_media_play_pause_desc">Play or pause active media playback</string>
+    <string name="qa_action_brightness">Cover brightness</string>
+    <string name="qa_action_brightness_desc">Cycle Auto / Low / Medium / High brightness</string>
+    <string name="qa_action_scan">Quick scan</string>
+    <string name="qa_action_scan_desc">Open WeChat Scan (falls back to Alipay Scan)</string>
+    <string name="qa_action_app">Launch app…</string>
+    <string name="qa_action_app_desc">Assign any installed app to this slot</string>
+    <string name="qa_action_app_fmt">App: %1$s</string>
+    <string name="picker_quick_app_title">Select app for slot %1$d</string>
+    <string name="btn_reset_default">Defaults</string>
+    <string name="btn_save_quick_slots">Save</string>
+    <string name="msg_quick_slots_saved">Quick actions widget updated (%1$s)</string>
+
+    <!-- Feature 1: Fold-close seamless continuity -->
+    <string name="section_fold_continuity">Fold-close continuity</string>
+    <string name="row_fold_mode_title">Fold-close continuity mode</string>
+    <string name="fold_mode_system">Follow system continuity settings</string>
+    <string name="fold_mode_selected">Selected apps stay awake on cover</string>
+    <string name="fold_mode_selected_fmt">Selected apps (%1$d) stay awake on cover</string>
+    <string name="fold_mode_all">All apps stay awake on cover</string>
+    <string name="row_fold_apps_title">Custom fold-awake apps</string>
+    <string name="row_fold_apps_empty">No apps selected yet; tap to pick apps that stay open on cover when folded</string>
+    <string name="row_fold_apps_summary">Selected %1$d: %2$s</string>
+    <string name="picker_fold_apps_title">Apps kept awake when folded</string>
+    <string name="picker_fold_apps_sub">Closing the phone while these apps are in the foreground switches directly to the cover screen without locking</string>
+    <string name="btn_save_fold_apps">Save continuity apps</string>
+    <string name="msg_fold_apps_saved">Saved %1$d fold-awake app(s)</string>
+    <string name="sw_fold_pocket_title">Pocket proximity lock guard</string>
+    <string name="sw_fold_pocket_sub">Checks the rear cover proximity sensor after folding and locks the screen if placed in a pocket</string>
+
+    <!-- Feature 2: Launcher unlock, double-tap lock & StatusOrb actions -->
+    <string name="sw_unlock_launcher_title">Unlock all cover launcher apps</string>
+    <string name="sw_unlock_launcher_sub">Removes HyperOS allowlist/blacklist filtering in the cover launcher editor (includes dual apps)</string>
+    <string name="sw_double_tap_lock_title">Double-tap empty space to lock</string>
+    <string name="sw_double_tap_lock_sub">Double-tap empty wallpaper space on the cover desktop to turn off and lock the screen</string>
+    <string name="row_orb_tap_title">Status orb single tap</string>
+    <string name="row_orb_long_title">Status orb long press</string>
+    <string name="orb_action_none">None (display only)</string>
+    <string name="orb_action_none_desc">Keep status orb non-interactive so touches pass through</string>
+    <string name="picker_orb_tap_title">Choose status orb tap action</string>
+    <string name="picker_orb_long_title">Choose status orb long-press action</string>
+    <string name="picker_orb_tap_app_title">Select app for orb tap</string>
+    <string name="picker_orb_long_app_title">Select app for orb long press</string>
+    <string name="picker_orb_sub">Pulling down over the status orb still expands Notifications or Control Center</string>
+    <string name="msg_orb_action_saved">Status orb action updated: %1$s</string>
+
+    <!-- Feature 4: Universal cover IME tuning -->
+    <string name="row_ime_tuning_title">Cover keyboard layout tuning</string>
+    <string name="row_ime_tuning_summary">Scale %1$d%% · Height %2$d%% · Candidate inset %3$s</string>
+    <string name="dialog_ime_tuning_title">Cover keyboard tuning</string>
+    <string name="ime_tuning_scale_label">Keyboard density scale</string>
+    <string name="ime_tuning_height_label">Keyboard max height ratio</string>
+    <string name="ime_tuning_inset_label">Camera-side candidate bar inset (upright)</string>
+    <string name="ime_inset_auto">Auto (398px)</string>
+    <string name="ime_inset_none">None (0px)</string>
+    <string name="ime_inset_compact">Compact (260px)</string>
+    <string name="ime_inset_standard">Standard (398px)</string>
+    <string name="ime_inset_wide">Wide (430px)</string>
+    <string name="btn_switch_ime">Switch IME</string>
+    <string name="msg_ime_tuning_saved">Cover keyboard tuning saved; reopen keyboard to apply</string>
+
+    <!-- Feature 6: Per-app cover rules & JSON share/import -->
+    <string name="section_per_app_rules">Per-app cover rules</string>
+    <string name="row_per_app_rules_title">Per-app cover rule editor</string>
+    <string name="row_per_app_rules_empty">No custom per-app overrides; tap to configure top gap, width or scale per app</string>
+    <string name="row_per_app_rules_summary">%1$d app(s) customized</string>
+    <string name="row_rules_json_title">Share &amp; import rules JSON</string>
+    <string name="row_rules_json_sub">Export, copy, share or import per-app cover rule JSON presets</string>
+    <string name="picker_rules_title">Per-app cover rules</string>
+    <string name="picker_rules_sub">Tap an app to customize its cover top gap, width mode, and UI scale</string>
+    <string name="filter_has_rules">Customized</string>
+    <string name="tag_rule_default">Default</string>
+    <string name="rule_editor_title">Cover rule: %1$s</string>
+    <string name="rule_top_gap_label">Top gap height (px)</string>
+    <string name="rule_top_gap_default">Default (30px)</string>
+    <string name="rule_top_gap_zero">0px (Zero)</string>
+    <string name="rule_top_gap_30">30px (Compact)</string>
+    <string name="rule_top_gap_60">60px (Relaxed)</string>
+    <string name="rule_top_gap_114">114px (Stock)</string>
+    <string name="rule_top_gap_custom">Custom…</string>
+    <string name="rule_gap_custom_hint">Enter 0–160 px</string>
+    <string name="rule_width_label">Render width mode</string>
+    <string name="rule_width_default">System default</string>
+    <string name="rule_width_column">Safe column (810px)</string>
+    <string name="rule_width_full">Full width (1208px)</string>
+    <string name="rule_scale_label">Cover UI scale</string>
+    <string name="rule_scale_default">System default</string>
+    <string name="rule_scale_fmt">%1$d%%</string>
+    <string name="btn_save_rule">Save rule</string>
+    <string name="btn_launch_cover_test">Launch on cover</string>
+    <string name="msg_launch_app_failed">Unable to launch this app</string>
+    <string name="msg_rule_saved">Saved cover rule for %1$s (reopen app if width/scale changed)</string>
+    <string name="msg_rule_cleared">Restored default cover rule for %1$s</string>
+    <string name="dialog_rules_json_title">Per-app rules JSON</string>
+    <string name="dialog_rules_json_sub">%1$d custom app rule(s). Paste JSON below to merge or replace.</string>
+    <string name="dialog_rules_json_hint">Paste mixflip2cover.rules.v1 JSON here…</string>
+    <string name="btn_copy_json">Copy</string>
+    <string name="btn_share_json">Share</string>
+    <string name="btn_import_merge">Merge</string>
+    <string name="btn_import_replace">Replace</string>
+    <string name="msg_json_copied">Copied rules JSON to clipboard</string>
+    <string name="msg_json_imported">Imported %1$d per-app cover rule(s)</string>
+    <string name="msg_json_invalid">Invalid rules JSON: %1$s</string>
 </resources>

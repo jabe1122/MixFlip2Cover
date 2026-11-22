@@ -36,6 +36,7 @@
         android:theme="@android:style/Theme.DeviceDefault.DayNight">
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density"
             android:exported="true"
             android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">

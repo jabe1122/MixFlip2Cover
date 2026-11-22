@@ -250,10 +250,10 @@ final class CoverGeometry {
         return value;
     }
 
-    /** Public (possibly inherited) method lookup via Class.getMethod, cached per class/name/arity; misses included. */
+    /** Public (possibly inherited) method lookup via Class.getMethod, cached per class/name/param-types; misses included. */
     static Method findMethod(Class<?> type, String name, Class<?>... params) {
         ConcurrentHashMap<String, Object> perClass = METHODS.computeIfAbsent(type, k -> new ConcurrentHashMap<>());
-        String key = name + '/' + params.length;
+        String key = methodCacheKey(name, params);
         Object cached = perClass.get(key);
         if (cached == null) {
             try {
@@ -266,6 +266,20 @@ final class CoverGeometry {
             perClass.put(key, cached);
         }
         return cached instanceof Method m ? m : null;
+    }
+
+    private static String methodCacheKey(String name, Class<?>[] params) {
+        if (params == null || params.length == 0) {
+            return name + "()";
+        }
+        StringBuilder sb = new StringBuilder(name.length() + params.length * 24 + 2);
+        sb.append(name).append('(');
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(params[i] != null ? params[i].getName() : "null");
+        }
+        sb.append(')');
+        return sb.toString();
     }
 
     /** Invokes a cached public no-arg/one-arg method; throws NoSuchMethodException when absent. */

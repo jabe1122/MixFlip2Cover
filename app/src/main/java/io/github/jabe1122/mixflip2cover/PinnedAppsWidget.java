@@ -4,19 +4,25 @@ import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.content.BroadcastReceiver;
+import android.content.ComponentCallbacks2;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.LauncherActivityInfo;
+import android.content.pm.LauncherApps;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.os.UserHandle;
 import android.util.Log;
+import android.view.Display;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
@@ -96,17 +102,21 @@ final class PinnedAppsWidget {
     private static volatile Method folmeSetToMethod;
 
     private static final class ResolvedApp {
+        final String target;
         final String packageName;
+        final int userId;
         final ComponentName component;
         final String label;
         final Drawable icon;
 
         ResolvedApp(String packageName, ComponentName component, String label) {
-            this(packageName, component, label, null);
+            this(packageName, packageName, 0, component, label, null);
         }
 
-        ResolvedApp(String packageName, ComponentName component, String label, Drawable icon) {
+        ResolvedApp(String target, String packageName, int userId, ComponentName component, String label, Drawable icon) {
+            this.target = target;
             this.packageName = packageName;
+            this.userId = userId;
             this.component = component;
             this.label = label;
             this.icon = icon;
@@ -333,21 +343,51 @@ final class PinnedAppsWidget {
                         if (Intent.ACTION_PACKAGE_CHANGED.equals(action)
                                 && changedPkg != null
                                 && !changedPkg.isEmpty()
-                                && !isPackageRelevantToWidget(changedPkg)) {
-                            resolvedAppCache.remove(changedPkg);
+                                && !isPackageRelevantToWidget(changedPkg)
+                                && !QuickActionsWidget.isPackageRelevantToQuickWidget(changedPkg)) {
+                            removeCachedPackageEntries(changedPkg);
                             return;
                         }
                         if (changedPkg != null && !changedPkg.isEmpty()) {
-                            resolvedAppCache.remove(changedPkg);
+                            removeCachedPackageEntries(changedPkg);
                         } else {
                             resolvedAppCache.clear();
                         }
                         appliedSignatureByView.clear();
                         ModLog.i(TAG, "package change detected (" + action
                                 + (changedPkg != null ? ":" + changedPkg : "") + "), refreshing pinned apps");
-                        main.post(() -> refreshAllViews(true));
+                        main.post(() -> {
+                            refreshAllViews(true);
+                            QuickActionsWidget.onPackageChanged(changedPkg);
+                        });
                     }
                 }, pkgFilter, null, main, Context.RECEIVER_NOT_EXPORTED);
+                app.registerComponentCallbacks(new ComponentCallbacks2() {
+                    private int lastUiMode = app.getResources() != null
+                            ? app.getResources().getConfiguration().uiMode : 0;
+                    private int lastDensityDpi = app.getResources() != null
+                            ? app.getResources().getConfiguration().densityDpi : 0;
+
+                    @Override
+                    public void onConfigurationChanged(Configuration newConfig) {
+                        if (newConfig == null) return;
+                        if (newConfig.uiMode != lastUiMode || newConfig.densityDpi != lastDensityDpi) {
+                            lastUiMode = newConfig.uiMode;
+                            lastDensityDpi = newConfig.densityDpi;
+                            resolvedAppCache.clear();
+                            appliedSignatureByView.clear();
+                            main.post(() -> {
+                                refreshAllViews(true);
+                                QuickActionsWidget.onPackageChanged(null);
+                            });
+                        }
+                    }
+
+                    @Override public void onLowMemory() { resolvedAppCache.clear(); }
+                    @Override public void onTrimMemory(int level) {
+                        if (level >= TRIM_MEMORY_UI_HIDDEN) resolvedAppCache.clear();
+                    }
+                });
                 syncReceiverRegistered = true;
             } catch (Throwable t) {
                 Log.w(TAG, "ensureSyncReceiverRegistered skipped", t);
@@ -448,7 +488,13 @@ final class PinnedAppsWidget {
             String prevSig = appliedSignatureByView.get(recentView);
 
             if (!enabled) {
-                if (prevSig != null) {
+                boolean hasSynthetic = false;
+                try {
+                    Object curVals = CoverGeometry.field(recentView, "mValues");
+                    hasSynthetic = curVals instanceof List<?> list && containsAnyPinnedTask(list);
+                } catch (Throwable ignored) {
+                }
+                if (prevSig != null || hasSynthetic) {
                     appliedSignatureByView.remove(recentView);
                     List<Object> restored = getRawRecentsCopy(recentView);
                     int maxItems = SquareCards.active() ? 4 : 6;
@@ -531,6 +577,20 @@ final class PinnedAppsWidget {
     private static void syncEmptyStateVisibility(View recentView, List<?> list) {
         if (recentView == null) return;
         boolean hasItems = list != null && !list.isEmpty();
+        try {
+            Object rvObj = CoverGeometry.field(recentView, "mRecyclerView");
+            Object noDataObj = CoverGeometry.field(recentView, "mNoDataContainer");
+            Object showRecyclerObj = CoverGeometry.field(recentView, "mIsShowRecycler");
+            boolean alreadySynced = Boolean.valueOf(hasItems).equals(showRecyclerObj)
+                    && (!(rvObj instanceof View rv)
+                            || (rv.getVisibility() == (hasItems ? View.VISIBLE : View.INVISIBLE)
+                                    && Math.abs(rv.getAlpha() - (hasItems ? 1f : 0f)) < 0.01f))
+                    && (!(noDataObj instanceof View noData)
+                            || (noData.getVisibility() == (hasItems ? View.INVISIBLE : View.VISIBLE)
+                                    && Math.abs(noData.getAlpha() - (hasItems ? 0f : 1f)) < 0.01f));
+            if (alreadySynced) return;
+        } catch (Throwable ignored) {
+        }
         try {
             if (checkValuesMethod != null) {
                 checkValuesMethod.invoke(recentView, list);
@@ -628,9 +688,22 @@ final class PinnedAppsWidget {
         return pkg != null ? pkg : String.valueOf(System.identityHashCode(task));
     }
 
+    private static void removeCachedPackageEntries(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return;
+        resolvedAppCache.remove(pkg);
+        String prefix = pkg + "#";
+        for (String key : new ArrayList<>(resolvedAppCache.keySet())) {
+            if (key != null && key.startsWith(prefix)) {
+                resolvedAppCache.remove(key);
+            }
+        }
+    }
+
     private static boolean isPackageRelevantToWidget(String pkg) {
         if (pkg == null || pkg.isEmpty()) return false;
-        if (ModuleConfig.pinnedWidgetApps().contains(pkg)) return true;
+        for (String target : ModuleConfig.pinnedWidgetApps()) {
+            if (pkg.equals(ModuleConfig.extractAppTargetPackage(target))) return true;
+        }
         List<View> views;
         synchronized (knownRecentViews) {
             views = new ArrayList<>(knownRecentViews);
@@ -721,35 +794,49 @@ final class PinnedAppsWidget {
         }
 
         List<Object> result = new ArrayList<>(ModuleConfig.MAX_PINNED_WIDGET_APPS);
-        LinkedHashSet<String> includedPackages = new LinkedHashSet<>();
+        LinkedHashSet<String> includedTargets = new LinkedHashSet<>();
 
         for (int i = 0; i < pinnedPkgs.size() && result.size() < ModuleConfig.MAX_PINNED_WIDGET_APPS; i++) {
-            String pkg = pinnedPkgs.get(i);
-            ResolvedApp app = resolveApp(context, pkg);
+            String target = pinnedPkgs.get(i);
+            ResolvedApp app = resolveApp(context, target);
             if (app == null) continue;
             Object syntheticTask = createSyntheticTask(app, i);
             if (syntheticTask != null) {
                 result.add(syntheticTask);
-                includedPackages.add(pkg);
+                includedTargets.add(app.target);
             }
         }
 
-        // Fill remaining slots (up to 4) with non-duplicate recent tasks
+        // Fill remaining slots (up to 4) with non-duplicate recent tasks (deduped by pkg + userId so dual apps stay distinct)
         for (Object recentTask : rawRecents) {
             if (result.size() >= ModuleConfig.MAX_PINNED_WIDGET_APPS) break;
             if (recentTask == null || isPinnedTask(recentTask)) continue;
             String pkg = extractPackageName(recentTask);
-            if (pkg != null && includedPackages.contains(pkg)) continue;
+            int uid = extractUserId(recentTask);
+            String taskTarget = pkg != null ? ModuleConfig.formatAppTarget(pkg, uid) : null;
+            if (taskTarget != null && includedTargets.contains(taskTarget)) continue;
             result.add(recentTask);
-            if (pkg != null) includedPackages.add(pkg);
+            if (taskTarget != null) includedTargets.add(taskTarget);
         }
 
         return result;
     }
 
-    private static ResolvedApp resolveApp(Context context, String pkg) {
-        if (pkg == null || pkg.isEmpty()) return null;
-        ResolvedApp cached = resolvedAppCache.get(pkg);
+    static Drawable getCachedAppIcon(String rawTarget) {
+        String pkg = ModuleConfig.extractAppTargetPackage(rawTarget);
+        if (pkg.isEmpty()) return null;
+        int userId = ModuleConfig.extractAppTargetUserId(rawTarget);
+        ResolvedApp cached = resolvedAppCache.get(ModuleConfig.formatAppTarget(pkg, userId));
+        return cached != null && cached.icon != null ? cloneDrawable(cached.icon) : null;
+    }
+
+    private static ResolvedApp resolveApp(Context context, String rawTarget) {
+        if (rawTarget == null || rawTarget.isEmpty()) return null;
+        String pkg = ModuleConfig.extractAppTargetPackage(rawTarget);
+        if (pkg.isEmpty()) return null;
+        int userId = ModuleConfig.extractAppTargetUserId(rawTarget);
+        String targetKey = ModuleConfig.formatAppTarget(pkg, userId);
+        ResolvedApp cached = resolvedAppCache.get(targetKey);
         if (cached != null) return cached;
         try {
             PackageManager pm = context.getPackageManager();
@@ -759,53 +846,82 @@ final class PinnedAppsWidget {
             String label = pkg;
             Drawable icon = null;
 
-            Intent launchIntent = pm.getLaunchIntentForPackage(pkg);
-            if (launchIntent != null && launchIntent.getComponent() != null) {
-                component = launchIntent.getComponent();
+            if (userId > 0) {
+                LauncherApps la = context.getSystemService(LauncherApps.class);
+                if (la != null) {
+                    UserHandle uh = UserHandle.getUserHandleForUid(userId * 100000);
+                    List<LauncherActivityInfo> acts = la.getActivityList(pkg, uh);
+                    if (acts != null && !acts.isEmpty()) {
+                        LauncherActivityInfo info = acts.get(0);
+                        component = info.getComponentName();
+                        CharSequence l = info.getLabel();
+                        if (l != null && l.length() > 0) label = l.toString();
+                        try {
+                            icon = info.getBadgedIcon(0);
+                        } catch (Throwable ignored) {
+                        }
+                        if (icon == null) {
+                            try {
+                                Drawable rawIcon = info.getIcon(0);
+                                icon = rawIcon != null ? pm.getUserBadgedIcon(rawIcon, uh) : null;
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
             }
-            if (component == null) {
-                Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(pkg);
-                List<ResolveInfo> infos = pm.queryIntentActivities(query, 0);
-                if (infos != null && !infos.isEmpty() && infos.get(0).activityInfo != null) {
-                    component = new ComponentName(
-                            infos.get(0).activityInfo.packageName,
-                            infos.get(0).activityInfo.name);
-                    CharSequence l = infos.get(0).loadLabel(pm);
-                    if (l != null && l.length() > 0) label = l.toString();
-                    try {
-                        icon = infos.get(0).loadIcon(pm);
-                    } catch (Throwable ignored) {
+
+            if (component == null && userId == 0) {
+                Intent launchIntent = pm.getLaunchIntentForPackage(pkg);
+                if (launchIntent != null && launchIntent.getComponent() != null) {
+                    component = launchIntent.getComponent();
+                }
+                if (component == null) {
+                    Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(pkg);
+                    List<ResolveInfo> infos = pm.queryIntentActivities(query, 0);
+                    if (infos != null && !infos.isEmpty() && infos.get(0).activityInfo != null) {
+                        component = new ComponentName(
+                                infos.get(0).activityInfo.packageName,
+                                infos.get(0).activityInfo.name);
+                        CharSequence l = infos.get(0).loadLabel(pm);
+                        if (l != null && l.length() > 0) label = l.toString();
+                        try {
+                            icon = infos.get(0).loadIcon(pm);
+                        } catch (Throwable ignored) {
+                        }
                     }
                 }
             }
             if (component == null) {
-                Log.w(TAG, "resolveApp found no launcher component for " + pkg);
+                Log.w(TAG, "resolveApp found no launcher component for " + targetKey);
                 return null;
             }
 
-            try {
-                ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
-                CharSequence appLabel = pm.getApplicationLabel(ai);
-                if (appLabel != null && appLabel.length() > 0) {
-                    label = appLabel.toString();
+            if (userId == 0) {
+                try {
+                    ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                    CharSequence appLabel = pm.getApplicationLabel(ai);
+                    if (appLabel != null && appLabel.length() > 0) {
+                        label = appLabel.toString();
+                    }
+                    if (icon == null) {
+                        icon = pm.getApplicationIcon(ai);
+                    }
+                } catch (Throwable ignored) {
                 }
                 if (icon == null) {
-                    icon = pm.getApplicationIcon(ai);
-                }
-            } catch (Throwable ignored) {
-            }
-            if (icon == null) {
-                try {
-                    icon = pm.getApplicationIcon(pkg);
-                } catch (Throwable ignored) {
+                    try {
+                        icon = pm.getApplicationIcon(pkg);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
 
-            ResolvedApp resolved = new ResolvedApp(pkg, component, label, icon);
-            resolvedAppCache.put(pkg, resolved);
+            ResolvedApp resolved = new ResolvedApp(targetKey, pkg, userId, component, label, icon);
+            resolvedAppCache.put(targetKey, resolved);
             return resolved;
         } catch (Throwable t) {
-            Log.w(TAG, "resolveApp failed for " + pkg, t);
+            Log.w(TAG, "resolveApp failed for " + targetKey, t);
             return null;
         }
     }
@@ -821,8 +937,8 @@ final class PinnedAppsWidget {
     static Object createSyntheticTask(ResolvedApp app, int slotIndex) {
         if (app == null || taskCtor == null || taskKeyClass == null) return null;
         try {
-            int userId = currentUserId();
-            int syntheticId = computeSyntheticTaskId(app.component, slotIndex);
+            int userId = app.userId > 0 ? app.userId : currentUserId();
+            int syntheticId = computeSyntheticTaskId(app.component, slotIndex, userId);
             Intent baseIntent = new Intent(Intent.ACTION_MAIN)
                     .addCategory(Intent.CATEGORY_LAUNCHER)
                     .setComponent(app.component)
@@ -923,7 +1039,12 @@ final class PinnedAppsWidget {
     }
 
     static int computeSyntheticTaskId(ComponentName component, int slotIndex) {
-        int hash = component != null ? (component.flattenToShortString().hashCode() & 0x0FFFFFFF) : 0;
+        return computeSyntheticTaskId(component, slotIndex, 0);
+    }
+
+    static int computeSyntheticTaskId(ComponentName component, int slotIndex, int userId) {
+        String key = (component != null ? component.flattenToShortString() : "") + "#" + userId;
+        int hash = key.hashCode() & 0x0FFFFFFF;
         return SYNTHETIC_TASK_ID_BASE - (slotIndex * 1000) - (hash % 500000000);
     }
 
@@ -969,6 +1090,19 @@ final class PinnedAppsWidget {
     private static String extractPackageName(Object task) {
         ComponentName cn = extractComponent(task);
         return cn != null ? cn.getPackageName() : null;
+    }
+
+    private static int extractUserId(Object task) {
+        if (task == null) return 0;
+        try {
+            Object key = getField(task, "key");
+            if (key != null && getField(key, "userId") instanceof Number n) {
+                int uid = n.intValue();
+                return uid > 0 ? uid : 0;
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
     }
 
     private static Object getAdapterItem(Object adapter, int position) {
@@ -1026,18 +1160,20 @@ final class PinnedAppsWidget {
         try {
             Object ivObj = CoverGeometry.field(holder, "ivIcon");
             String pkg = extractPackageName(task);
+            int userId = extractUserId(task);
+            String target = pkg != null ? ModuleConfig.formatAppTarget(pkg, userId) : null;
             boolean pinned = isPinnedTask(task);
             if (ivObj instanceof ImageView iv) {
                 Object ctxObj = CoverGeometry.field(adapter, "mContext");
                 Context ctx = ctxObj instanceof Context c ? c : iv.getContext();
                 if (pinned) {
                     Drawable pinnedIcon = null;
-                    if (pkg != null && ctx != null) {
-                        ResolvedApp resolved = resolveApp(ctx, pkg);
+                    if (target != null && ctx != null) {
+                        ResolvedApp resolved = resolveApp(ctx, target);
                         if (resolved != null && resolved.icon != null) {
                             pinnedIcon = cloneDrawable(resolved.icon);
                         }
-                        if (pinnedIcon == null) {
+                        if (pinnedIcon == null && userId == 0) {
                             try {
                                 pinnedIcon = ctx.getPackageManager().getApplicationIcon(pkg);
                             } catch (Throwable ignored) {
@@ -1049,13 +1185,11 @@ final class PinnedAppsWidget {
                     }
                 } else if (iv.getDrawable() == null && pkg != null && ctx != null) {
                     try {
-                        Drawable fallbackIcon = ctx.getPackageManager().getApplicationIcon(pkg);
+                        Drawable fallbackIcon = loadAppIcon(ctx, target);
                         if (fallbackIcon != null) iv.setImageDrawable(fallbackIcon);
                     } catch (Throwable ignored) {
                     }
                 }
-                ModLog.i(TAG, "onBindViewHolder pkg=" + pkg + " pinned=" + pinned
-                        + " hasIcon=" + (iv.getDrawable() != null));
             }
             Object itemViewObj = CoverGeometry.field(holder, "itemView");
             if (itemViewObj instanceof View itemView) {
@@ -1077,18 +1211,121 @@ final class PinnedAppsWidget {
         }
     }
 
+    static Drawable loadAppIcon(Context context, String rawTarget) {
+        if (context == null || rawTarget == null || rawTarget.isEmpty()) return null;
+        try {
+            ResolvedApp resolved = resolveApp(context, rawTarget);
+            if (resolved != null && resolved.icon != null) {
+                return cloneDrawable(resolved.icon);
+            }
+            int userId = ModuleConfig.extractAppTargetUserId(rawTarget);
+            String pkg = ModuleConfig.extractAppTargetPackage(rawTarget);
+            if (pkg.isEmpty()) return null;
+            Drawable base = context.getPackageManager().getApplicationIcon(pkg);
+            if (userId > 0 && base != null) {
+                try {
+                    return context.getPackageManager().getUserBadgedIcon(
+                            base, UserHandle.getUserHandleForUid(userId * 100000));
+                } catch (Throwable ignored) {
+                }
+            }
+            return base;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    static String loadAppLabel(Context context, String rawTarget) {
+        if (context == null || rawTarget == null || rawTarget.isEmpty()) return rawTarget != null ? rawTarget : "";
+        String pkg = ModuleConfig.extractAppTargetPackage(rawTarget);
+        if (pkg.isEmpty()) return rawTarget;
+        try {
+            ResolvedApp resolved = resolveApp(context, rawTarget);
+            if (resolved != null && resolved.label != null && !resolved.label.isEmpty()) {
+                return resolved.label;
+            }
+            ApplicationInfo ai = context.getPackageManager().getApplicationInfo(pkg, 0);
+            CharSequence cs = context.getPackageManager().getApplicationLabel(ai);
+            if (cs != null && cs.length() > 0) return cs.toString();
+        } catch (Throwable ignored) {
+        }
+        return pkg;
+    }
+
+    static void launchPackageOnCover(Context context, String rawTarget, View clickedView) {
+        if (rawTarget == null || rawTarget.isEmpty()) return;
+        String pkg = ModuleConfig.extractAppTargetPackage(rawTarget);
+        int userId = ModuleConfig.extractAppTargetUserId(rawTarget);
+        if (pkg.isEmpty()) return;
+        ComponentName cn = null;
+        Context ctx = context != null ? context : (clickedView != null ? clickedView.getContext() : null);
+        if (ctx != null) {
+            ResolvedApp resolved = resolveApp(ctx, rawTarget);
+            if (resolved != null) {
+                cn = resolved.component;
+            }
+        }
+        launchComponentOnCover(cn, pkg, userId, clickedView);
+    }
+
     static void launchPinnedTask(Object task, View clickedView) {
         ComponentName cn = extractComponent(task);
         if (cn == null) return;
-        String pkg = cn.getPackageName();
+        launchComponentOnCover(cn, cn.getPackageName(), extractUserId(task), clickedView);
+    }
+
+    private static void launchComponentOnCover(ComponentName cn, String pkg, int userId, View clickedView) {
+        if (pkg == null || pkg.isEmpty()) return;
+
+        // Dual-App / secondary profile (e.g. u999): launch directly via LauncherApps.startMainActivity on outer display
+        if (userId > 0) {
+            try {
+                Context ctx = clickedView != null ? clickedView.getContext() : null;
+                if (ctx == null) {
+                    Object appObj = CoverGeometry.application();
+                    if (appObj instanceof Context c) ctx = c;
+                }
+                if (ctx != null) {
+                    LauncherApps la = ctx.getSystemService(LauncherApps.class);
+                    UserHandle userHandle = UserHandle.getUserHandleForUid(userId * 100000);
+                    ComponentName targetCn = cn;
+                    if (targetCn == null && la != null) {
+                        List<LauncherActivityInfo> acts = la.getActivityList(pkg, userHandle);
+                        if (acts != null && !acts.isEmpty()) targetCn = acts.get(0).getComponentName();
+                    }
+                    if (la != null && targetCn != null) {
+                        Rect bounds = null;
+                        if (clickedView != null && clickedView.isAttachedToWindow()) {
+                            int[] loc = new int[2];
+                            clickedView.getLocationOnScreen(loc);
+                            bounds = new Rect(loc[0], loc[1], loc[0] + clickedView.getWidth(), loc[1] + clickedView.getHeight());
+                        }
+                        Display outer = CoverGeometry.outerDisplay(ctx);
+                        int displayId = outer != null ? outer.getDisplayId() : Display.DEFAULT_DISPLAY;
+                        ActivityOptions ao = ActivityOptions.makeBasic();
+                        ao.setLaunchDisplayId(displayId);
+                        la.startMainActivity(targetCn, userHandle, bounds, ao.toBundle());
+                        ModLog.i(TAG, "launched dual-app on cover via LauncherApps: " + targetCn.flattenToShortString() + "#" + userId);
+                        return;
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "LauncherApps dual-app launch failed for " + pkg + "#" + userId, t);
+            }
+        }
 
         Intent launchIntent = new Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setComponent(cn)
                 .setPackage(pkg)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        if (cn != null) {
+            launchIntent.setComponent(cn);
+        }
         try {
-            launchIntent.putExtra("profile", Process.myUserHandle());
+            UserHandle profile = userId > 0
+                    ? UserHandle.getUserHandleForUid(userId * 100000)
+                    : Process.myUserHandle();
+            launchIntent.putExtra("profile", profile);
         } catch (Throwable ignored) {
         }
 
@@ -1098,7 +1335,7 @@ final class PinnedAppsWidget {
             if (launcher instanceof Activity activity && performLaunchCtor != null && performLaunchMethod != null) {
                 Object action = performLaunchCtor.newInstance(activity);
                 performLaunchMethod.invoke(action, launchIntent, null, clickedView);
-                ModLog.i(TAG, "launched pinned app via PerformLaunchAction: " + cn.flattenToShortString());
+                ModLog.i(TAG, "launched cover app via PerformLaunchAction: " + (cn != null ? cn.flattenToShortString() : pkg));
                 return;
             }
             if (launcher instanceof Activity activity) {
@@ -1108,7 +1345,7 @@ final class PinnedAppsWidget {
                 } else {
                     activity.startActivity(launchIntent);
                 }
-                ModLog.i(TAG, "launched pinned app via FlipLauncher: " + cn.flattenToShortString());
+                ModLog.i(TAG, "launched cover app via FlipLauncher: " + (cn != null ? cn.flattenToShortString() : pkg));
                 return;
             }
         } catch (Throwable t) {
@@ -1130,7 +1367,7 @@ final class PinnedAppsWidget {
                 ctx.startActivity(fallback);
             }
         } catch (Throwable t) {
-            Log.e(TAG, "failed to launch pinned app: " + pkg, t);
+            Log.e(TAG, "failed to launch cover app: " + pkg, t);
         }
     }
 

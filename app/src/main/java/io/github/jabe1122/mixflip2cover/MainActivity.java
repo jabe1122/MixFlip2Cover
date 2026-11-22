@@ -2,6 +2,7 @@ package io.github.jabe1122.mixflip2cover;
 
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.ActivityOptions;
 import android.app.AlertDialog;
 import android.app.BroadcastOptions;
 import android.app.Dialog;
@@ -12,6 +13,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.LauncherActivityInfo;
+import android.content.pm.LauncherApps;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.ColorStateList;
@@ -29,6 +32,7 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.hardware.display.DisplayManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -36,7 +40,9 @@ import android.os.DeadObjectException;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Parcel;
+import android.os.Process;
 import android.os.ResultReceiver;
+import android.os.UserHandle;
 import android.text.Editable;
 import android.text.TextUtils;
 import android.text.TextWatcher;
@@ -83,6 +89,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -171,10 +178,14 @@ public final class MainActivity extends Activity {
             Map.entry(ModuleConfig.KEY_THIRD_PARTY_IME, ModuleConfig.DEFAULT_THIRD_PARTY_IME),
             Map.entry(ModuleConfig.KEY_HIDE_APP_NAMES, false),
             Map.entry(ModuleConfig.KEY_PINNED_WIDGET_ENABLED, false),
+            Map.entry(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, false),
             Map.entry(ModuleConfig.KEY_BATTERY_NUMBER, false),
             Map.entry(ModuleConfig.KEY_DUAL_SIM, false),
             Map.entry(ModuleConfig.KEY_ALLOW_ALL_COVER_APPS, true),
             Map.entry(ModuleConfig.KEY_DIRECT_OPEN_COVER_NOTIF, true),
+            Map.entry(ModuleConfig.KEY_FOLD_POCKET_GUARD, true),
+            Map.entry(ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS, true),
+            Map.entry(ModuleConfig.KEY_DOUBLE_TAP_LOCK, true),
             Map.entry(ModuleConfig.KEY_VERBOSE_LOG, false));
     /** Keys whose defaults are written explicitly on first connection so hooked processes see them. */
     private static final List<String> PERSISTED_DEFAULT_KEYS = List.of(
@@ -184,6 +195,9 @@ public final class MainActivity extends Activity {
             ModuleConfig.KEY_UNIVERSAL_COMPAT,
             ModuleConfig.KEY_ALLOW_ALL_COVER_APPS,
             ModuleConfig.KEY_DIRECT_OPEN_COVER_NOTIF,
+            ModuleConfig.KEY_FOLD_POCKET_GUARD,
+            ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS,
+            ModuleConfig.KEY_DOUBLE_TAP_LOCK,
             ModuleConfig.KEY_THIRD_PARTY_IME);
 
     private static final ExecutorService IO = Executors.newFixedThreadPool(2, r -> {
@@ -219,6 +233,21 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private static final class TrackedDialog {
+        final WeakReference<Dialog> ref;
+        Consumer<Dialog> relayout;
+
+        TrackedDialog(Dialog dialog) {
+            this.ref = new WeakReference<>(dialog);
+        }
+    }
+
+    private record ScopeSnapshot(
+            XposedService forService,
+            List<String> scope,
+            LinkedHashSet<String> required,
+            DeepCompatStats deepCompatStats) {}
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private XposedService service;
     private SharedPreferences prefs;
@@ -228,13 +257,29 @@ public final class MainActivity extends Activity {
     private final List<TextView> scopeCountTexts = new ArrayList<>();
     private final List<TextView> deepCompatStatusTexts = new ArrayList<>();
     private final List<TextView> pinnedSummaryTexts = new ArrayList<>();
-    private final List<WeakReference<Dialog>> trackedDialogs = new ArrayList<>();
+    private final List<TextView> quickWidgetSummaryTexts = new ArrayList<>();
+    private final List<TextView> orbTapSummaryTexts = new ArrayList<>();
+    private final List<TextView> orbLongSummaryTexts = new ArrayList<>();
+    private final List<TextView> foldModeSummaryTexts = new ArrayList<>();
+    private final List<TextView> foldAppsSummaryTexts = new ArrayList<>();
+    private final List<TextView> imeTuningSummaryTexts = new ArrayList<>();
+    private final List<TextView> perAppRulesSummaryTexts = new ArrayList<>();
+    private final List<TrackedDialog> trackedDialogs = new ArrayList<>();
     private final LruCache<String, Drawable> iconCache = new LruCache<>(160);
     private final Set<String> iconLoading = new HashSet<>();
+    private final Map<String, String> appLabelCache = new ConcurrentHashMap<>();
+    private volatile ScopeSnapshot cachedScopeSnapshot;
+    private int scopeRefreshGen;
     private LinearLayout root;
+    private ScrollView contentScroll;
     private LinearLayout pageContainer;
     private CoverPreviewView coverPreview;
+    private TextView heroMetaText;
+    private TextView homeCompatSubtitleText;
+    private Status lastRenderedStatus = Status.DISCONNECTED;
     private int selected;
+    private int lastConfigDensityDpi;
+    private int lastConfigUiMode;
     private boolean loading, renderPending, dark;
     private String frameworkProp = "";
     private Toast toast;
@@ -247,8 +292,10 @@ public final class MainActivity extends Activity {
 
     @Override
     public void onCreate(Bundle state) {
-        dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
-                == Configuration.UI_MODE_NIGHT_YES;
+        Configuration cfg = getResources().getConfiguration();
+        lastConfigDensityDpi = cfg.densityDpi;
+        lastConfigUiMode = cfg.uiMode;
+        dark = (cfg.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         setTheme(dark ? android.R.style.Theme_Material_NoActionBar : android.R.style.Theme_Material_Light_NoActionBar);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         super.onCreate(state);
@@ -271,15 +318,47 @@ public final class MainActivity extends Activity {
         if (existing != null) onServiceBound(existing);
     }
 
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (isFinishing() || isDestroyed()) return;
+        boolean newDark = (newConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        boolean themeOrDensityChanged = (newDark != dark)
+                || (newConfig.densityDpi != lastConfigDensityDpi)
+                || ((newConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                        != (lastConfigUiMode & Configuration.UI_MODE_NIGHT_MASK));
+        if (newDark != dark) {
+            dark = newDark;
+            setTheme(dark ? android.R.style.Theme_Material_NoActionBar : android.R.style.Theme_Material_Light_NoActionBar);
+        }
+        lastConfigDensityDpi = newConfig.densityDpi;
+        lastConfigUiMode = newConfig.uiMode;
+        palette = new M3Palette(this, dark);
+        if (themeOrDensityChanged) {
+            iconCache.evictAll();
+        }
+        configureEdgeToEdge(dark);
+        render(false);
+        relayoutTrackedDialogs();
+        mainHandler.post(this::relayoutTrackedDialogs);
+    }
+
     private void onServiceBound(XposedService bound) {
         if (service == bound && prefs != null) return;
         service = bound;
+        cachedScopeSnapshot = null;
         try {
             prefs = bound.getRemotePreferences(ModuleConfig.PREFS_NAME);
             ModuleConfig.initLocal(prefs);
             ensureDefaults();
-            List<String> scope = bound.getScope();
-            ModLog.i(TAG, "connected; frameworkScope=" + scope.contains("system") + " scopeCount=" + scope.size());
+            IO.execute(() -> {
+                try {
+                    List<String> scope = bound.getScope();
+                    ModLog.i(TAG, "connected; frameworkScope=" + scope.contains("system")
+                            + " scopeCount=" + scope.size());
+                } catch (RuntimeException ignored) {
+                }
+            });
         } catch (RuntimeException e) {
             Log.w(TAG, "service bind failed", e);
             if (cachedService == bound) cachedService = null;
@@ -292,6 +371,7 @@ public final class MainActivity extends Activity {
     private void onServiceLost(XposedService bound) {
         if (service != bound) return;
         service = null;
+        cachedScopeSnapshot = null;
         show(getString(R.string.msg_service_died));
         render(false);
     }
@@ -409,8 +489,8 @@ public final class MainActivity extends Activity {
             backCallbackRegistered = false;
         }
         if (currentActivity.get() == this) currentActivity = new WeakReference<>(null);
-        for (WeakReference<Dialog> ref : trackedDialogs) {
-            Dialog d = ref.get();
+        for (TrackedDialog entry : trackedDialogs) {
+            Dialog d = entry.ref.get();
             if (d != null && d.isShowing()) {
                 try {
                     d.dismiss();
@@ -519,6 +599,10 @@ public final class MainActivity extends Activity {
                 changed = true;
             }
         }
+        if (!prefs.contains(ModuleConfig.KEY_FOLD_CONTINUITY_MODE)) {
+            editor.putInt(ModuleConfig.KEY_FOLD_CONTINUITY_MODE, ModuleConfig.FOLD_CONT_SYSTEM);
+            changed = true;
+        }
         for (Map.Entry<String, Boolean> e : resolveDependencies(currentState(), null, false).entrySet()) {
             editor.putBoolean(e.getKey(), e.getValue());
             changed = true;
@@ -542,12 +626,49 @@ public final class MainActivity extends Activity {
                 boolean pinEnabled = Boolean.TRUE.equals(updates.get(ModuleConfig.KEY_PINNED_WIDGET_ENABLED));
                 broadcastPinnedWidgetSync(pinEnabled, prefs.getString(ModuleConfig.KEY_PINNED_WIDGET_APPS, ""));
             }
+            if (updates.containsKey(ModuleConfig.KEY_QUICK_WIDGET_ENABLED)) {
+                boolean qwEnabled = Boolean.TRUE.equals(updates.get(ModuleConfig.KEY_QUICK_WIDGET_ENABLED));
+                String rawSlots = prefs.getString(
+                        ModuleConfig.KEY_QUICK_WIDGET_SLOTS,
+                        ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS);
+                if (qwEnabled && !prefs.contains(ModuleConfig.KEY_QUICK_WIDGET_SLOTS)) {
+                    prefs.edit().putString(
+                            ModuleConfig.KEY_QUICK_WIDGET_SLOTS,
+                            ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS).apply();
+                    rawSlots = ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS;
+                }
+                broadcastQuickWidgetSync(qwEnabled, rawSlots, true);
+            }
+            if (updates.containsKey(ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS)) {
+                broadcastLauncherAppsSync(Boolean.TRUE.equals(updates.get(ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS)));
+            }
             if (updates.containsKey(ModuleConfig.KEY_THIRD_PARTY_IME)) refreshScopeTexts();
             if (coverPreview != null) coverPreview.invalidate();
             if (ModuleConfig.KEY_PINNED_WIDGET_ENABLED.equals(key) && checked && currentPinnedPackages().isEmpty()) {
                 showPinnedWidgetAppsPickerDialog();
-            } else if (ModuleConfig.KEY_THIRD_PARTY_IME.equals(key) && checked && isWeTypeInstalledWithoutScope()) {
-                requestPackages(List.of(WETYPE_PKG));
+            } else if (ModuleConfig.KEY_THIRD_PARTY_IME.equals(key) && checked) {
+                final XposedService boundService = service;
+                IO.execute(() -> {
+                    List<String> candidates = installedUnpackedThirdPartyImePackages();
+                    List<String> missingImeScopes = new ArrayList<>();
+                    if (!candidates.isEmpty() && boundService != null) {
+                        try {
+                            List<String> scope = boundService.getScope();
+                            for (String pkg : candidates) {
+                                if (!scope.contains(pkg)) missingImeScopes.add(pkg);
+                            }
+                        } catch (RuntimeException ignored) {
+                        }
+                    }
+                    mainHandler.post(() -> {
+                        if (isFinishing() || isDestroyed() || service != boundService) return;
+                        if (!missingImeScopes.isEmpty()) {
+                            requestPackages(missingImeScopes);
+                        } else {
+                            showSwitchEffectHint(key);
+                        }
+                    });
+                });
             } else {
                 showSwitchEffectHint(key);
             }
@@ -573,14 +694,145 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private boolean isWeTypeInstalledWithoutScope() {
+    private boolean isBuiltInOrSystemImePackage(String pkg) {
+        return pkg == null || pkg.isEmpty()
+                || "com.sohu.inputmethod.sogou.xiaomi".equals(pkg)
+                || pkg.startsWith("com.miui.")
+                || pkg.startsWith("com.xiaomi.")
+                || pkg.startsWith("com.android.")
+                || "com.google.android.tts".equals(pkg);
+    }
+
+    private List<String> installedUnpackedThirdPartyImePackages() {
+        LinkedHashSet<String> pkgs = new LinkedHashSet<>();
         try {
-            getPackageManager().getPackageInfo(WETYPE_PKG, 0);
-        } catch (PackageManager.NameNotFoundException e) {
+            InputMethodManager imm = getSystemService(InputMethodManager.class);
+            PackageManager pm = getPackageManager();
+            if (imm != null && pm != null) {
+                for (InputMethodInfo info : imm.getEnabledInputMethodList()) {
+                    if (info == null) continue;
+                    String pkg = info.getPackageName();
+                    if (isBuiltInOrSystemImePackage(pkg)) continue;
+                    if (info.getServiceInfo() != null && AppCompatibility.isPackedOrProtectedApp(info.getServiceInfo().applicationInfo)) {
+                        continue;
+                    }
+                    pkgs.add(pkg);
+                }
+                if (pkgs.isEmpty()) {
+                    try {
+                        getPackageManager().getPackageInfo(WETYPE_PKG, 0);
+                        pkgs.add(WETYPE_PKG);
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return new ArrayList<>(pkgs);
+    }
+
+    private void broadcastLauncherAppsSync(boolean unlock) {
+        try {
+            Intent intent = new Intent(CoverLauncherApps.ACTION_LAUNCHER_APPS_SYNC)
+                    .setPackage(CoverGeometry.FLIPHOME)
+                    .putExtra(ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS, unlock);
+            BroadcastOptions options = BroadcastOptions.makeBasic();
+            options.setShareIdentityEnabled(true);
+            sendBroadcast(intent, null, options.toBundle());
+        } catch (RuntimeException e) {
+            Log.w(TAG, "launcher apps sync broadcast failed", e);
+        }
+    }
+
+    private static final int DUAL_APP_USER_ID = 999;
+
+    private static UserHandle userHandleForId(int userId) {
+        if (userId <= 0) return Process.myUserHandle();
+        return UserHandle.getUserHandleForUid(userId * 100000);
+    }
+
+    private static int extractUserId(UserHandle uh) {
+        if (uh == null) return 0;
+        try {
+            Object id = UserHandle.class.getMethod("getIdentifier").invoke(uh);
+            if (id instanceof Integer v) return Math.max(0, v);
+        } catch (Throwable ignored) {
+        }
+        return Math.max(0, uh.hashCode());
+    }
+
+    private static List<UserHandle> querySecondaryUserHandles(LauncherApps launcherApps) {
+        List<UserHandle> out = new ArrayList<>();
+        Set<Integer> seenIds = new HashSet<>();
+        seenIds.add(0);
+        if (launcherApps != null) {
+            try {
+                for (UserHandle uh : launcherApps.getProfiles()) {
+                    int uid = extractUserId(uh);
+                    if (uid > 0 && seenIds.add(uid)) {
+                        out.add(uh);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (seenIds.add(DUAL_APP_USER_ID)) {
+            out.add(userHandleForId(DUAL_APP_USER_ID));
+        }
+        return out;
+    }
+
+    private boolean isAppTargetInstalled(PackageManager pm, LauncherApps launcherApps, String target) {
+        String pkg = ModuleConfig.extractAppTargetPackage(target);
+        if (pkg == null || pkg.isEmpty()) return false;
+        int userId = ModuleConfig.extractAppTargetUserId(target);
+        if (userId > 0) {
+            if (launcherApps == null) return false;
+            try {
+                List<LauncherActivityInfo> list = launcherApps.getActivityList(pkg, userHandleForId(userId));
+                return list != null && !list.isEmpty();
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+        try {
+            pm.getApplicationInfo(pkg, 0);
+            return true;
+        } catch (Throwable ignored) {
             return false;
         }
-        List<String> scope = scopeSafe();
-        return scope != null && !scope.contains(WETYPE_PKG);
+    }
+
+    private static Drawable loadAppIconSync(PackageManager pm, LauncherApps launcherApps, String pkg, int userId) {
+        if (pkg == null || pkg.isEmpty()) return null;
+        if (userId > 0 && launcherApps != null) {
+            try {
+                List<LauncherActivityInfo> list = launcherApps.getActivityList(pkg, userHandleForId(userId));
+                if (list != null && !list.isEmpty()) {
+                    Drawable badged = list.get(0).getBadgedIcon(0);
+                    if (badged != null) return badged;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            return pm.getApplicationIcon(pkg);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private String cachedLabelOrPkg(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return "";
+        String cached = appLabelCache.get(pkg);
+        return cached != null ? cached : pkg;
+    }
+
+    private String formatAppTargetLabel(String target) {
+        String pkg = ModuleConfig.extractAppTargetPackage(target);
+        int userId = ModuleConfig.extractAppTargetUserId(target);
+        String base = cachedLabelOrPkg(pkg);
+        return userId > 0 ? getString(R.string.dual_app_name_fmt, base) : base;
     }
 
     private boolean isCompactCoverUi() {
@@ -595,15 +847,52 @@ public final class MainActivity extends Activity {
         return density > 0f && (widthPx / density) < 360f;
     }
 
+    private boolean isNarrowDialogFooter() {
+        return currentSafeWindowFrame().safeRect().width() < dp(320);
+    }
+
     private <T extends Dialog> T trackDialog(T dialog) {
         if (dialog != null) {
-            trackedDialogs.removeIf(ref -> {
-                Dialog existing = ref.get();
+            trackedDialogs.removeIf(entry -> {
+                Dialog existing = entry.ref.get();
                 return existing == null || !existing.isShowing();
             });
-            trackedDialogs.add(new WeakReference<>(dialog));
+            for (TrackedDialog entry : trackedDialogs) {
+                if (entry.ref.get() == dialog) return dialog;
+            }
+            trackedDialogs.add(new TrackedDialog(dialog));
         }
         return dialog;
+    }
+
+    private void registerDialogRelayout(Dialog dialog, Consumer<Dialog> relayout) {
+        if (dialog == null) return;
+        for (TrackedDialog entry : trackedDialogs) {
+            if (entry.ref.get() == dialog) {
+                entry.relayout = relayout;
+                return;
+            }
+        }
+        TrackedDialog td = new TrackedDialog(dialog);
+        td.relayout = relayout;
+        trackedDialogs.add(td);
+    }
+
+    private void relayoutTrackedDialogs() {
+        if (isFinishing() || isDestroyed()) return;
+        trackedDialogs.removeIf(entry -> {
+            Dialog existing = entry.ref.get();
+            return existing == null || !existing.isShowing();
+        });
+        for (TrackedDialog entry : new ArrayList<>(trackedDialogs)) {
+            Dialog d = entry.ref.get();
+            if (d != null && d.isShowing() && entry.relayout != null) {
+                try {
+                    entry.relayout.accept(d);
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
     }
 
     private record SafeWindowFrame(int winWidth, int winHeight, Rect safeRect) {}
@@ -681,6 +970,7 @@ public final class MainActivity extends Activity {
         lp.y = Math.round((safe.top - safeBottom) / 2f);
         w.setAttributes(lp);
         w.setLayout(width, height);
+        registerDialogRelayout(dialog, d -> configureCoverSafeDialogWindow(d, tallSheet, customBackground));
     }
 
     private void configureCoverSafePickerWindow(Dialog dialog, boolean hasExtraTopBar) {
@@ -715,6 +1005,7 @@ public final class MainActivity extends Activity {
         lp.y = Math.round((safe.top - safeBottom) / 2f);
         w.setAttributes(lp);
         w.setLayout(width, height);
+        registerDialogRelayout(dialog, d -> configureCoverSafePickerWindow(d, hasExtraTopBar));
     }
 
     // ==================== Rendering ====================
@@ -783,6 +1074,7 @@ public final class MainActivity extends Activity {
 
     private void render(boolean animateTransition) {
         if (isFinishing() || isDestroyed()) return;
+        int savedScrollY = (!animateTransition && contentScroll != null) ? contentScroll.getScrollY() : 0;
         loading = true;
         switches.clear();
         switchesByKey.clear();
@@ -790,7 +1082,16 @@ public final class MainActivity extends Activity {
         scopeCountTexts.clear();
         deepCompatStatusTexts.clear();
         pinnedSummaryTexts.clear();
+        quickWidgetSummaryTexts.clear();
+        orbTapSummaryTexts.clear();
+        orbLongSummaryTexts.clear();
+        foldModeSummaryTexts.clear();
+        foldAppsSummaryTexts.clear();
+        imeTuningSummaryTexts.clear();
+        perAppRulesSummaryTexts.clear();
         coverPreview = null;
+        heroMetaText = null;
+        homeCompatSubtitleText = null;
 
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -861,6 +1162,7 @@ public final class MainActivity extends Activity {
         scroll.setFillViewport(false);
         scroll.setClipToPadding(false);
         scroll.setVerticalScrollBarEnabled(false);
+        contentScroll = scroll;
 
         pageContainer = new LinearLayout(this);
         pageContainer.setOrientation(LinearLayout.VERTICAL);
@@ -964,6 +1266,11 @@ public final class MainActivity extends Activity {
         }
         loading = false;
         root.requestApplyInsets();
+        if (savedScrollY > 0) {
+            final ScrollView targetScroll = scroll;
+            targetScroll.post(() -> targetScroll.scrollTo(0, savedScrollY));
+        }
+        refreshAsyncSummaries();
 
         if (animateTransition) {
             pages.setAlpha(0f);
@@ -983,9 +1290,32 @@ public final class MainActivity extends Activity {
         return BuildConfig.VERSION_NAME;
     }
 
+    private ScopeSnapshot usableScopeSnapshot() {
+        ScopeSnapshot snap = cachedScopeSnapshot;
+        if (snap != null && snap.forService() == service) {
+            return snap;
+        }
+        return new ScopeSnapshot(service, null, new LinkedHashSet<>(CORE_SCOPE), null);
+    }
+
+    private String formatHeroMeta(Status st, List<String> scope) {
+        boolean unsupported = st == Status.UNSUPPORTED_DEVICE || st == Status.UNSUPPORTED_FIRMWARE;
+        String fwText;
+        if (frameworkReady()) fwText = getString(R.string.fw_ready);
+        else if (frameworkProp.isEmpty()) fwText = getString(R.string.fw_inactive);
+        else fwText = getString(R.string.fw_mismatch);
+        StringBuilder meta = new StringBuilder(getString(R.string.meta_version, versionName()))
+                .append(" · ")
+                .append(getString(R.string.meta_target));
+        if (!unsupported) meta.append(" · ").append(fwText);
+        if (scope != null) meta.append(" · ").append(getString(R.string.meta_scopes, scope.size()));
+        return meta.toString();
+    }
+
     private void buildHomePage(Status st) {
-        List<String> scope = service == null ? null : scopeSafe();
-        int scopeCount = scope == null ? 0 : scope.size();
+        lastRenderedStatus = st;
+        ScopeSnapshot snap = usableScopeSnapshot();
+        List<String> scope = snap.scope();
 
         // Expressive M3 Hero Banner Card with Live Cover Display Preview
         LinearLayout hero = new LinearLayout(this);
@@ -1016,18 +1346,10 @@ public final class MainActivity extends Activity {
         TextView heroStatusTitle = createText(title, unsupported ? 18f : 22f, palette.onPrimaryContainer, FONT_BOLD);
         heroInfo.addView(heroStatusTitle);
 
-        String fwText;
-        if (frameworkReady()) fwText = getString(R.string.fw_ready);
-        else if (frameworkProp.isEmpty()) fwText = getString(R.string.fw_inactive);
-        else fwText = getString(R.string.fw_mismatch);
-        StringBuilder meta = new StringBuilder(getString(R.string.meta_version, versionName()))
-                .append(" · ")
-                .append(getString(R.string.meta_target));
-        if (!unsupported) meta.append(" · ").append(fwText);
-        if (scope != null) meta.append(" · ").append(getString(R.string.meta_scopes, scopeCount));
-        TextView heroMeta = createText(meta.toString(), 13f, palette.onPrimaryContainerVariant, FONT_MEDIUM);
+        TextView heroMeta = createText(formatHeroMeta(st, scope), 13f, palette.onPrimaryContainerVariant, FONT_MEDIUM);
         heroMeta.setPadding(0, dp(4), 0, dp(10));
         heroInfo.addView(heroMeta);
+        heroMetaText = heroMeta;
 
         int hint = switch (st) {
             case UNSUPPORTED_DEVICE, UNSUPPORTED_FIRMWARE -> R.string.hint_unsupported;
@@ -1107,16 +1429,26 @@ public final class MainActivity extends Activity {
                 false,
                 true,
                 this::showPinnedWidgetAppsPickerDialog);
-        overviewGroup.addActionRow(
+        int homeQuickRow = overviewGroup.addActionRow(
+                Glyph.QUICK_GRID,
+                getString(R.string.sw_quick_widget_title),
+                quickWidgetSlotsSummary(),
+                getString(R.string.chip_configure),
+                false,
+                true,
+                this::showQuickWidgetSlotsDialog);
+        int homeCompatRow = overviewGroup.addActionRow(
                 Glyph.SHIELD,
                 getString(R.string.home_nav_compat_title),
-                compatOverviewSubtitle(scope),
+                compatOverviewSubtitle(scope, snap.required()),
                 getString(R.string.chip_manage),
                 false,
                 false,
                 () -> selectTab(3));
         overviewGroup.commit();
         addPinnedSummaryText(overviewGroup.subtitleAt(homePinnedRow));
+        addQuickWidgetSummaryText(overviewGroup.subtitleAt(homeQuickRow));
+        homeCompatSubtitleText = overviewGroup.subtitleAt(homeCompatRow);
 
         addSectionHeader(getString(R.string.section_builtin));
         SegmentedGroup builtinGroup = new SegmentedGroup();
@@ -1143,11 +1475,13 @@ public final class MainActivity extends Activity {
                 stateText(value(ModuleConfig.KEY_THIRD_PARTY_IME)));
     }
 
-    private String compatOverviewSubtitle(List<String> scope) {
+    private String compatOverviewSubtitle(List<String> scope, LinkedHashSet<String> req) {
         if (scope == null) {
-            return getString(R.string.home_nav_compat_sub_disconnected);
+            return service == null
+                    ? getString(R.string.home_nav_compat_sub_disconnected)
+                    : getString(R.string.picker_loading);
         }
-        LinkedHashSet<String> missing = required();
+        LinkedHashSet<String> missing = new LinkedHashSet<>(req != null ? req : CORE_SCOPE);
         missing.removeAll(scope);
         if (!missing.isEmpty()) {
             return getString(R.string.home_nav_compat_sub_missing, missing.size(), scopeLabels(missing));
@@ -1161,17 +1495,31 @@ public final class MainActivity extends Activity {
         orbGroup.addSwitch(Glyph.ORB, R.string.sw_panel_title, R.string.sw_panel_sub, ModuleConfig.KEY_PANEL);
         orbGroup.addSwitch(Glyph.BATTERY, R.string.sw_battery_title, R.string.sw_battery_sub, ModuleConfig.KEY_BATTERY_NUMBER);
         orbGroup.addSwitch(Glyph.SIM, R.string.sw_dual_title, R.string.sw_dual_sub, ModuleConfig.KEY_DUAL_SIM);
+        int orbTapRow = orbGroup.addActionRow(Glyph.ORB, getString(R.string.row_orb_tap_title),
+                orbActionLabel(ModuleConfig.orbTapAction()), getString(R.string.chip_configure),
+                false, true, () -> showOrbActionPickerDialog(false));
+        int orbLongRow = orbGroup.addActionRow(Glyph.ORB, getString(R.string.row_orb_long_title),
+                orbActionLabel(ModuleConfig.orbLongPressAction()), getString(R.string.chip_configure),
+                false, true, () -> showOrbActionPickerDialog(true));
         orbGroup.commit();
+        addTextIfPresent(orbTapSummaryTexts, orbGroup.subtitleAt(orbTapRow));
+        addTextIfPresent(orbLongSummaryTexts, orbGroup.subtitleAt(orbLongRow));
 
         addSectionHeader(getString(R.string.section_desktop));
         SegmentedGroup desktopGroup = new SegmentedGroup();
         desktopGroup.addSwitch(Glyph.ISLAND, R.string.sw_island_title, R.string.sw_island_sub, ModuleConfig.KEY_LIVE_ISLAND);
         desktopGroup.addSwitch(Glyph.GRID, R.string.sw_hide_names_title, R.string.sw_hide_names_sub, ModuleConfig.KEY_HIDE_APP_NAMES);
+        desktopGroup.addSwitch(Glyph.LAYERS, R.string.sw_unlock_launcher_title, R.string.sw_unlock_launcher_sub, ModuleConfig.KEY_UNLOCK_LAUNCHER_APPS);
+        desktopGroup.addSwitch(Glyph.LAYOUT, R.string.sw_double_tap_lock_title, R.string.sw_double_tap_lock_sub, ModuleConfig.KEY_DOUBLE_TAP_LOCK);
         desktopGroup.addSwitch(Glyph.GRID, R.string.sw_pinned_widget_title, R.string.sw_pinned_widget_sub, ModuleConfig.KEY_PINNED_WIDGET_ENABLED);
         int pinnedRow = desktopGroup.addActionRow(Glyph.SPARKLE, getString(R.string.row_pinned_widget_apps_title),
                 pinnedWidgetAppsSummary(), getString(R.string.chip_configure), false, true, this::showPinnedWidgetAppsPickerDialog);
+        desktopGroup.addSwitch(Glyph.QUICK_GRID, R.string.sw_quick_widget_title, R.string.sw_quick_widget_sub, ModuleConfig.KEY_QUICK_WIDGET_ENABLED);
+        int quickRow = desktopGroup.addActionRow(Glyph.SPARKLE, getString(R.string.row_quick_widget_slots_title),
+                quickWidgetSlotsSummary(), getString(R.string.chip_configure), false, true, this::showQuickWidgetSlotsDialog);
         desktopGroup.commit();
         addPinnedSummaryText(desktopGroup.subtitleAt(pinnedRow));
+        addQuickWidgetSummaryText(desktopGroup.subtitleAt(quickRow));
     }
 
     private void buildLayoutPage() {
@@ -1189,22 +1537,48 @@ public final class MainActivity extends Activity {
         unblockGroup.addSwitch(Glyph.ISLAND, R.string.sw_notif_open_title, R.string.sw_notif_open_sub, ModuleConfig.KEY_DIRECT_OPEN_COVER_NOTIF);
         unblockGroup.commit();
 
+        addSectionHeader(getString(R.string.section_fold_continuity));
+        SegmentedGroup foldGroup = new SegmentedGroup();
+        int foldModeRow = foldGroup.addActionRow(Glyph.SPARKLE, getString(R.string.row_fold_mode_title),
+                foldContinuityModeSummary(), getString(R.string.chip_configure), false, true, this::showFoldContinuityModeDialog);
+        int foldAppsRow = foldGroup.addActionRow(Glyph.LAYERS, getString(R.string.row_fold_apps_title),
+                foldContinuityAppsSummary(), getString(R.string.chip_configure), false, true, this::showFoldContinuityAppsDialog);
+        foldGroup.addSwitch(Glyph.SHIELD, R.string.sw_fold_pocket_title, R.string.sw_fold_pocket_sub, ModuleConfig.KEY_FOLD_POCKET_GUARD);
+        foldGroup.commit();
+        addTextIfPresent(foldModeSummaryTexts, foldGroup.subtitleAt(foldModeRow));
+        addTextIfPresent(foldAppsSummaryTexts, foldGroup.subtitleAt(foldAppsRow));
+
         addSectionHeader(getString(R.string.section_ime_compat));
         SegmentedGroup imeGroup = new SegmentedGroup();
         imeGroup.addSwitch(Glyph.KEYBOARD, R.string.sw_ime_title, R.string.sw_ime_sub, ModuleConfig.KEY_THIRD_PARTY_IME);
+        int imeTuneRow = imeGroup.addActionRow(Glyph.KEYBOARD, getString(R.string.row_ime_tuning_title),
+                imeTuningSummary(), getString(R.string.chip_configure), false, true, this::showImeTuningDialog);
         imeGroup.addInfoRow(Glyph.INFO, getString(R.string.info_ime_scope_title), getString(R.string.info_ime_scope_sub));
         imeGroup.commit();
+        addTextIfPresent(imeTuningSummaryTexts, imeGroup.subtitleAt(imeTuneRow));
     }
 
     private void buildCompatibilityPage() {
+        addSectionHeader(getString(R.string.section_per_app_rules));
+        SegmentedGroup rulesGroup = new SegmentedGroup();
+        int rulesRow = rulesGroup.addActionRow(Glyph.LAYOUT, getString(R.string.row_per_app_rules_title),
+                perAppRulesSummary(), getString(R.string.chip_manage), false, true, this::showPerAppRulesManagerDialog);
+        rulesGroup.addActionRow(Glyph.LINK, getString(R.string.row_rules_json_title),
+                getString(R.string.row_rules_json_sub), getString(R.string.chip_configure), false, true, this::showPerAppRulesJsonDialog);
+        rulesGroup.commit();
+        addTextIfPresent(perAppRulesSummaryTexts, rulesGroup.subtitleAt(rulesRow));
+
         addSectionHeader(getString(R.string.section_scope));
-        buildDeepCompatGuideCard();
+        ScopeSnapshot snap = usableScopeSnapshot();
+        buildDeepCompatGuideCard(snap);
         SegmentedGroup scopeGroup = new SegmentedGroup();
         scopeGroup.addActionRow(Glyph.LAYERS, getString(R.string.row_ext_scope_title), getString(R.string.row_ext_scope_sub),
                 getString(R.string.chip_manage), false, true, this::showAppScopePickerDialog);
-        int requestRow = scopeGroup.addActionRow(Glyph.SHIELD, getString(R.string.action_request_core), requestCoreSubtitle(),
+        int requestRow = scopeGroup.addActionRow(Glyph.SHIELD, getString(R.string.action_request_core),
+                requestCoreSubtitle(snap.required()),
                 getString(R.string.chip_request), false, true, this::requestCore);
-        int resetRow = scopeGroup.addActionRow(Glyph.CLEAN, getString(R.string.row_reset_scope_title), resetCoreSubtitle(),
+        int resetRow = scopeGroup.addActionRow(Glyph.CLEAN, getString(R.string.row_reset_scope_title),
+                resetCoreSubtitle(snap.required()),
                 getString(R.string.chip_reset), false, true, this::pruneScopes);
         scopeGroup.commit();
         addScopeCountText(scopeGroup.subtitleAt(requestRow));
@@ -1250,8 +1624,10 @@ public final class MainActivity extends Activity {
         return new DeepCompatStats(installed, enabled);
     }
 
-    private String deepCompatStatusSummary(Collection<String> scope) {
-        DeepCompatStats stats = queryDeepCompatStats(scope);
+    private String deepCompatStatusSummary(Collection<String> scope, DeepCompatStats stats) {
+        if (stats == null) {
+            return getString(R.string.picker_loading);
+        }
         if (stats.installedCount() == 0) {
             return getString(R.string.deep_compat_status_none);
         }
@@ -1261,9 +1637,10 @@ public final class MainActivity extends Activity {
         return getString(R.string.deep_compat_status_connected, stats.installedCount(), stats.enabledCount());
     }
 
-    private void buildDeepCompatGuideCard() {
+    private void buildDeepCompatGuideCard(ScopeSnapshot snap) {
         boolean compact = isCompactCoverUi();
-        List<String> scope = service == null ? null : scopeSafe();
+        List<String> scope = snap != null ? snap.scope() : null;
+        DeepCompatStats stats = snap != null ? snap.deepCompatStats() : null;
 
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -1298,7 +1675,7 @@ public final class MainActivity extends Activity {
         titleView.setAccessibilityHeading(true);
         titleCol.addView(titleView);
 
-        TextView statusView = createText(deepCompatStatusSummary(scope), 12f, palette.primary, FONT_MEDIUM);
+        TextView statusView = createText(deepCompatStatusSummary(scope, stats), 12f, palette.primary, FONT_MEDIUM);
         statusView.setLineSpacing(dp(2f), 1f);
         statusView.setPadding(0, dp(3), 0, 0);
         titleCol.addView(statusView);
@@ -1325,7 +1702,7 @@ public final class MainActivity extends Activity {
         ctaBtn.setMinimumHeight(dp(44));
         LinearLayout.LayoutParams ctaLp = compact
                 ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44))
-                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42));
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
         ctaRow.addView(ctaBtn, ctaLp);
         card.addView(ctaRow);
 
@@ -1340,26 +1717,117 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshScopeTexts() {
-        if (scopeCountTexts.size() == 2) {
-            scopeCountTexts.get(0).setText(requestCoreSubtitle());
-            scopeCountTexts.get(1).setText(resetCoreSubtitle());
+        refreshAsyncSummaries();
+    }
+
+    private Set<String> collectPackagesNeedingLabels() {
+        LinkedHashSet<String> pkgs = new LinkedHashSet<>();
+        for (String target : currentPinnedPackages()) {
+            String pkg = ModuleConfig.extractAppTargetPackage(target);
+            if (!pkg.isEmpty() && !appLabelCache.containsKey(pkg)) pkgs.add(pkg);
         }
-        if (!deepCompatStatusTexts.isEmpty()) {
-            List<String> scope = service == null ? null : scopeSafe();
-            String status = deepCompatStatusSummary(scope);
-            for (TextView tv : deepCompatStatusTexts) {
-                if (tv != null) tv.setText(status);
+        for (String token : currentQuickActionSlots()) {
+            if (token != null && token.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                String pkg = ModuleConfig.extractAppTargetPackage(token.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+                if (!pkg.isEmpty() && !appLabelCache.containsKey(pkg)) pkgs.add(pkg);
             }
         }
+        String tap = ModuleConfig.orbTapAction();
+        if (tap.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+            String pkg = ModuleConfig.extractAppTargetPackage(tap.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+            if (!pkg.isEmpty() && !appLabelCache.containsKey(pkg)) pkgs.add(pkg);
+        }
+        String lng = ModuleConfig.orbLongPressAction();
+        if (lng.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+            String pkg = ModuleConfig.extractAppTargetPackage(lng.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+            if (!pkg.isEmpty() && !appLabelCache.containsKey(pkg)) pkgs.add(pkg);
+        }
+        int shown = 0;
+        for (String pkg : ModuleConfig.foldContinuityApps()) {
+            if (shown++ >= 4) break;
+            if (!pkg.isEmpty() && !appLabelCache.containsKey(pkg)) pkgs.add(pkg);
+        }
+        return pkgs;
     }
 
-    private String requestCoreSubtitle() {
-        LinkedHashSet<String> req = required();
-        return getString(R.string.row_request_core_sub, req.size(), scopeLabels(req));
+    private void refreshAsyncSummaries() {
+        if (isFinishing() || isDestroyed()) return;
+        final int gen = ++scopeRefreshGen;
+        final XposedService boundService = service;
+        final boolean thirdPartyIme = value(ModuleConfig.KEY_THIRD_PARTY_IME);
+        final Set<String> labelPackages = collectPackagesNeedingLabels();
+        final PackageManager pm = getPackageManager();
+        IO.execute(() -> {
+            List<String> fetchedScope = null;
+            RuntimeException scopeError = null;
+            if (boundService != null) {
+                try {
+                    fetchedScope = new ArrayList<>(boundService.getScope());
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "async getScope failed", e);
+                    scopeError = e;
+                }
+            }
+            LinkedHashSet<String> req = computeRequiredPackages(thirdPartyIme);
+            DeepCompatStats stats = queryDeepCompatStats(fetchedScope);
+            boolean labelsUpdated = false;
+            for (String pkg : labelPackages) {
+                String resolved = resolvePackageLabel(pm, pkg);
+                if (resolved != null && !resolved.isEmpty()) {
+                    appLabelCache.put(pkg, resolved);
+                    labelsUpdated = true;
+                }
+            }
+            final List<String> finalScope = fetchedScope;
+            final RuntimeException finalError = scopeError;
+            final boolean finalLabelsUpdated = labelsUpdated;
+            mainHandler.post(() -> {
+                if (gen != scopeRefreshGen || isFinishing() || isDestroyed()) return;
+                if (finalError != null && service == boundService) {
+                    if (cachedService == boundService) cachedService = null;
+                    service = null;
+                    cachedScopeSnapshot = null;
+                    show(getString(R.string.msg_service_died));
+                    scheduleRender();
+                    return;
+                }
+                if (service != boundService) return;
+                ScopeSnapshot snap = new ScopeSnapshot(boundService, finalScope, req, stats);
+                cachedScopeSnapshot = snap;
+                if (heroMetaText != null) {
+                    heroMetaText.setText(formatHeroMeta(lastRenderedStatus, finalScope));
+                }
+                if (homeCompatSubtitleText != null) {
+                    homeCompatSubtitleText.setText(compatOverviewSubtitle(finalScope, req));
+                }
+                if (scopeCountTexts.size() == 2) {
+                    scopeCountTexts.get(0).setText(requestCoreSubtitle(req));
+                    scopeCountTexts.get(1).setText(resetCoreSubtitle(req));
+                }
+                if (!deepCompatStatusTexts.isEmpty()) {
+                    String status = deepCompatStatusSummary(finalScope, stats);
+                    for (TextView tv : deepCompatStatusTexts) {
+                        if (tv != null) tv.setText(status);
+                    }
+                }
+                if (finalLabelsUpdated) {
+                    refreshPinnedSummaryTexts();
+                    refreshQuickWidgetSummaryTexts();
+                    refreshOrbActionSummaries();
+                    refreshFoldContinuitySummaries();
+                }
+            });
+        });
     }
 
-    private String resetCoreSubtitle() {
-        return getString(R.string.row_reset_scope_sub, required().size());
+    private String requestCoreSubtitle(LinkedHashSet<String> req) {
+        LinkedHashSet<String> target = req != null ? req : new LinkedHashSet<>(CORE_SCOPE);
+        return getString(R.string.row_request_core_sub, target.size(), scopeLabels(target));
+    }
+
+    private String resetCoreSubtitle(LinkedHashSet<String> req) {
+        int size = req != null ? req.size() : CORE_SCOPE.size();
+        return getString(R.string.row_reset_scope_sub, size);
     }
 
     // ==================== M3 Expressive Components ====================
@@ -1417,14 +1885,16 @@ public final class MainActivity extends Activity {
         sw.setClickable(false);
         sw.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         sw.hostRow = row;
-        row.setStateDescription(stateText(sw.isChecked()));
+        row.setStateDescription(sw.getVisibility() == View.VISIBLE ? stateText(sw.isChecked()) : null);
         row.setAccessibilityDelegate(new View.AccessibilityDelegate() {
             @Override
             public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
                 super.onInitializeAccessibilityNodeInfo(host, info);
-                info.setClassName("android.widget.Switch");
-                info.setCheckable(true);
-                info.setChecked(sw.isChecked());
+                if (sw.getVisibility() == View.VISIBLE) {
+                    info.setClassName("android.widget.Switch");
+                    info.setCheckable(true);
+                    info.setChecked(sw.isChecked());
+                }
             }
         });
     }
@@ -1589,25 +2059,34 @@ public final class MainActivity extends Activity {
         return TextUtils.join(getString(R.string.list_separator), labels);
     }
 
-    private LinkedHashSet<String> required() {
+    private LinkedHashSet<String> computeRequiredPackages(boolean thirdPartyImeEnabled) {
         LinkedHashSet<String> pkgs = new LinkedHashSet<>(CORE_SCOPE);
         try {
             getPackageManager().getPackageInfo(VOICEASSIST_PKG, 0);
             pkgs.add(VOICEASSIST_PKG);
         } catch (PackageManager.NameNotFoundException ignored) {
         }
-        if (value(ModuleConfig.KEY_THIRD_PARTY_IME)) {
-            try {
-                getPackageManager().getPackageInfo(WETYPE_PKG, 0);
-                pkgs.add(WETYPE_PKG);
-            } catch (PackageManager.NameNotFoundException ignored) {
-            }
+        if (thirdPartyImeEnabled) {
+            pkgs.addAll(installedUnpackedThirdPartyImePackages());
         }
         return pkgs;
     }
 
+    private LinkedHashSet<String> required() {
+        return computeRequiredPackages(value(ModuleConfig.KEY_THIRD_PARTY_IME));
+    }
+
     private void requestCore() {
-        requestPackages(required());
+        if (!CoverDisplay.isSupportedFirmware() || service == null) return;
+        final XposedService boundService = service;
+        final boolean thirdPartyIme = value(ModuleConfig.KEY_THIRD_PARTY_IME);
+        IO.execute(() -> {
+            LinkedHashSet<String> req = computeRequiredPackages(thirdPartyIme);
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || service != boundService) return;
+                requestPackages(req);
+            });
+        });
     }
 
     private void enableUniversalZeroBlank() {
@@ -1621,36 +2100,60 @@ public final class MainActivity extends Activity {
             show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
             return;
         }
-        List<String> scope = scopeSafe();
-        if (scope != null) {
-            PackageManager pm = getPackageManager();
+        final XposedService boundService = service;
+        final boolean thirdPartyIme = value(ModuleConfig.KEY_THIRD_PARTY_IME);
+        final PackageManager pm = getPackageManager();
+        IO.execute(() -> {
+            List<String> scope = null;
+            RuntimeException scopeError = null;
+            try {
+                scope = new ArrayList<>(boundService.getScope());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "enableUniversalZeroBlank getScope failed", e);
+                scopeError = e;
+            }
             List<String> packedInScope = new ArrayList<>();
-            for (String pkg : scope) {
-                if (CORE_SCOPE.contains(pkg) || WETYPE_PKG.equals(pkg)
-                        || VOICEASSIST_PKG.equals(pkg) || isDeepCompatApp(pkg)) {
-                    continue;
-                }
-                try {
-                    ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
-                    if (AppCompatibility.isPackedOrProtectedApp(ai)) {
-                        packedInScope.add(pkg);
+            LinkedHashSet<String> missing = new LinkedHashSet<>();
+            if (scope != null) {
+                for (String pkg : scope) {
+                    if (CORE_SCOPE.contains(pkg) || WETYPE_PKG.equals(pkg)
+                            || VOICEASSIST_PKG.equals(pkg) || isDeepCompatApp(pkg)) {
+                        continue;
                     }
-                } catch (PackageManager.NameNotFoundException ignored) {
+                    try {
+                        ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        if (AppCompatibility.isPackedOrProtectedApp(ai)) {
+                            packedInScope.add(pkg);
+                        }
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                    }
                 }
+                missing.addAll(computeRequiredPackages(thirdPartyIme));
+                missing.removeAll(scope);
             }
-            if (!packedInScope.isEmpty()) {
-                removeScopeSafe(packedInScope, R.string.msg_remove_failed);
-            }
-            LinkedHashSet<String> missing = required();
-            missing.removeAll(scope);
-            if (!missing.isEmpty()) {
-                requestPackages(missing);
+            final RuntimeException finalError = scopeError;
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || service != boundService) return;
+                if (finalError != null) {
+                    if (cachedService == boundService) cachedService = null;
+                    service = null;
+                    cachedScopeSnapshot = null;
+                    show(getString(R.string.msg_service_died));
+                    render(false);
+                    return;
+                }
+                if (!packedInScope.isEmpty()) {
+                    removeScopeSafe(packedInScope, R.string.msg_remove_failed);
+                }
+                if (!missing.isEmpty()) {
+                    requestPackages(missing);
+                    render(false);
+                    return;
+                }
+                show(getString(R.string.msg_zero_blank_done));
                 render(false);
-                return;
-            }
-        }
-        show(getString(R.string.msg_zero_blank_done));
-        render(false);
+            });
+        });
     }
 
     private static final class ScopeCallback implements XposedService.OnScopeEventListener {
@@ -1707,28 +2210,48 @@ public final class MainActivity extends Activity {
     }
 
     private void pruneScopes() {
-        if (!CoverDisplay.isSupportedFirmware()) return;
-        List<String> scope = scopeSafe();
-        if (scope == null) return;
-        LinkedHashSet<String> req = required();
-        List<String> extra = new ArrayList<>(scope);
-        extra.removeAll(req);
-        if (extra.isEmpty()) {
-            show(getString(R.string.msg_reset_nothing));
-            return;
-        }
-        AlertDialog resetDialog = trackDialog(dialogBuilder()
-                .setTitle(R.string.dialog_reset_title)
-                .setMessage(getString(R.string.dialog_reset_message, extra.size(), scopeLabels(req)))
-                .setNegativeButton(R.string.btn_cancel, null)
-                .setPositiveButton(R.string.chip_reset, (d, w) -> {
-                    if (removeScopeSafe(extra, R.string.msg_prune_failed)) {
-                        show(getString(R.string.msg_pruned, extra.size()));
-                    }
-                    render(false);
-                })
-                .show());
-        configureCoverSafeDialogWindow(resetDialog, false, false);
+        if (!CoverDisplay.isSupportedFirmware() || service == null) return;
+        final XposedService boundService = service;
+        final boolean thirdPartyIme = value(ModuleConfig.KEY_THIRD_PARTY_IME);
+        IO.execute(() -> {
+            List<String> scope;
+            try {
+                scope = new ArrayList<>(boundService.getScope());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "pruneScopes getScope failed", e);
+                mainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed() || service != boundService) return;
+                    if (cachedService == boundService) cachedService = null;
+                    service = null;
+                    cachedScopeSnapshot = null;
+                    show(getString(R.string.msg_service_died));
+                    scheduleRender();
+                });
+                return;
+            }
+            LinkedHashSet<String> req = computeRequiredPackages(thirdPartyIme);
+            List<String> extra = new ArrayList<>(scope);
+            extra.removeAll(req);
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || service != boundService) return;
+                if (extra.isEmpty()) {
+                    show(getString(R.string.msg_reset_nothing));
+                    return;
+                }
+                AlertDialog resetDialog = trackDialog(dialogBuilder()
+                        .setTitle(R.string.dialog_reset_title)
+                        .setMessage(getString(R.string.dialog_reset_message, extra.size(), scopeLabels(req)))
+                        .setNegativeButton(R.string.btn_cancel, null)
+                        .setPositiveButton(R.string.chip_reset, (d, w) -> {
+                            if (removeScopeSafe(extra, R.string.msg_prune_failed)) {
+                                show(getString(R.string.msg_pruned, extra.size()));
+                            }
+                            render(false);
+                        })
+                        .show());
+                configureCoverSafeDialogWindow(resetDialog, false, false);
+            });
+        });
     }
 
     // ==================== Restore / recovery / about ====================
@@ -1790,22 +2313,31 @@ public final class MainActivity extends Activity {
     }
 
     private void restoreSystemDefaults() {
+        String rawSlots = ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS;
         if (prefs != null && service != null) {
             try {
+                rawSlots = prefs.getString(
+                        ModuleConfig.KEY_QUICK_WIDGET_SLOTS,
+                        ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS);
                 prefs.edit()
                         .putBoolean(ModuleConfig.KEY_IMMERSIVE, false)
                         .putBoolean(ModuleConfig.KEY_UNIVERSAL_COMPAT, false)
                         .putBoolean(ModuleConfig.KEY_THIRD_PARTY_IME, false)
+                        .putBoolean(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, false)
+                        .putInt(ModuleConfig.KEY_FOLD_CONTINUITY_MODE, ModuleConfig.FOLD_CONT_SYSTEM)
                         .commit();
                 syncSwitches(ModuleConfig.KEY_IMMERSIVE, false);
                 syncSwitches(ModuleConfig.KEY_UNIVERSAL_COMPAT, false);
                 syncSwitches(ModuleConfig.KEY_THIRD_PARTY_IME, false);
+                syncSwitches(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, false);
+                refreshFoldContinuitySummaries();
                 refreshScopeTexts();
                 if (coverPreview != null) coverPreview.invalidate();
             } catch (RuntimeException e) {
                 Log.w(TAG, "failed to commit default preferences before restore", e);
             }
         }
+        broadcastQuickWidgetSync(false, rawSlots, true);
         try {
             Intent intent = new Intent(FrameworkRuntime.ACTION_RESTORE).setPackage("android");
             BroadcastOptions options = BroadcastOptions.makeBasic();
@@ -1840,36 +2372,158 @@ public final class MainActivity extends Activity {
         };
     }
 
+    static boolean isPublicDiagnosticPackage(String target) {
+        if (target == null || target.isEmpty()) return false;
+        String pkg = ModuleConfig.extractAppTargetPackage(target);
+        if (pkg.isEmpty()) return false;
+        if ("system".equals(pkg)
+                || "android".equals(pkg)
+                || CORE_SCOPE.contains(pkg)
+                || VOICEASSIST_PKG.equals(pkg)
+                || WETYPE_PKG.equals(pkg)
+                || CoverImeGuard.SOGOU_PKG.equals(pkg)
+                || DEEP_COMPAT_SPECS.containsKey(pkg)
+                || BuildConfig.APPLICATION_ID.equals(pkg)) {
+            return true;
+        }
+        return pkg.startsWith("com.android.")
+                || pkg.startsWith("com.miui.")
+                || pkg.startsWith("com.xiaomi.")
+                || pkg.startsWith("android.");
+    }
+
+    static String formatDiagnosticPackageList(Collection<String> pkgs, boolean redact) {
+        if (pkgs == null || pkgs.isEmpty()) return "[]";
+        if (!redact) return new ArrayList<>(pkgs).toString();
+        List<String> out = new ArrayList<>();
+        int redactedCount = 0;
+        for (String item : pkgs) {
+            if (item == null || item.isEmpty()) continue;
+            if (isPublicDiagnosticPackage(item)) {
+                out.add(item);
+            } else {
+                redactedCount++;
+            }
+        }
+        if (redactedCount > 0) {
+            out.add("<redacted:" + redactedCount + ">");
+        }
+        return out.toString();
+    }
+
+    static String formatDiagnosticActionToken(String token, boolean redact) {
+        if (!redact || token == null || !token.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+            return token;
+        }
+        String target = token.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+        if (isPublicDiagnosticPackage(target)) {
+            return token;
+        }
+        int userId = ModuleConfig.extractAppTargetUserId(target);
+        return ModuleConfig.QA_APP_PREFIX + (userId > 0 ? "<redacted>#" + userId : "<redacted>");
+    }
+
+    static String formatDiagnosticActionList(List<String> slots, boolean redact) {
+        if (slots == null || slots.isEmpty()) return "[]";
+        if (!redact) return new ArrayList<>(slots).toString();
+        List<String> out = new ArrayList<>(slots.size());
+        for (String slot : slots) {
+            out.add(formatDiagnosticActionToken(slot, true));
+        }
+        return out.toString();
+    }
+
+    static String redactDiagnosticLogLine(String line, Collection<String> personalPackages) {
+        if (line == null || line.isEmpty() || personalPackages == null || personalPackages.isEmpty()) {
+            return line;
+        }
+        String out = line;
+        for (String pkg : personalPackages) {
+            if (pkg != null && pkg.length() >= 4 && pkg.contains(".") && out.contains(pkg)) {
+                out = out.replace(pkg, "<redacted-pkg>");
+            }
+        }
+        return out;
+    }
+
+    private List<String> collectPersonalDiagnosticPackages(List<String> scope) {
+        LinkedHashSet<String> personal = new LinkedHashSet<>();
+        Consumer<String> addIfPersonal = raw -> {
+            if (raw == null || raw.isEmpty()) return;
+            String pkg = ModuleConfig.extractAppTargetPackage(raw);
+            if (!pkg.isEmpty() && pkg.contains(".") && !isPublicDiagnosticPackage(pkg)) {
+                personal.add(pkg);
+            }
+        };
+        if (scope != null) {
+            for (String p : scope) addIfPersonal.accept(p);
+        }
+        for (String p : currentPinnedPackages()) addIfPersonal.accept(p);
+        for (String slot : currentQuickActionSlots()) {
+            if (slot != null && slot.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                addIfPersonal.accept(slot.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+            }
+        }
+        for (String p : ModuleConfig.foldContinuityApps()) addIfPersonal.accept(p);
+        String tap = ModuleConfig.orbTapAction();
+        if (tap.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+            addIfPersonal.accept(tap.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+        }
+        String lng = ModuleConfig.orbLongPressAction();
+        if (lng.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+            addIfPersonal.accept(lng.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+        }
+        for (String p : ModuleConfig.perAppRules().keySet()) addIfPersonal.accept(p);
+        List<String> sorted = new ArrayList<>(personal);
+        sorted.sort((a, b) -> Integer.compare(b.length(), a.length()));
+        return sorted;
+    }
+
     private void showDiagnosticLogsDialog() {
+        boolean compact = isCompactCoverUi();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean compactHeight = safeHeight < dp(420);
+        boolean ultraCompactHeight = safeHeight < dp(320);
+
         Dialog dialog = trackDialog(new Dialog(this));
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
         LinearLayout sheet = new LinearLayout(this);
         sheet.setOrientation(LinearLayout.VERTICAL);
-        sheet.setPadding(dp(18), dp(16), dp(18), dp(16));
-        sheet.setBackground(rounded(palette.surfaceContainerLow, 28f));
+        int padH = compact ? dp(10) : dp(18);
+        int padV = dp(ultraCompactHeight ? 8 : (compactHeight ? 12 : 16));
+        sheet.setPadding(padH, padV, padH, padV);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
 
-        View handle = new View(this);
-        handle.setBackground(rounded(palette.outlineVariant, 2f));
-        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(36), dp(4));
-        handleLp.gravity = Gravity.CENTER_HORIZONTAL;
-        handleLp.bottomMargin = dp(12);
-        sheet.addView(handle, handleLp);
+        if (!compactHeight) {
+            View handle = new View(this);
+            handle.setBackground(rounded(palette.outlineVariant, 2f));
+            LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(36), dp(4));
+            handleLp.gravity = Gravity.CENTER_HORIZONTAL;
+            handleLp.bottomMargin = dp(10);
+            sheet.addView(handle, handleLp);
+        }
 
-        TextView titleView = createText(getString(R.string.dialog_diag_log_title), 20f, palette.onSurface, FONT_BOLD);
+        TextView titleView = createText(
+                getString(R.string.dialog_diag_log_title),
+                ultraCompactHeight ? 15f : (compact ? 18f : 20f),
+                palette.onSurface,
+                FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
         sheet.addView(titleView);
 
         TextView subtitleView = createText(
                 getString(R.string.dialog_diag_log_sub, getString(R.string.app_name), 0),
-                12.5f, palette.onSurfaceVariant, FONT_REGULAR);
-        subtitleView.setPadding(0, dp(4), 0, dp(10));
+                ultraCompactHeight ? 11f : 12.5f, palette.onSurfaceVariant, FONT_REGULAR);
+        subtitleView.setPadding(0, dp(3), 0, dp(ultraCompactHeight ? 6 : 8));
         sheet.addView(subtitleView);
 
-        // Top action bar arranged as a clean 2x2 grid so buttons never truncate on the cover screen
+        // Top action bar arranged as a clean 2x2 grid (>= 44dp touch height)
         LinearLayout topActions = new LinearLayout(this);
         topActions.setOrientation(LinearLayout.VERTICAL);
-        topActions.setPadding(0, 0, 0, dp(10));
+        topActions.setPadding(0, 0, 0, dp(8));
 
+        int actionBtnH = dp(44);
         TextView btnRefresh = createDialogChipButton(getString(R.string.btn_refresh_log), false);
         TextView btnClear = createDialogChipButton(getString(R.string.btn_clear_log), false);
         TextView btnCopy = createDialogChipButton(getString(R.string.btn_copy_all), false);
@@ -1878,10 +2532,10 @@ public final class MainActivity extends Activity {
         LinearLayout actionRow1 = new LinearLayout(this);
         actionRow1.setOrientation(LinearLayout.HORIZONTAL);
         actionRow1.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams row1LeftLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        LinearLayout.LayoutParams row1LeftLp = new LinearLayout.LayoutParams(0, actionBtnH, 1f);
         row1LeftLp.rightMargin = dp(8);
         actionRow1.addView(btnRefresh, row1LeftLp);
-        actionRow1.addView(btnClear, new LinearLayout.LayoutParams(0, dp(38), 1f));
+        actionRow1.addView(btnClear, new LinearLayout.LayoutParams(0, actionBtnH, 1f));
         LinearLayout.LayoutParams row1Lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         row1Lp.bottomMargin = dp(6);
@@ -1890,13 +2544,65 @@ public final class MainActivity extends Activity {
         LinearLayout actionRow2 = new LinearLayout(this);
         actionRow2.setOrientation(LinearLayout.HORIZONTAL);
         actionRow2.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams row2LeftLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        LinearLayout.LayoutParams row2LeftLp = new LinearLayout.LayoutParams(0, actionBtnH, 1f);
         row2LeftLp.rightMargin = dp(8);
         actionRow2.addView(btnCopy, row2LeftLp);
-        actionRow2.addView(btnShare, new LinearLayout.LayoutParams(0, dp(38), 1f));
+        actionRow2.addView(btnShare, new LinearLayout.LayoutParams(0, actionBtnH, 1f));
         topActions.addView(actionRow2, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         sheet.addView(topActions);
+
+        // Privacy redaction toggle (ON by default)
+        final boolean[] redactPackages = {true};
+        final Runnable[] rebuildViewRef = new Runnable[1];
+
+        LinearLayout redactRow = new LinearLayout(this);
+        redactRow.setOrientation(LinearLayout.HORIZONTAL);
+        redactRow.setGravity(Gravity.CENTER_VERTICAL);
+        redactRow.setMinimumHeight(dp(44));
+        redactRow.setPadding(dp(12), dp(6), dp(12), dp(6));
+        redactRow.setBackground(ripple(palette.surfaceContainer, palette.rippleColor, 16f, 16f, 16f, 16f, 0, 0));
+        redactRow.setClickable(true);
+        redactRow.setFocusable(true);
+
+        LinearLayout redactTextCol = new LinearLayout(this);
+        redactTextCol.setOrientation(LinearLayout.VERTICAL);
+        redactTextCol.setPadding(0, 0, dp(8), 0);
+        TextView redactTitle = createText(
+                getString(R.string.diag_log_redact_title),
+                compact ? 12.5f : 13.5f,
+                palette.onSurface,
+                FONT_MEDIUM);
+        redactTitle.setSingleLine(true);
+        redactTitle.setEllipsize(TextUtils.TruncateAt.END);
+        redactTextCol.addView(redactTitle);
+        if (!ultraCompactHeight) {
+            TextView redactSub = createText(
+                    getString(R.string.diag_log_redact_sub),
+                    11f,
+                    palette.onSurfaceVariant,
+                    FONT_REGULAR);
+            redactSub.setMaxLines(2);
+            redactSub.setEllipsize(TextUtils.TruncateAt.END);
+            redactSub.setPadding(0, dp(1), 0, 0);
+            redactTextCol.addView(redactSub);
+        }
+        redactRow.addView(redactTextCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        M3Switch redactSwitch = new M3Switch(this, true);
+        redactSwitch.setContentDescription(getString(R.string.diag_log_redact_title));
+        redactRow.addView(redactSwitch, new LinearLayout.LayoutParams(dp(52), dp(32)));
+        bindSwitchRow(redactRow, redactSwitch);
+        redactSwitch.setOnCheckedChangeListener(checked -> {
+            redactPackages[0] = checked;
+            if (rebuildViewRef[0] != null) rebuildViewRef[0].run();
+        });
+        redactRow.setOnClickListener(v -> redactSwitch.toggleChecked());
+
+        LinearLayout.LayoutParams redactLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        redactLp.bottomMargin = dp(8);
+        sheet.addView(redactRow, redactLp);
 
         // Monospace scrollable log box
         ScrollView logScroll = new ScrollView(this);
@@ -1912,23 +2618,29 @@ public final class MainActivity extends Activity {
         sheet.addView(logScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        // Bottom close button
+        // Bottom close button (>= 44dp touch height)
         LinearLayout footer = new LinearLayout(this);
         footer.setOrientation(LinearLayout.HORIZONTAL);
         footer.setGravity(Gravity.END);
-        footer.setPadding(0, dp(12), 0, 0);
+        footer.setPadding(0, dp(10), 0, 0);
 
         TextView closeBtn = createText(getString(R.string.btn_close), 14f, palette.onSecondaryContainer, FONT_MEDIUM);
         closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setSingleLine(true);
+        closeBtn.setEllipsize(TextUtils.TruncateAt.END);
         closeBtn.setPadding(dp(22), 0, dp(22), 0);
+        closeBtn.setMinHeight(dp(44));
         closeBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 22f));
         closeBtn.setOnClickListener(v -> dialog.dismiss());
-        footer.addView(closeBtn, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42)));
+        footer.addView(closeBtn, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
         sheet.addView(footer);
 
         final Map<String, List<String>> processBuffers = new LinkedHashMap<>();
         final LinkedHashSet<String> respondedSources = new LinkedHashSet<>();
         final List<String> logcatLines = new ArrayList<>();
+        final ScopeSnapshot initialSnap = usableScopeSnapshot();
+        @SuppressWarnings("unchecked")
+        final List<String>[] collectedScope = new List[]{initialSnap.scope()};
         final String[] currentFullText = {""};
         final int[] collectGen = {0};
 
@@ -1955,23 +2667,28 @@ public final class MainActivity extends Activity {
             int count = mergedLogs.size();
             subtitleView.setText(getString(R.string.dialog_diag_log_sub, sourcesSummary, count));
 
+            boolean redact = redactPackages[0];
+            List<String> personalPkgs = redact ? collectPersonalDiagnosticPackages(collectedScope[0]) : List.of();
+
             StringBuilder sb = new StringBuilder();
-            sb.append(buildDiagnosticHeader());
+            sb.append(buildDiagnosticHeader(collectedScope[0], redact));
             sb.append("RespondedProcesses: ").append(sourcesToFormat).append('\n');
             sb.append("\n=== Runtime Logs (").append(count).append(") ===\n");
             if (mergedLogs.isEmpty()) {
                 sb.append(getString(R.string.dialog_diag_log_empty)).append('\n');
             } else {
                 for (String line : mergedLogs) {
-                    sb.append(line).append('\n');
+                    sb.append(redact ? redactDiagnosticLogLine(line, personalPkgs) : line).append('\n');
                 }
             }
             currentFullText[0] = sb.toString();
             logTextView.setText(currentFullText[0]);
         };
+        rebuildViewRef[0] = rebuildView;
 
         Runnable triggerCollect = () -> {
             final int gen = ++collectGen[0];
+            final XposedService boundService = service;
             processBuffers.clear();
             respondedSources.clear();
             logcatLines.clear();
@@ -1980,9 +2697,18 @@ public final class MainActivity extends Activity {
             rebuildView.run();
 
             IO.execute(() -> {
+                List<String> freshScope = null;
+                if (boundService != null) {
+                    try {
+                        freshScope = new ArrayList<>(boundService.getScope());
+                    } catch (RuntimeException ignored) {
+                    }
+                }
                 ArrayList<String> localLogcat = ModLog.readFilteredLogcat(200);
+                final List<String> resolvedScope = freshScope;
                 mainHandler.post(() -> {
                     if (gen != collectGen[0] || isFinishing() || isDestroyed() || !dialog.isShowing()) return;
+                    if (resolvedScope != null) collectedScope[0] = resolvedScope;
                     logcatLines.addAll(localLogcat);
                     rebuildView.run();
                 });
@@ -2087,18 +2813,18 @@ public final class MainActivity extends Activity {
         btn.setGravity(Gravity.CENTER);
         btn.setSingleLine(true);
         btn.setEllipsize(TextUtils.TruncateAt.END);
+        btn.setMinHeight(dp(44));
         btn.setPadding(dp(8), 0, dp(8), 0);
         btn.setBackground(pillRipple(
                 primary ? palette.primary : palette.secondaryContainer,
                 palette.rippleColor,
-                18f));
+                20f));
         btn.setClickable(true);
         btn.setFocusable(true);
         return btn;
     }
 
-    private String buildDiagnosticHeader() {
-        List<String> scope = service == null ? null : scopeSafe();
+    private String buildDiagnosticHeader(List<String> scope, boolean redact) {
         StringBuilder sb = new StringBuilder();
         sb.append("=== MixFlip2Cover Diagnostic Report ===\n");
         sb.append("Module: v").append(versionName()).append(" (").append(BuildConfig.VERSION_CODE).append(")\n");
@@ -2110,10 +2836,22 @@ public final class MainActivity extends Activity {
         sb.append("Status: ").append(status().name())
                 .append(" · fw_prop=").append(frameworkProp.isEmpty() ? "<empty>" : frameworkProp)
                 .append(" (expected=").append(FrameworkRuntime.VERSION).append(")\n");
+        sb.append("PrivacyRedaction: ").append(redact ? "on" : "off").append('\n');
         sb.append("LSPosed: ").append(service != null ? "connected" : "disconnected")
-                .append(" · scopes=").append(scope != null ? scope.toString() : "[]").append('\n');
+                .append(" · scopes=").append(formatDiagnosticPackageList(scope, redact)).append('\n');
         sb.append("Switches: ").append(currentState().toString()).append('\n');
-        sb.append("PinnedApps: ").append(currentPinnedPackages().toString()).append('\n');
+        sb.append("PinnedApps: ").append(formatDiagnosticPackageList(currentPinnedPackages(), redact)).append('\n');
+        sb.append("QuickActions: enabled=").append(value(ModuleConfig.KEY_QUICK_WIDGET_ENABLED))
+                .append(" slots=").append(formatDiagnosticActionList(currentQuickActionSlots(), redact)).append('\n');
+        sb.append("FoldContinuity: mode=").append(ModuleConfig.foldContinuityMode())
+                .append(" apps=").append(ModuleConfig.foldContinuityApps().size())
+                .append(" pocketGuard=").append(ModuleConfig.foldPocketGuardEnabled()).append('\n');
+        sb.append("OrbActions: tap=").append(formatDiagnosticActionToken(ModuleConfig.orbTapAction(), redact))
+                .append(" longPress=").append(formatDiagnosticActionToken(ModuleConfig.orbLongPressAction(), redact)).append('\n');
+        sb.append("ImeTuning: scale=").append(ModuleConfig.imeDpiScalePercent())
+                .append("% height=").append(ModuleConfig.imeMaxHeightPercent())
+                .append("% inset=").append(ModuleConfig.imeTopInsetPx()).append('\n');
+        sb.append("PerAppRules: count=").append(ModuleConfig.perAppRules().size()).append('\n');
         return sb.toString();
     }
 
@@ -2123,25 +2861,36 @@ public final class MainActivity extends Activity {
         final String label;
         final String labelLower;
         final String packageName;
+        final int userId;
+        final String targetKey;
         final boolean systemApp;
         final boolean inScope;
+        final boolean uninstalled;
         final String compatSummary;
         final String compatSummaryLower;
-        /** ResolveInfo or InputMethodInfo used to load the icon lazily (null falls back to ApplicationInfo icon). */
+        /** ResolveInfo, LauncherActivityInfo, or InputMethodInfo used to load the icon lazily. */
         final Object iconSource;
         boolean selected;
 
         AppEntry(String label, String packageName, boolean systemApp, boolean inScope, Object iconSource) {
-            this(label, packageName, systemApp, inScope, "", iconSource);
+            this(label, packageName, systemApp, inScope, "", iconSource, 0, false);
         }
 
         AppEntry(String label, String packageName, boolean systemApp, boolean inScope,
                  String compatSummary, Object iconSource) {
+            this(label, packageName, systemApp, inScope, compatSummary, iconSource, 0, false);
+        }
+
+        AppEntry(String label, String packageName, boolean systemApp, boolean inScope,
+                 String compatSummary, Object iconSource, int userId, boolean uninstalled) {
             this.label = label;
             this.labelLower = label.toLowerCase(Locale.ROOT);
             this.packageName = packageName;
+            this.userId = Math.max(0, userId);
+            this.targetKey = ModuleConfig.formatAppTarget(packageName, this.userId);
             this.systemApp = systemApp;
             this.inScope = inScope;
+            this.uninstalled = uninstalled;
             this.compatSummary = compatSummary != null ? compatSummary : "";
             this.compatSummaryLower = this.compatSummary.toLowerCase(Locale.ROOT);
             this.iconSource = iconSource;
@@ -2240,31 +2989,70 @@ public final class MainActivity extends Activity {
     }
 
     private void bindIcon(AppEntry app, ImageView target) {
-        target.setTag(app.packageName);
-        Drawable cached = iconCache.get(app.packageName);
+        String cacheKey = app.targetKey;
+        target.setTag(cacheKey);
+        if (app.uninstalled) {
+            target.setImageDrawable(null);
+            return;
+        }
+        Drawable cached = iconCache.get(cacheKey);
         if (cached != null) {
             target.setImageDrawable(iconCopy(cached));
             return;
         }
         target.setImageDrawable(null);
-        if (!iconLoading.add(app.packageName)) return;
+        if (!iconLoading.add(cacheKey)) return;
         PackageManager pm = getPackageManager();
+        LauncherApps launcherApps = getSystemService(LauncherApps.class);
         WeakReference<ImageView> targetRef = new WeakReference<>(target);
         IO.execute(() -> {
             Drawable d = null;
             try {
-                if (app.iconSource instanceof ResolveInfo ri) d = ri.loadIcon(pm);
+                if (app.iconSource instanceof LauncherActivityInfo lai) d = lai.getBadgedIcon(0);
+                else if (app.iconSource instanceof ResolveInfo ri) d = ri.loadIcon(pm);
                 else if (app.iconSource instanceof InputMethodInfo imi) d = imi.loadIcon(pm);
-                else d = pm.getApplicationIcon(app.packageName);
+                else d = loadAppIconSync(pm, launcherApps, app.packageName, app.userId);
             } catch (Throwable ignored) {
             }
             final Drawable icon = d;
             mainHandler.post(() -> {
-                iconLoading.remove(app.packageName);
+                iconLoading.remove(cacheKey);
                 if (icon == null || isDestroyed()) return;
-                iconCache.put(app.packageName, icon);
+                iconCache.put(cacheKey, icon);
                 ImageView view = targetRef.get();
-                if (view != null && app.packageName.equals(view.getTag())) view.setImageDrawable(iconCopy(icon));
+                if (view != null && cacheKey.equals(view.getTag())) view.setImageDrawable(iconCopy(icon));
+            });
+        });
+    }
+
+    private void bindTargetIcon(String targetKey, ImageView target) {
+        if (targetKey == null || targetKey.isEmpty()) {
+            target.setTag(null);
+            target.setImageDrawable(null);
+            return;
+        }
+        target.setTag(targetKey);
+        Drawable cached = iconCache.get(targetKey);
+        if (cached != null) {
+            target.setImageDrawable(iconCopy(cached));
+            return;
+        }
+        target.setImageDrawable(null);
+        if (!iconLoading.add(targetKey)) return;
+        String pkg = ModuleConfig.extractAppTargetPackage(targetKey);
+        int userId = ModuleConfig.extractAppTargetUserId(targetKey);
+        PackageManager pm = getPackageManager();
+        LauncherApps launcherApps = getSystemService(LauncherApps.class);
+        WeakReference<ImageView> targetRef = new WeakReference<>(target);
+        IO.execute(() -> {
+            Drawable d = loadAppIconSync(pm, launcherApps, pkg, userId);
+            final Drawable icon = d;
+            mainHandler.post(() -> {
+                iconLoading.remove(targetKey);
+                if (icon == null || isDestroyed()) return;
+                iconCache.put(targetKey, icon);
+                ImageView view = targetRef.get();
+                if (view != null && targetKey.equals(view.getTag())) view.setImageDrawable(iconCopy(icon));
             });
         });
     }
@@ -2279,10 +3067,16 @@ public final class MainActivity extends Activity {
         final TextView compatDesc;
         final TextView pkg;
         final M3Switch sw;
+        final boolean hasSwitch;
         int shape = -1;
         AppEntry entry;
 
         AppRowHolder() {
+            this(true);
+        }
+
+        AppRowHolder(boolean hasSwitch) {
+            this.hasSwitch = hasSwitch;
             boolean compact = isCompactCoverUi();
             row = new LinearLayout(MainActivity.this);
             row.setOrientation(LinearLayout.HORIZONTAL);
@@ -2370,7 +3164,13 @@ public final class MainActivity extends Activity {
 
             sw = new M3Switch(MainActivity.this, false);
             row.addView(sw, new LinearLayout.LayoutParams(dp(52), dp(32)));
-            bindSwitchRow(row, sw);
+            if (hasSwitch) {
+                bindSwitchRow(row, sw);
+            } else {
+                sw.setVisibility(View.GONE);
+                sw.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                row.setStateDescription(null);
+            }
             row.setTag(this);
         }
 
@@ -2423,20 +3223,43 @@ public final class MainActivity extends Activity {
                     compatDesc.setVisibility(View.GONE);
                 }
             } else {
-                deepTag.setVisibility(View.GONE);
                 tag.setVisibility(View.GONE);
                 compatDesc.setVisibility(View.GONE);
+                if (app.uninstalled) {
+                    deepTag.setText(R.string.tag_uninstalled);
+                    deepTag.setTextColor(palette.onErrorContainer);
+                    deepTag.setBackground(rounded(palette.errorContainer, 8f));
+                    deepTag.setVisibility(View.VISIBLE);
+                } else if (app.userId > 0) {
+                    deepTag.setText(R.string.tag_dual_app);
+                    deepTag.setTextColor(palette.onSecondaryContainer);
+                    deepTag.setBackground(rounded(palette.secondaryContainer, 8f));
+                    deepTag.setVisibility(View.VISIBLE);
+                } else {
+                    deepTag.setVisibility(View.GONE);
+                }
             }
             syncBadgeRow();
-            pkg.setText(app.packageName);
-            sw.setContentDescription(app.label);
-            sw.jumpTo(app.selected);
+            pkg.setText(app.targetKey);
+            if (hasSwitch) {
+                sw.setContentDescription(app.label);
+                sw.jumpTo(app.selected);
+            }
             bindIcon(app, icon);
         }
     }
 
     private final class AppListAdapter extends BaseAdapter {
         final List<AppEntry> items = new ArrayList<>();
+        private final boolean showCompatMeta;
+
+        AppListAdapter() {
+            this(true);
+        }
+
+        AppListAdapter(boolean showCompatMeta) {
+            this.showCompatMeta = showCompatMeta;
+        }
 
         @Override public int getCount() { return items.size(); }
         @Override public AppEntry getItem(int position) { return items.get(position); }
@@ -2448,11 +3271,59 @@ public final class MainActivity extends Activity {
             if (convertView != null && convertView.getTag() instanceof AppRowHolder h) {
                 holder = h;
             } else {
-                holder = new AppRowHolder();
+                holder = new AppRowHolder(true);
             }
-            holder.bind(items.get(position), position, items.size(), true);
+            holder.bind(items.get(position), position, items.size(), showCompatMeta);
             return holder.row;
         }
+    }
+
+    private record PruneBannerHolder(LinearLayout container, TextView message) {
+        void update(Context ctx, int uninstalledCount) {
+            if (uninstalledCount > 0) {
+                message.setText(ctx.getString(R.string.banner_uninstalled_found, uninstalledCount));
+                container.setVisibility(View.VISIBLE);
+            } else {
+                container.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    private PruneBannerHolder createUninstalledPruneBanner(boolean compact, boolean ultraCompactHeight, Runnable onPrune) {
+        LinearLayout banner = new LinearLayout(this);
+        banner.setOrientation(LinearLayout.HORIZONTAL);
+        banner.setGravity(Gravity.CENTER_VERTICAL);
+        banner.setPadding(dp(compact ? 10 : 12), dp(ultraCompactHeight ? 4 : 6),
+                dp(compact ? 8 : 10), dp(ultraCompactHeight ? 4 : 6));
+        banner.setBackground(rounded(palette.errorContainer, 14f));
+        banner.setVisibility(View.GONE);
+
+        TextView msg = createText("", ultraCompactHeight ? 11f : 12f, palette.onErrorContainer, FONT_MEDIUM);
+        msg.setSingleLine(true);
+        msg.setEllipsize(TextUtils.TruncateAt.END);
+        banner.addView(msg, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView btn = createText(getString(R.string.btn_prune_uninstalled),
+                ultraCompactHeight ? 11.5f : 12.5f, palette.onErrorContainer, FONT_BOLD);
+        btn.setGravity(Gravity.CENTER);
+        btn.setSingleLine(true);
+        btn.setEllipsize(TextUtils.TruncateAt.END);
+        btn.setMinHeight(dp(ultraCompactHeight ? 36 : 44));
+        btn.setPadding(dp(10), 0, dp(10), 0);
+        btn.setBackground(pillRipple(
+                M3Palette.blend(palette.errorContainer, palette.onErrorContainer, 0.14f),
+                palette.rippleColor,
+                16f));
+        btn.setClickable(true);
+        btn.setFocusable(true);
+        btn.setOnClickListener(v -> {
+            if (onPrune != null) onPrune.run();
+        });
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        btnLp.leftMargin = dp(6);
+        banner.addView(btn, btnLp);
+        return new PruneBannerHolder(banner, msg);
     }
 
     private TextView createChip(String text, int color, boolean ultraCompactHeight) {
@@ -2481,10 +3352,8 @@ public final class MainActivity extends Activity {
     }
 
     private void showAppScopePickerDialog(int initialFilter) {
-        if (!CoverDisplay.isSupportedFirmware()) return;
-        List<String> scopeList = scopeSafe();
-        if (scopeList == null) return;
-        Set<String> currentScope = new HashSet<>(scopeList);
+        if (!CoverDisplay.isSupportedFirmware() || service == null) return;
+        final XposedService boundService = service;
         int startFilter = (initialFilter >= FILTER_THIRD_PARTY && initialFilter <= FILTER_SYSTEM_APPS)
                 ? initialFilter : FILTER_THIRD_PARTY;
 
@@ -2757,7 +3626,7 @@ public final class MainActivity extends Activity {
             }
             List<String> toAdd = new ArrayList<>();
             List<String> toRemove = new ArrayList<>();
-            Set<String> coreReq = required();
+            Set<String> coreReq = usableScopeSnapshot().required();
             for (AppEntry app : allApps) {
                 if (app.selected && !app.inScope) {
                     toAdd.add(app.packageName);
@@ -2789,14 +3658,32 @@ public final class MainActivity extends Activity {
         dialog.show();
         configureCoverSafePickerWindow(dialog, false);
 
-        // Load the app list off the main thread.
+        // Load scope + app list off the main thread.
         Context appCtx = this;
         PackageManager pm = getPackageManager();
         InputMethodManager imm = getSystemService(InputMethodManager.class);
         IO.execute(() -> {
+            Set<String> currentScope;
+            try {
+                currentScope = new HashSet<>(boundService.getScope());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "failed to query scope for picker", e);
+                mainHandler.post(() -> {
+                    if (dialog.isShowing()) dialog.dismiss();
+                    if (!isFinishing() && !isDestroyed() && service == boundService) {
+                        if (cachedService == boundService) cachedService = null;
+                        service = null;
+                        cachedScopeSnapshot = null;
+                        show(getString(R.string.msg_service_died));
+                        scheduleRender();
+                    }
+                });
+                return;
+            }
             List<AppEntry> loaded;
             try {
                 loaded = loadLaunchableApps(appCtx, pm, imm, currentScope);
+                for (AppEntry e : loaded) appLabelCache.put(e.packageName, e.label);
             } catch (RuntimeException e) {
                 Log.w(TAG, "failed to load apps", e);
                 loaded = List.of();
@@ -2856,29 +3743,22 @@ public final class MainActivity extends Activity {
     }
 
     private String pinnedWidgetAppsSummary() {
-        List<String> pkgs = currentPinnedPackages();
-        if (pkgs.isEmpty()) {
+        List<String> targets = currentPinnedPackages();
+        if (targets.isEmpty()) {
             return getString(R.string.row_pinned_widget_apps_empty);
         }
-        PackageManager pm = getPackageManager();
         String sep = getString(R.string.list_separator);
         StringBuilder names = new StringBuilder();
-        for (String pkg : pkgs) {
-            String label = pkg;
-            try {
-                ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
-                CharSequence cs = pm.getApplicationLabel(ai);
-                if (cs != null && cs.length() > 0) label = cs.toString();
-            } catch (Throwable ignored) {
-            }
+        for (String target : targets) {
             if (names.length() > 0) names.append(sep);
-            names.append(label);
+            names.append(formatAppTargetLabel(target));
         }
-        return getString(R.string.row_pinned_widget_apps_summary, pkgs.size(), names.toString());
+        return getString(R.string.row_pinned_widget_apps_summary, targets.size(), names.toString());
     }
 
-    /** Loads all launchable launcher apps (except FlipHome itself) for the 4-slot widget icon picker. */
-    private static List<AppEntry> loadLaunchableAppsForWidget(PackageManager pm, List<String> pinnedOrder) {
+    /** Loads launchable launcher apps (except FlipHome itself), optionally including Dual-App (u999) profiles. */
+    private static List<AppEntry> loadLaunchableAppsForWidget(
+            PackageManager pm, LauncherApps launcherApps, List<String> pinnedOrder, boolean includeDualApps) {
         Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
         mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
         List<ResolveInfo> resolved = pm.queryIntentActivities(mainIntent, 0);
@@ -2888,26 +3768,60 @@ public final class MainActivity extends Activity {
         for (ResolveInfo info : resolved) {
             if (info.activityInfo == null) continue;
             String pkg = info.activityInfo.packageName;
-            if (pkg == null || pkg.isEmpty() || "com.miui.fliphome".equals(pkg) || !seen.add(pkg)) continue;
+            if (pkg == null || pkg.isEmpty() || "com.miui.fliphome".equals(pkg)) continue;
+            String target = ModuleConfig.formatAppTarget(pkg, 0);
+            if (!seen.add(target)) continue;
             String label = String.valueOf(info.loadLabel(pm));
             entries.add(new AppEntry(label, pkg, isSystemApp(info.activityInfo.applicationInfo),
-                    pinnedSet.contains(pkg), info));
+                    pinnedSet.contains(target), "", info, 0, false));
+        }
+        if (includeDualApps && launcherApps != null) {
+            for (UserHandle uh : querySecondaryUserHandles(launcherApps)) {
+                int uid = extractUserId(uh);
+                if (uid <= 0) continue;
+                try {
+                    List<LauncherActivityInfo> activities = launcherApps.getActivityList(null, uh);
+                    if (activities == null) continue;
+                    for (LauncherActivityInfo lai : activities) {
+                        if (lai == null) continue;
+                        ApplicationInfo ai = lai.getApplicationInfo();
+                        String pkg = ai != null ? ai.packageName
+                                : (lai.getComponentName() != null ? lai.getComponentName().getPackageName() : null);
+                        if (pkg == null || pkg.isEmpty() || "com.miui.fliphome".equals(pkg)) continue;
+                        String target = ModuleConfig.formatAppTarget(pkg, uid);
+                        if (!seen.add(target)) continue;
+                        CharSequence rawLbl = lai.getLabel();
+                        String label = (rawLbl != null && rawLbl.length() > 0) ? rawLbl.toString() : pkg;
+                        entries.add(new AppEntry(label, pkg, isSystemApp(ai),
+                                pinnedSet.contains(target), "", lai, uid, false));
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
         }
         entries.sort(Comparator
                 .comparing((AppEntry a) -> {
-                    int idx = pinnedOrder.indexOf(a.packageName);
+                    int idx = pinnedOrder.indexOf(a.targetKey);
                     return idx >= 0 ? idx : Integer.MAX_VALUE;
                 })
                 .thenComparing(a -> a.systemApp)
-                .thenComparing(a -> a.label, String.CASE_INSENSITIVE_ORDER));
+                .thenComparing(a -> a.label, String.CASE_INSENSITIVE_ORDER)
+                .thenComparingInt(a -> a.userId));
         return entries;
+    }
+
+    private static List<AppEntry> loadLaunchableAppsForWidget(PackageManager pm, List<String> pinnedOrder) {
+        return loadLaunchableAppsForWidget(pm, null, pinnedOrder, false);
     }
 
     private void showPinnedWidgetAppsPickerDialog() {
         if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
         final List<String> selectedOrder = new ArrayList<>(currentPinnedPackages());
+        final int[] focusedSlot = {selectedOrder.isEmpty() ? -1 : 0};
+        final Set<String> uninstalledTargets = new LinkedHashSet<>();
 
         boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
         int safeHeight = currentSafeWindowFrame().safeRect().height();
         boolean compactHeight = safeHeight < dp(420);
         boolean ultraCompactHeight = safeHeight < dp(320);
@@ -2928,7 +3842,7 @@ public final class MainActivity extends Activity {
             handle.setBackground(rounded(palette.outlineVariant, 2f));
             LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(36), dp(4));
             handleLp.gravity = Gravity.CENTER_HORIZONTAL;
-            handleLp.bottomMargin = dp(14);
+            handleLp.bottomMargin = dp(12);
             sheet.addView(handle, handleLp);
         }
 
@@ -2951,27 +3865,52 @@ public final class MainActivity extends Activity {
             sheetSub.setEllipsize(TextUtils.TruncateAt.END);
             sheetSub.setPadding(0, dp(3), 0, dp(6));
         } else {
-            sheetSub.setPadding(0, dp(4), 0, dp(10));
+            sheetSub.setPadding(0, dp(4), 0, dp(8));
         }
         sheet.addView(sheetSub);
 
-        // Live 4-Slot Preview Strip (tapping a filled slot removes it)
+        final Map<String, AppEntry> entryByTarget = new HashMap<>();
+        final List<AppEntry> allApps = new ArrayList<>();
+        final Runnable[] refreshSlotsAndListRef = new Runnable[1];
+        final Runnable[] refilterRef = new Runnable[1];
+
+        // 1-tap prune banner for uninstalled pinned apps
+        final PruneBannerHolder[] pruneBannerRef = new PruneBannerHolder[1];
+        pruneBannerRef[0] = createUninstalledPruneBanner(compact, ultraCompactHeight, () -> {
+            int removed = 0;
+            for (String missing : new ArrayList<>(uninstalledTargets)) {
+                if (selectedOrder.remove(missing)) removed++;
+                AppEntry e = entryByTarget.remove(missing);
+                if (e != null) allApps.remove(e);
+            }
+            uninstalledTargets.clear();
+            pruneBannerRef[0].update(this, 0);
+            if (focusedSlot[0] >= selectedOrder.size()) {
+                focusedSlot[0] = selectedOrder.size() - 1;
+            }
+            if (refilterRef[0] != null) refilterRef[0].run();
+            if (removed > 0) show(getString(R.string.msg_uninstalled_pruned, removed));
+        });
+        LinearLayout.LayoutParams pruneLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pruneLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
+        sheet.addView(pruneBannerRef[0].container(), pruneLp);
+
+        // Live 4-Slot Preview Strip (tap a filled slot to select for reorder/remove)
         LinearLayout slotsBar = new LinearLayout(this);
         slotsBar.setOrientation(LinearLayout.HORIZONTAL);
         slotsBar.setGravity(Gravity.CENTER);
-        int slotsPad = dp(ultraCompactHeight ? 3 : 10);
+        int slotsPad = dp(ultraCompactHeight ? 3 : 8);
         slotsBar.setPadding(slotsPad, slotsPad, slotsPad, slotsPad);
         slotsBar.setBackground(rounded(palette.surfaceContainerHigh, ultraCompactHeight ? 14f : 20f));
         LinearLayout.LayoutParams slotsBarLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        slotsBarLp.bottomMargin = dp(ultraCompactHeight ? 3 : (compactHeight ? 6 : 10));
+        slotsBarLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
         sheet.addView(slotsBar, slotsBarLp);
 
         final ImageView[] slotIcons = new ImageView[ModuleConfig.MAX_PINNED_WIDGET_APPS];
         final TextView[] slotLabels = new TextView[ModuleConfig.MAX_PINNED_WIDGET_APPS];
         final LinearLayout[] slotCells = new LinearLayout[ModuleConfig.MAX_PINNED_WIDGET_APPS];
-        final Map<String, AppEntry> entryByPkg = new HashMap<>();
-        final Runnable[] refreshSlotsAndListRef = new Runnable[1];
 
         for (int i = 0; i < ModuleConfig.MAX_PINNED_WIDGET_APPS; i++) {
             final int slotIdx = i;
@@ -2981,10 +3920,12 @@ public final class MainActivity extends Activity {
             int cellPadV = dp(ultraCompactHeight ? 2 : 6);
             cell.setPadding(dp(4), cellPadV, dp(4), cellPadV);
             cell.setBackground(rounded(palette.surfaceContainer, ultraCompactHeight ? 10f : 14f));
+            cell.setClickable(true);
+            cell.setFocusable(true);
 
             ImageView iv = new ImageView(this);
             iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            int slotIconSize = dp(ultraCompactHeight ? 18 : 34);
+            int slotIconSize = dp(ultraCompactHeight ? 18 : 32);
             LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(slotIconSize, slotIconSize);
             if (ultraCompactHeight) ivLp.rightMargin = dp(4);
             cell.addView(iv, ivLp);
@@ -3001,9 +3942,7 @@ public final class MainActivity extends Activity {
 
             cell.setOnClickListener(v -> {
                 if (slotIdx < selectedOrder.size()) {
-                    String removedPkg = selectedOrder.remove(slotIdx);
-                    AppEntry e = entryByPkg.get(removedPkg);
-                    if (e != null) e.selected = false;
+                    focusedSlot[0] = slotIdx;
                     if (refreshSlotsAndListRef[0] != null) refreshSlotsAndListRef[0].run();
                 }
             });
@@ -3015,6 +3954,62 @@ public final class MainActivity extends Activity {
             slotLabels[i] = lbl;
             slotCells[i] = cell;
         }
+
+        // Slot Reorder Bar (↑ Up | ↓ Down | Remove)
+        LinearLayout reorderBar = new LinearLayout(this);
+        reorderBar.setOrientation(LinearLayout.HORIZONTAL);
+        reorderBar.setGravity(Gravity.CENTER_VERTICAL);
+        int reorderBtnH = dp(ultraCompactHeight ? 36 : 44);
+        TextView btnMoveUp = createDialogChipButton(getString(R.string.btn_slot_move_up), false);
+        btnMoveUp.setMinHeight(reorderBtnH);
+        btnMoveUp.setContentDescription(getString(R.string.a11y_slot_move_prev));
+        TextView btnMoveDown = createDialogChipButton(getString(R.string.btn_slot_move_down), false);
+        btnMoveDown.setMinHeight(reorderBtnH);
+        btnMoveDown.setContentDescription(getString(R.string.a11y_slot_move_next));
+        TextView btnRemoveSlot = createDialogChipButton(getString(R.string.btn_slot_remove), false);
+        btnRemoveSlot.setMinHeight(reorderBtnH);
+
+        LinearLayout.LayoutParams rBtn1Lp = new LinearLayout.LayoutParams(0, reorderBtnH, 1f);
+        rBtn1Lp.rightMargin = dp(6);
+        reorderBar.addView(btnMoveUp, rBtn1Lp);
+        LinearLayout.LayoutParams rBtn2Lp = new LinearLayout.LayoutParams(0, reorderBtnH, 1f);
+        rBtn2Lp.rightMargin = dp(6);
+        reorderBar.addView(btnMoveDown, rBtn2Lp);
+        reorderBar.addView(btnRemoveSlot, new LinearLayout.LayoutParams(0, reorderBtnH, 1f));
+
+        btnMoveUp.setOnClickListener(v -> {
+            int idx = focusedSlot[0];
+            if (idx > 0 && idx < selectedOrder.size()) {
+                Collections.swap(selectedOrder, idx, idx - 1);
+                focusedSlot[0] = idx - 1;
+                if (refreshSlotsAndListRef[0] != null) refreshSlotsAndListRef[0].run();
+            }
+        });
+        btnMoveDown.setOnClickListener(v -> {
+            int idx = focusedSlot[0];
+            if (idx >= 0 && idx < selectedOrder.size() - 1) {
+                Collections.swap(selectedOrder, idx, idx + 1);
+                focusedSlot[0] = idx + 1;
+                if (refreshSlotsAndListRef[0] != null) refreshSlotsAndListRef[0].run();
+            }
+        });
+        btnRemoveSlot.setOnClickListener(v -> {
+            int idx = focusedSlot[0];
+            if (idx >= 0 && idx < selectedOrder.size()) {
+                String removedTarget = selectedOrder.remove(idx);
+                AppEntry e = entryByTarget.get(removedTarget);
+                if (e != null) e.selected = false;
+                uninstalledTargets.remove(removedTarget);
+                pruneBannerRef[0].update(this, uninstalledTargets.size());
+                if (focusedSlot[0] >= selectedOrder.size()) focusedSlot[0] = selectedOrder.size() - 1;
+                if (refreshSlotsAndListRef[0] != null) refreshSlotsAndListRef[0].run();
+            }
+        });
+
+        LinearLayout.LayoutParams reorderBarLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        reorderBarLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
+        sheet.addView(reorderBar, reorderBarLp);
 
         // Search Bar
         LinearLayout searchBox = new LinearLayout(this);
@@ -3045,8 +4040,6 @@ public final class MainActivity extends Activity {
         final int[] activeFilter = {0}; // 0=user apps, 1=all apps, 2=pinned, 3=system apps
         int[] filterNames = {R.string.filter_third, R.string.filter_all, R.string.filter_pinned_only, R.string.filter_system};
         final List<TextView> chipViews = new ArrayList<>();
-        final List<AppEntry> allApps = new ArrayList<>();
-        final Runnable[] refilterRef = new Runnable[1];
 
         final List<AppEntry> adapterItems = new ArrayList<>();
         final BaseAdapter pinnedAdapter = new BaseAdapter() {
@@ -3060,11 +4053,11 @@ public final class MainActivity extends Activity {
                 if (convertView != null && convertView.getTag() instanceof AppRowHolder h) {
                     holder = h;
                 } else {
-                    holder = new AppRowHolder();
+                    holder = new AppRowHolder(true);
                 }
                 AppEntry app = adapterItems.get(position);
                 holder.bind(app, position, adapterItems.size(), false);
-                int orderIdx = selectedOrder.indexOf(app.packageName);
+                int orderIdx = selectedOrder.indexOf(app.targetKey);
                 if (orderIdx >= 0) {
                     holder.tag.setText(getString(R.string.tag_pinned_order, orderIdx + 1));
                     holder.tag.setVisibility(View.VISIBLE);
@@ -3100,7 +4093,12 @@ public final class MainActivity extends Activity {
         clearChip.setBackground(chipBackground(false, ultraCompactHeight));
         clearChip.setOnClickListener(v -> {
             selectedOrder.clear();
+            focusedSlot[0] = -1;
+            uninstalledTargets.clear();
+            allApps.removeIf(e -> e.uninstalled);
+            pruneBannerRef[0].update(this, 0);
             for (AppEntry e : allApps) e.selected = false;
+            if (refilterRef[0] != null) refilterRef[0].run();
             if (refreshSlotsAndListRef[0] != null) refreshSlotsAndListRef[0].run();
         });
         chipRow.addView(clearChip);
@@ -3131,31 +4129,38 @@ public final class MainActivity extends Activity {
 
         refreshSlotsAndListRef[0] = () -> {
             float slotRadius = ultraCompactHeight ? 10f : 14f;
-            PackageManager pm = getPackageManager();
+            if (selectedOrder.isEmpty()) {
+                focusedSlot[0] = -1;
+            } else if (focusedSlot[0] < 0 || focusedSlot[0] >= selectedOrder.size()) {
+                focusedSlot[0] = 0;
+            }
             for (int i = 0; i < ModuleConfig.MAX_PINNED_WIDGET_APPS; i++) {
                 if (i < selectedOrder.size()) {
-                    String pkg = selectedOrder.get(i);
-                    AppEntry entry = entryByPkg.get(pkg);
-                    String label = entry != null ? entry.label : pkg;
-                    if (entry == null) {
-                        try {
-                            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
-                            CharSequence cs = pm.getApplicationLabel(ai);
-                            if (cs != null && cs.length() > 0) label = cs.toString();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    slotLabels[i].setText((i + 1) + ". " + label);
-                    slotLabels[i].setTextColor(palette.onSurface);
-                    slotCells[i].setBackground(rounded(palette.secondaryContainer, slotRadius));
+                    String target = selectedOrder.get(i);
+                    AppEntry entry = entryByTarget.get(target);
+                    boolean isMissing = uninstalledTargets.contains(target);
+                    boolean isFocused = (i == focusedSlot[0]);
+                    String baseLabel = entry != null
+                            ? (entry.userId > 0 ? getString(R.string.dual_app_name_fmt, entry.label) : entry.label)
+                            : formatAppTargetLabel(target);
+                    slotLabels[i].setText(getString(R.string.slot_numbered_fmt, i + 1, baseLabel));
+                    int fill = isMissing
+                            ? palette.errorContainer
+                            : (isFocused ? palette.primaryContainer : palette.secondaryContainer);
+                    int fg = isMissing
+                            ? palette.onErrorContainer
+                            : (isFocused ? palette.onPrimaryContainer : palette.onSurface);
+                    int strokeW = isFocused ? dp(2) : 0;
+                    int strokeC = isMissing ? palette.onErrorContainer : palette.primary;
+                    slotLabels[i].setTextColor(fg);
+                    slotCells[i].setBackground(createShape(fill, slotRadius, slotRadius, slotRadius, slotRadius, strokeW, strokeC));
                     if (entry != null) {
                         bindIcon(entry, slotIcons[i]);
+                    } else if (!isMissing) {
+                        bindTargetIcon(target, slotIcons[i]);
                     } else {
-                        try {
-                            slotIcons[i].setImageDrawable(pm.getApplicationIcon(pkg));
-                        } catch (Throwable ignored) {
-                            slotIcons[i].setImageDrawable(null);
-                        }
+                        slotIcons[i].setTag(null);
+                        slotIcons[i].setImageDrawable(null);
                     }
                 } else {
                     slotIcons[i].setTag(null);
@@ -3165,15 +4170,33 @@ public final class MainActivity extends Activity {
                     slotCells[i].setBackground(rounded(palette.surfaceContainer, slotRadius));
                 }
             }
+            boolean hasSelection = !selectedOrder.isEmpty() && focusedSlot[0] >= 0;
+            reorderBar.setVisibility(hasSelection ? View.VISIBLE : View.GONE);
+            if (hasSelection) {
+                boolean canUp = focusedSlot[0] > 0;
+                boolean canDown = focusedSlot[0] < selectedOrder.size() - 1;
+                btnMoveUp.setEnabled(canUp);
+                btnMoveUp.setAlpha(canUp ? 1f : 0.4f);
+                btnMoveDown.setEnabled(canDown);
+                btnMoveDown.setAlpha(canDown ? 1f : 0.4f);
+                btnRemoveSlot.setEnabled(true);
+                btnRemoveSlot.setAlpha(1f);
+            }
             pinnedAdapter.notifyDataSetChanged();
         };
 
         listView.setOnItemClickListener((parent, view, position, id) -> {
             if (position < 0 || position >= adapterItems.size()) return;
             AppEntry app = adapterItems.get(position);
-            if (selectedOrder.contains(app.packageName)) {
-                selectedOrder.remove(app.packageName);
+            if (selectedOrder.contains(app.targetKey)) {
+                int removedIdx = selectedOrder.indexOf(app.targetKey);
+                selectedOrder.remove(app.targetKey);
                 app.selected = false;
+                if (uninstalledTargets.remove(app.targetKey)) {
+                    pruneBannerRef[0].update(this, uninstalledTargets.size());
+                }
+                if (focusedSlot[0] >= selectedOrder.size()) focusedSlot[0] = selectedOrder.size() - 1;
+                else if (removedIdx >= 0 && removedIdx < focusedSlot[0]) focusedSlot[0]--;
             } else {
                 if (selectedOrder.size() >= ModuleConfig.MAX_PINNED_WIDGET_APPS) {
                     show(getString(R.string.msg_pinned_limit));
@@ -3182,8 +4205,9 @@ public final class MainActivity extends Activity {
                     }
                     return;
                 }
-                selectedOrder.add(app.packageName);
+                selectedOrder.add(app.targetKey);
                 app.selected = true;
+                focusedSlot[0] = selectedOrder.size() - 1;
             }
             refreshSlotsAndListRef[0].run();
         });
@@ -3199,12 +4223,13 @@ public final class MainActivity extends Activity {
             String query = searchInput.getText() == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
             adapterItems.clear();
             for (AppEntry app : allApps) {
-                if (activeFilter[0] == 0 && app.systemApp && !selectedOrder.contains(app.packageName)) continue;
-                if (activeFilter[0] == 2 && !selectedOrder.contains(app.packageName)) continue;
+                boolean isPinned = selectedOrder.contains(app.targetKey);
+                if (activeFilter[0] == 0 && app.systemApp && !isPinned) continue;
+                if (activeFilter[0] == 2 && !isPinned) continue;
                 if (activeFilter[0] == 3 && !app.systemApp) continue;
                 if (!query.isEmpty()
                         && !app.labelLower.contains(query)
-                        && !app.packageName.toLowerCase(Locale.ROOT).contains(query)) {
+                        && !app.targetKey.toLowerCase(Locale.ROOT).contains(query)) {
                     continue;
                 }
                 adapterItems.add(app);
@@ -3232,7 +4257,7 @@ public final class MainActivity extends Activity {
         int cancelPadH = compact ? dp(8) : dp(20);
         int savePadH = compact ? dp(10) : dp(22);
         int btnPadV = dp(ultraCompactHeight ? 6 : 10);
-        int btnMinH = dp(ultraCompactHeight ? 36 : (compactHeight ? 42 : 48));
+        int btnMinH = dp(ultraCompactHeight ? 36 : 44);
 
         TextView cancelBtn = createText(getString(R.string.btn_cancel), btnSp, palette.primary, FONT_MEDIUM);
         cancelBtn.setGravity(Gravity.CENTER);
@@ -3253,8 +4278,9 @@ public final class MainActivity extends Activity {
         saveBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 24f));
         saveBtn.setEnabled(false);
         saveBtn.setAlpha(0.45f);
-        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams saveLp = narrowFooter
+                ? new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         saveLp.leftMargin = compact ? dp(4) : dp(8);
         saveBtn.setOnClickListener(v -> {
             dialog.dismiss();
@@ -3289,33 +4315,2460 @@ public final class MainActivity extends Activity {
         configureCoverSafePickerWindow(dialog, true);
 
         PackageManager pm = getPackageManager();
+        LauncherApps launcherApps = getSystemService(LauncherApps.class);
+        List<String> orderSnapshot = new ArrayList<>(selectedOrder);
         IO.execute(() -> {
             List<AppEntry> loaded;
             try {
-                loaded = loadLaunchableAppsForWidget(pm, selectedOrder);
+                loaded = loadLaunchableAppsForWidget(pm, launcherApps, orderSnapshot, true);
+                for (AppEntry e : loaded) {
+                    if (e.userId == 0) appLabelCache.put(e.packageName, e.label);
+                }
             } catch (RuntimeException e) {
                 Log.w(TAG, "failed to load widget apps", e);
                 loaded = List.of();
             }
-            final List<AppEntry> result = loaded;
+            Set<String> loadedTargets = new HashSet<>();
+            for (AppEntry e : loaded) loadedTargets.add(e.targetKey);
+            List<String> missingTargets = new ArrayList<>();
+            List<AppEntry> combined = new ArrayList<>(loaded);
+            for (String target : orderSnapshot) {
+                if (loadedTargets.contains(target)) continue;
+                if (!isAppTargetInstalled(pm, launcherApps, target)) {
+                    missingTargets.add(target);
+                    String pkg = ModuleConfig.extractAppTargetPackage(target);
+                    int uid = ModuleConfig.extractAppTargetUserId(target);
+                    AppEntry synth = new AppEntry(pkg, pkg, false, true, "", null, uid, true);
+                    combined.add(0, synth);
+                }
+            }
             mainHandler.post(() -> {
                 if (isDestroyed() || !dialog.isShowing()) return;
-                if (result.isEmpty()) {
+                if (combined.isEmpty()) {
                     dialog.dismiss();
                     show(getString(R.string.msg_no_apps));
                     return;
                 }
-                allApps.addAll(result);
-                for (AppEntry e : result) {
-                    entryByPkg.put(e.packageName, e);
-                    e.selected = selectedOrder.contains(e.packageName);
+                allApps.addAll(combined);
+                uninstalledTargets.clear();
+                uninstalledTargets.addAll(missingTargets);
+                for (AppEntry e : combined) {
+                    entryByTarget.put(e.targetKey, e);
+                    e.selected = selectedOrder.contains(e.targetKey);
                 }
+                pruneBannerRef[0].update(this, uninstalledTargets.size());
                 emptyView.setText(R.string.picker_empty);
                 saveBtn.setEnabled(true);
                 saveBtn.setAlpha(1f);
                 refilterRef[0].run();
             });
         });
+    }
+
+    // ==================== 2x2 Quick Actions Widget Configurator (4 Slots) ====================
+
+    private void broadcastQuickWidgetSync(boolean enabled, String rawSlots, boolean explicitToggle) {
+        try {
+            Intent intent = new Intent(QuickActionsWidget.ACTION_QUICK_WIDGET_SYNC)
+                    .setPackage(CoverGeometry.FLIPHOME)
+                    .putExtra(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, enabled)
+                    .putExtra(ModuleConfig.KEY_QUICK_WIDGET_SLOTS,
+                            rawSlots != null ? rawSlots : ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS)
+                    .putExtra(QuickActionsWidget.EXTRA_EXPLICIT_TOGGLE, explicitToggle);
+            BroadcastOptions options = BroadcastOptions.makeBasic();
+            options.setShareIdentityEnabled(true);
+            sendBroadcast(intent, null, options.toBundle());
+        } catch (RuntimeException e) {
+            Log.w(TAG, "quick widget sync broadcast failed", e);
+        }
+    }
+
+    private List<String> currentQuickActionSlots() {
+        SharedPreferences p = prefs;
+        if (p == null) return ModuleConfig.parseQuickActionSlots(ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS);
+        try {
+            return ModuleConfig.parseQuickActionSlots(
+                    p.getString(ModuleConfig.KEY_QUICK_WIDGET_SLOTS, ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS));
+        } catch (RuntimeException e) {
+            return ModuleConfig.parseQuickActionSlots(ModuleConfig.DEFAULT_QUICK_WIDGET_SLOTS);
+        }
+    }
+
+    private void addQuickWidgetSummaryText(TextView tv) {
+        if (tv != null) quickWidgetSummaryTexts.add(tv);
+    }
+
+    private void refreshQuickWidgetSummaryTexts() {
+        String text = quickWidgetSlotsSummary();
+        for (TextView tv : quickWidgetSummaryTexts) {
+            if (tv != null) tv.setText(text);
+        }
+    }
+
+    private String quickActionLabel(String token) {
+        if (token == null) return "";
+        return switch (token) {
+            case ModuleConfig.QA_HOME -> getString(R.string.qa_action_home);
+            case ModuleConfig.QA_RECENTS -> getString(R.string.qa_action_recents);
+            case ModuleConfig.QA_LOCK -> getString(R.string.qa_action_lock);
+            case ModuleConfig.QA_BACK -> getString(R.string.qa_action_back);
+            case ModuleConfig.QA_NOTIFICATIONS -> getString(R.string.qa_action_notifications);
+            case ModuleConfig.QA_CONTROL_CENTER -> getString(R.string.qa_action_control_center);
+            case ModuleConfig.QA_TORCH -> getString(R.string.qa_action_torch);
+            case ModuleConfig.QA_SCREENSHOT -> getString(R.string.qa_action_screenshot);
+            case ModuleConfig.QA_RINGER -> getString(R.string.qa_action_ringer);
+            case ModuleConfig.QA_ROTATION_LOCK -> getString(R.string.qa_action_rotation_lock);
+            case ModuleConfig.QA_MEDIA_PLAY_PAUSE -> getString(R.string.qa_action_media_play_pause);
+            case ModuleConfig.QA_BRIGHTNESS -> getString(R.string.qa_action_brightness);
+            case ModuleConfig.QA_SCAN -> getString(R.string.qa_action_scan);
+            default -> {
+                if (token.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                    String target = token.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+                    yield formatAppTargetLabel(target);
+                }
+                yield token;
+            }
+        };
+    }
+
+    private String quickWidgetSlotsSummary() {
+        List<String> slots = currentQuickActionSlots();
+        return getString(
+                R.string.row_quick_widget_slots_summary,
+                quickActionLabel(slots.get(0)),
+                quickActionLabel(slots.get(1)),
+                quickActionLabel(slots.get(2)),
+                quickActionLabel(slots.get(3)));
+    }
+
+    private record QuickOptionSpec(String token, int titleRes, int descRes) {}
+
+    private final class QuickActionPreviewIcon extends View {
+        private String token = ModuleConfig.QA_HOME;
+        private String boundAppTarget;
+        private int iconColor;
+        private Drawable appDrawable;
+
+        QuickActionPreviewIcon(Context context, int initialColor) {
+            super(context);
+            this.iconColor = initialColor;
+            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        void bind(String actionToken, int fgColor) {
+            this.token = actionToken != null ? actionToken : ModuleConfig.QA_HOME;
+            this.iconColor = fgColor;
+            if (this.token.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                String target = this.token.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+                this.boundAppTarget = target;
+                Drawable cached = iconCache.get(target);
+                if (cached != null) {
+                    this.appDrawable = iconCopy(cached);
+                } else {
+                    this.appDrawable = null;
+                    String pkg = ModuleConfig.extractAppTargetPackage(target);
+                    int userId = ModuleConfig.extractAppTargetUserId(target);
+                    PackageManager pm = getPackageManager();
+                    LauncherApps launcherApps = getSystemService(LauncherApps.class);
+                    WeakReference<QuickActionPreviewIcon> selfRef = new WeakReference<>(this);
+                    IO.execute(() -> {
+                        Drawable loaded = loadAppIconSync(pm, launcherApps, pkg, userId);
+                        mainHandler.post(() -> {
+                            if (loaded == null || isDestroyed()) return;
+                            iconCache.put(target, loaded);
+                            QuickActionPreviewIcon self = selfRef.get();
+                            if (self != null && target.equals(self.boundAppTarget)) {
+                                self.appDrawable = iconCopy(loaded);
+                                self.invalidate();
+                            }
+                        });
+                    });
+                }
+            } else {
+                this.boundAppTarget = null;
+                this.appDrawable = null;
+            }
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float w = getWidth();
+            float h = getHeight();
+            if (w <= 0f || h <= 0f) return;
+            if (appDrawable != null) {
+                int pad = Math.round(Math.min(w, h) * 0.08f);
+                appDrawable.setBounds(pad, pad, Math.round(w) - pad, Math.round(h) - pad);
+                appDrawable.draw(canvas);
+                return;
+            }
+            QuickActionsWidget.drawActionGlyph(
+                    canvas,
+                    token,
+                    w / 2f,
+                    h / 2f,
+                    Math.min(w, h) * 0.88f,
+                    iconColor,
+                    false,
+                    android.media.AudioManager.RINGER_MODE_NORMAL);
+        }
+    }
+
+    private void showQuickWidgetSlotsDialog() {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        final List<String> workingSlots = new ArrayList<>(currentQuickActionSlots());
+        final int[] activeSlot = {0};
+        final Set<String> uninstalledAppTargets = new LinkedHashSet<>();
+
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean compactHeight = safeHeight < dp(440);
+        boolean ultraCompactHeight = safeHeight < dp(330);
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        int sheetPadH = compact ? dp(10) : dp(20);
+        int sheetPadTop = ultraCompactHeight ? dp(6) : (compactHeight ? dp(10) : dp(16));
+        int sheetPadBot = ultraCompactHeight ? dp(6) : (compactHeight ? dp(12) : dp(18));
+        sheet.setPadding(sheetPadH, sheetPadTop, sheetPadH, sheetPadBot);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
+
+        if (!compactHeight) {
+            View handle = new View(this);
+            handle.setBackground(rounded(palette.outlineVariant, 2f));
+            LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(36), dp(4));
+            handleLp.gravity = Gravity.CENTER_HORIZONTAL;
+            handleLp.bottomMargin = dp(12);
+            sheet.addView(handle, handleLp);
+        }
+
+        float titleSp = ultraCompactHeight ? 15f : (compact ? 18f : 20f);
+        TextView sheetTitle = createText(getString(R.string.picker_quick_title), titleSp, palette.onSurface, FONT_BOLD);
+        sheetTitle.setAccessibilityHeading(true);
+        sheet.addView(sheetTitle);
+
+        TextView sheetSub = createText(
+                getString(R.string.picker_quick_sub),
+                ultraCompactHeight ? 10.5f : 12.5f,
+                palette.onSurfaceVariant,
+                FONT_REGULAR);
+        sheetSub.setPadding(0, dp(ultraCompactHeight ? 2 : 4), 0, dp(ultraCompactHeight ? 4 : 8));
+        sheet.addView(sheetSub);
+
+        final Runnable[] refreshUiRef = new Runnable[1];
+        final PruneBannerHolder[] pruneBannerRef = new PruneBannerHolder[1];
+        pruneBannerRef[0] = createUninstalledPruneBanner(compact, ultraCompactHeight, () -> {
+            int cleaned = 0;
+            for (int i = 0; i < workingSlots.size(); i++) {
+                String tok = workingSlots.get(i);
+                if (tok != null && tok.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                    String target = tok.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+                    if (uninstalledAppTargets.contains(target)) {
+                        workingSlots.set(i, ModuleConfig.DEFAULT_QUICK_WIDGET_SLOT_LIST.get(i));
+                        cleaned++;
+                    }
+                }
+            }
+            uninstalledAppTargets.clear();
+            pruneBannerRef[0].update(this, 0);
+            if (refreshUiRef[0] != null) refreshUiRef[0].run();
+            if (cleaned > 0) show(getString(R.string.msg_uninstalled_pruned, cleaned));
+        });
+        LinearLayout.LayoutParams pruneLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pruneLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
+        sheet.addView(pruneBannerRef[0].container(), pruneLp);
+
+        // Interactive 2x2 Visual Preview Card
+        LinearLayout gridCard = new LinearLayout(this);
+        gridCard.setOrientation(LinearLayout.VERTICAL);
+        int gridPad = dp(ultraCompactHeight ? 6 : 10);
+        gridCard.setPadding(gridPad, gridPad, gridPad, gridPad);
+        gridCard.setBackground(rounded(palette.surfaceContainerHigh, ultraCompactHeight ? 16f : 22f));
+        LinearLayout.LayoutParams gridCardLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        gridCardLp.bottomMargin = dp(ultraCompactHeight ? 4 : 8);
+        sheet.addView(gridCard, gridCardLp);
+
+        final int[] posNameRes = {
+                R.string.picker_quick_slot_pos_1,
+                R.string.picker_quick_slot_pos_2,
+                R.string.picker_quick_slot_pos_3,
+                R.string.picker_quick_slot_pos_4
+        };
+        final LinearLayout[] slotCells = new LinearLayout[ModuleConfig.QUICK_WIDGET_SLOT_COUNT];
+        final QuickActionPreviewIcon[] slotIcons = new QuickActionPreviewIcon[ModuleConfig.QUICK_WIDGET_SLOT_COUNT];
+        final TextView[] slotTitles = new TextView[ModuleConfig.QUICK_WIDGET_SLOT_COUNT];
+
+        for (int rowIdx = 0; rowIdx < 2; rowIdx++) {
+            LinearLayout rowLayout = new LinearLayout(this);
+            rowLayout.setOrientation(LinearLayout.HORIZONTAL);
+            for (int colIdx = 0; colIdx < 2; colIdx++) {
+                final int slotIdx = rowIdx * 2 + colIdx;
+                LinearLayout cell = new LinearLayout(this);
+                cell.setOrientation(LinearLayout.HORIZONTAL);
+                cell.setGravity(Gravity.CENTER_VERTICAL);
+                int cellPadH = dp(ultraCompactHeight ? 8 : 12);
+                int cellPadV = dp(ultraCompactHeight ? 6 : (compactHeight ? 8 : 11));
+                cell.setPadding(cellPadH, cellPadV, cellPadH, cellPadV);
+                cell.setClickable(true);
+                cell.setFocusable(true);
+
+                int iconDp = dp(ultraCompactHeight ? 20 : 26);
+                QuickActionPreviewIcon iconView = new QuickActionPreviewIcon(this, palette.onSurface);
+                LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(iconDp, iconDp);
+                iconLp.rightMargin = dp(ultraCompactHeight ? 6 : 10);
+                cell.addView(iconView, iconLp);
+
+                TextView lbl = createText("", ultraCompactHeight ? 11.5f : 13f, palette.onSurface, FONT_MEDIUM);
+                lbl.setSingleLine(true);
+                lbl.setEllipsize(TextUtils.TruncateAt.END);
+                cell.addView(lbl, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                cell.setOnClickListener(v -> {
+                    activeSlot[0] = slotIdx;
+                    if (refreshUiRef[0] != null) refreshUiRef[0].run();
+                });
+
+                LinearLayout.LayoutParams cellLp = new LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                if (colIdx == 0) cellLp.rightMargin = dp(ultraCompactHeight ? 5 : 8);
+                rowLayout.addView(cell, cellLp);
+
+                slotCells[slotIdx] = cell;
+                slotIcons[slotIdx] = iconView;
+                slotTitles[slotIdx] = lbl;
+            }
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            if (rowIdx == 0) rowLp.bottomMargin = dp(ultraCompactHeight ? 5 : 8);
+            gridCard.addView(rowLayout, rowLp);
+        }
+
+        // Editing slot banner + ↑ / ↓ slot reorder buttons
+        LinearLayout editingRow = new LinearLayout(this);
+        editingRow.setOrientation(LinearLayout.HORIZONTAL);
+        editingRow.setGravity(Gravity.CENTER_VERTICAL);
+        editingRow.setPadding(dp(2), 0, dp(2), dp(ultraCompactHeight ? 3 : 6));
+
+        TextView editingBanner = createText("", ultraCompactHeight ? 11f : 12f, palette.primary, FONT_MEDIUM);
+        editingBanner.setSingleLine(true);
+        editingBanner.setEllipsize(TextUtils.TruncateAt.END);
+        editingRow.addView(editingBanner, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        int slotReorderH = dp(ultraCompactHeight ? 36 : 44);
+        TextView btnSlotUp = createDialogChipButton("↑", false);
+        btnSlotUp.setMinWidth(dp(44));
+        btnSlotUp.setMinHeight(slotReorderH);
+        btnSlotUp.setContentDescription(getString(R.string.a11y_slot_move_prev));
+        TextView btnSlotDown = createDialogChipButton("↓", false);
+        btnSlotDown.setMinWidth(dp(44));
+        btnSlotDown.setMinHeight(slotReorderH);
+        btnSlotDown.setContentDescription(getString(R.string.a11y_slot_move_next));
+
+        LinearLayout.LayoutParams upLp = new LinearLayout.LayoutParams(dp(44), slotReorderH);
+        upLp.leftMargin = dp(6);
+        editingRow.addView(btnSlotUp, upLp);
+        LinearLayout.LayoutParams downLp = new LinearLayout.LayoutParams(dp(44), slotReorderH);
+        downLp.leftMargin = dp(4);
+        editingRow.addView(btnSlotDown, downLp);
+
+        btnSlotUp.setOnClickListener(v -> {
+            int idx = activeSlot[0];
+            if (idx > 0) {
+                Collections.swap(workingSlots, idx, idx - 1);
+                activeSlot[0] = idx - 1;
+                if (refreshUiRef[0] != null) refreshUiRef[0].run();
+            }
+        });
+        btnSlotDown.setOnClickListener(v -> {
+            int idx = activeSlot[0];
+            if (idx < workingSlots.size() - 1) {
+                Collections.swap(workingSlots, idx, idx + 1);
+                activeSlot[0] = idx + 1;
+                if (refreshUiRef[0] != null) refreshUiRef[0].run();
+            }
+        });
+        sheet.addView(editingRow);
+
+        // Scrollable Grouped Action Options
+        ScrollView optionsScroll = new ScrollView(this);
+        optionsScroll.setVerticalScrollBarEnabled(false);
+        LinearLayout optionsCol = new LinearLayout(this);
+        optionsCol.setOrientation(LinearLayout.VERTICAL);
+        optionsScroll.addView(optionsCol);
+        sheet.addView(optionsScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        List<QuickOptionSpec> navSpecs = List.of(
+                new QuickOptionSpec(ModuleConfig.QA_HOME, R.string.qa_action_home, R.string.qa_action_home_desc),
+                new QuickOptionSpec(ModuleConfig.QA_RECENTS, R.string.qa_action_recents, R.string.qa_action_recents_desc),
+                new QuickOptionSpec(ModuleConfig.QA_LOCK, R.string.qa_action_lock, R.string.qa_action_lock_desc),
+                new QuickOptionSpec(ModuleConfig.QA_BACK, R.string.qa_action_back, R.string.qa_action_back_desc));
+        List<QuickOptionSpec> ctrlSpecs = List.of(
+                new QuickOptionSpec(ModuleConfig.QA_NOTIFICATIONS, R.string.qa_action_notifications, R.string.qa_action_notifications_desc),
+                new QuickOptionSpec(ModuleConfig.QA_CONTROL_CENTER, R.string.qa_action_control_center, R.string.qa_action_control_center_desc),
+                new QuickOptionSpec(ModuleConfig.QA_TORCH, R.string.qa_action_torch, R.string.qa_action_torch_desc),
+                new QuickOptionSpec(ModuleConfig.QA_SCREENSHOT, R.string.qa_action_screenshot, R.string.qa_action_screenshot_desc),
+                new QuickOptionSpec(ModuleConfig.QA_RINGER, R.string.qa_action_ringer, R.string.qa_action_ringer_desc),
+                new QuickOptionSpec(ModuleConfig.QA_ROTATION_LOCK, R.string.qa_action_rotation_lock, R.string.qa_action_rotation_lock_desc),
+                new QuickOptionSpec(ModuleConfig.QA_MEDIA_PLAY_PAUSE, R.string.qa_action_media_play_pause, R.string.qa_action_media_play_pause_desc),
+                new QuickOptionSpec(ModuleConfig.QA_BRIGHTNESS, R.string.qa_action_brightness, R.string.qa_action_brightness_desc),
+                new QuickOptionSpec(ModuleConfig.QA_SCAN, R.string.qa_action_scan, R.string.qa_action_scan_desc),
+                new QuickOptionSpec(ModuleConfig.QA_APP_PREFIX, R.string.qa_action_app, R.string.qa_action_app_desc));
+
+        record OptionRowViews(String token, LinearLayout row, QuickActionPreviewIcon icon,
+                              TextView title, TextView sub, TextView badge) {}
+        final List<OptionRowViews> optionRows = new ArrayList<>();
+
+        java.util.function.BiConsumer<Integer, List<QuickOptionSpec>> appendSection = (headerRes, specs) -> {
+            TextView secHeader = createText(getString(headerRes), 12f, palette.primary, FONT_MEDIUM);
+            secHeader.setPadding(dp(8), dp(6), dp(8), dp(4));
+            optionsCol.addView(secHeader);
+
+            int count = specs.size();
+            for (int i = 0; i < count; i++) {
+                QuickOptionSpec spec = specs.get(i);
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                int padH = compact ? dp(10) : dp(14);
+                int padV = dp(ultraCompactHeight ? 7 : 10);
+                row.setPadding(padH, padV, padH, padV);
+                float rTop = (i == 0) ? 18f : 5f;
+                float rBot = (i == count - 1) ? 18f : 5f;
+                row.setBackground(ripple(palette.surfaceContainer, palette.rippleColor, rTop, rTop, rBot, rBot, 0, 0));
+                row.setClickable(true);
+                row.setFocusable(true);
+
+                FrameLayout iconBadge = new FrameLayout(this);
+                iconBadge.setBackground(rounded(palette.secondaryContainer, 12f));
+                QuickActionPreviewIcon icon = new QuickActionPreviewIcon(this, palette.onSecondaryContainer);
+                String glyphToken = ModuleConfig.QA_APP_PREFIX.equals(spec.token) ? "app_placeholder" : spec.token;
+                icon.bind(glyphToken, palette.onSecondaryContainer);
+                iconBadge.addView(icon, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+                LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(dp(34), dp(34));
+                badgeLp.rightMargin = dp(10);
+                row.addView(iconBadge, badgeLp);
+
+                LinearLayout textCol = new LinearLayout(this);
+                textCol.setOrientation(LinearLayout.VERTICAL);
+                TextView tView = createText(getString(spec.titleRes), compact ? 13.5f : 14.5f, palette.onSurface, FONT_MEDIUM);
+                textCol.addView(tView);
+                TextView sView = createText(getString(spec.descRes), 11.5f, palette.onSurfaceVariant, FONT_REGULAR);
+                sView.setPadding(0, dp(2), 0, 0);
+                textCol.addView(sView);
+                row.addView(textCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                TextView selTag = createText(getString(R.string.tag_enabled), 10.5f, palette.onPrimaryContainer, FONT_MEDIUM);
+                selTag.setPadding(dp(8), dp(3), dp(8), dp(3));
+                selTag.setBackground(rounded(palette.primaryContainer, 10f));
+                selTag.setVisibility(View.GONE);
+                LinearLayout.LayoutParams selLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                selLp.leftMargin = dp(6);
+                row.addView(selTag, selLp);
+
+                row.setOnClickListener(v -> {
+                    int targetSlot = activeSlot[0];
+                    if (ModuleConfig.QA_APP_PREFIX.equals(spec.token)) {
+                        showSingleAppPickerForQuickSlot(
+                                getString(R.string.picker_quick_app_title, targetSlot + 1),
+                                chosenTarget -> {
+                                    workingSlots.set(targetSlot, ModuleConfig.QA_APP_PREFIX + chosenTarget);
+                                    if (refreshUiRef[0] != null) refreshUiRef[0].run();
+                                });
+                    } else {
+                        workingSlots.set(targetSlot, spec.token);
+                        if (refreshUiRef[0] != null) refreshUiRef[0].run();
+                    }
+                });
+
+                LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                rowLp.bottomMargin = (i == count - 1) ? dp(8) : dp(2);
+                optionsCol.addView(row, rowLp);
+                optionRows.add(new OptionRowViews(spec.token, row, icon, tView, sView, selTag));
+            }
+        };
+
+        appendSection.accept(R.string.qa_group_nav, navSpecs);
+        appendSection.accept(R.string.qa_group_ctrl, ctrlSpecs);
+
+        refreshUiRef[0] = () -> {
+            float cellR = ultraCompactHeight ? 12f : 16f;
+            int missingCount = 0;
+            for (int i = 0; i < ModuleConfig.QUICK_WIDGET_SLOT_COUNT; i++) {
+                boolean isSel = (i == activeSlot[0]);
+                String slotToken = workingSlots.get(i);
+                boolean isMissing = slotToken != null
+                        && slotToken.startsWith(ModuleConfig.QA_APP_PREFIX)
+                        && uninstalledAppTargets.contains(slotToken.substring(ModuleConfig.QA_APP_PREFIX.length()).trim());
+                if (isMissing) missingCount++;
+                int fill = isMissing
+                        ? palette.errorContainer
+                        : (isSel ? palette.primaryContainer : palette.surfaceContainer);
+                int strokeW = isSel ? dp(2) : dp(1);
+                int strokeC = isMissing ? palette.onErrorContainer : (isSel ? palette.primary : palette.outlineVariant);
+                int fg = isMissing ? palette.onErrorContainer : (isSel ? palette.onPrimaryContainer : palette.onSurface);
+                slotCells[i].setBackground(createShape(fill, cellR, cellR, cellR, cellR, strokeW, strokeC));
+                slotIcons[i].bind(slotToken, fg);
+                String lbl = quickActionLabel(slotToken);
+                if (isMissing) lbl = getString(R.string.tag_uninstalled) + " · " + lbl;
+                slotTitles[i].setText(getString(R.string.slot_numbered_fmt, i + 1, lbl));
+                slotTitles[i].setTextColor(fg);
+            }
+            pruneBannerRef[0].update(this, missingCount);
+            String posName = getString(posNameRes[activeSlot[0]]);
+            editingBanner.setText(getString(R.string.picker_quick_editing_slot, activeSlot[0] + 1, posName));
+            boolean canUp = activeSlot[0] > 0;
+            boolean canDown = activeSlot[0] < ModuleConfig.QUICK_WIDGET_SLOT_COUNT - 1;
+            btnSlotUp.setEnabled(canUp);
+            btnSlotUp.setAlpha(canUp ? 1f : 0.35f);
+            btnSlotDown.setEnabled(canDown);
+            btnSlotDown.setAlpha(canDown ? 1f : 0.35f);
+
+            String activeToken = workingSlots.get(activeSlot[0]);
+            for (OptionRowViews orv : optionRows) {
+                boolean match;
+                if (ModuleConfig.QA_APP_PREFIX.equals(orv.token)) {
+                    match = activeToken.startsWith(ModuleConfig.QA_APP_PREFIX);
+                    if (match) {
+                        orv.title.setText(getString(R.string.qa_action_app_fmt, quickActionLabel(activeToken)));
+                    } else {
+                        orv.title.setText(R.string.qa_action_app);
+                    }
+                } else {
+                    match = orv.token.equals(activeToken);
+                }
+                orv.badge.setVisibility(match ? View.VISIBLE : View.GONE);
+            }
+        };
+        refreshUiRef[0].run();
+
+        // Bottom Row: Defaults | Cancel | Save (responsive on 249dp narrow cover)
+        float btnSp = compact ? 12.5f : 14f;
+        int btnPadH = compact ? dp(10) : dp(18);
+        int btnPadV = dp(ultraCompactHeight ? 6 : 10);
+        int btnMinH = dp(ultraCompactHeight ? 36 : 44);
+
+        TextView resetBtn = createText(getString(R.string.btn_reset_default), btnSp, palette.onSurfaceVariant, FONT_MEDIUM);
+        resetBtn.setGravity(Gravity.CENTER);
+        resetBtn.setSingleLine(true);
+        resetBtn.setEllipsize(TextUtils.TruncateAt.END);
+        resetBtn.setPadding(btnPadH, btnPadV, btnPadH, btnPadV);
+        resetBtn.setMinHeight(btnMinH);
+        resetBtn.setBackground(pillRipple(palette.surfaceContainerHigh, palette.rippleColor, 22f));
+        resetBtn.setOnClickListener(v -> {
+            workingSlots.clear();
+            workingSlots.addAll(ModuleConfig.DEFAULT_QUICK_WIDGET_SLOT_LIST);
+            refreshUiRef[0].run();
+        });
+
+        TextView cancelBtn = createText(getString(R.string.btn_cancel), btnSp, palette.primary, FONT_MEDIUM);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setSingleLine(true);
+        cancelBtn.setEllipsize(TextUtils.TruncateAt.END);
+        cancelBtn.setPadding(btnPadH, btnPadV, btnPadH, btnPadV);
+        cancelBtn.setMinHeight(btnMinH);
+        cancelBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 22f));
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+
+        TextView saveBtn = createText(getString(R.string.btn_save_quick_slots), btnSp, palette.onPrimary, FONT_MEDIUM);
+        saveBtn.setGravity(Gravity.CENTER);
+        saveBtn.setSingleLine(true);
+        saveBtn.setEllipsize(TextUtils.TruncateAt.END);
+        saveBtn.setPadding(compact ? dp(14) : dp(22), btnPadV, compact ? dp(14) : dp(22), btnPadV);
+        saveBtn.setMinHeight(btnMinH);
+        saveBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 22f));
+        saveBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            try {
+                String serialized = ModuleConfig.serializeQuickActionSlots(workingSlots);
+                prefs.edit()
+                        .putString(ModuleConfig.KEY_QUICK_WIDGET_SLOTS, serialized)
+                        .putBoolean(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, true)
+                        .apply();
+                broadcastQuickWidgetSync(true, serialized, true);
+                syncSwitches(ModuleConfig.KEY_QUICK_WIDGET_ENABLED, true);
+                refreshQuickWidgetSummaryTexts();
+                if (coverPreview != null) coverPreview.invalidate();
+                show(getString(R.string.msg_quick_slots_saved, quickWidgetSlotsSummary()));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        });
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(ultraCompactHeight ? 4 : 8), 0, 0);
+            LinearLayout topBtnRow = new LinearLayout(this);
+            topBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams resetLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            resetLp.rightMargin = dp(6);
+            topBtnRow.addView(resetBtn, resetLp);
+            topBtnRow.addView(cancelBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            footerCol.addView(topBtnRow);
+            LinearLayout.LayoutParams saveFullLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveFullLp.topMargin = dp(6);
+            footerCol.addView(saveBtn, saveFullLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+            bottomRow.setPadding(0, dp(ultraCompactHeight ? 4 : (compactHeight ? 8 : 12)), 0, 0);
+            bottomRow.addView(resetBtn);
+            bottomRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            bottomRow.addView(cancelBtn);
+            LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveLp.leftMargin = dp(4);
+            bottomRow.addView(saveBtn, saveLp);
+            sheet.addView(bottomRow);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        configureCoverSafePickerWindow(dialog, true);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, true);
+
+        // Background check for uninstalled app slots & missing labels
+        PackageManager pm = getPackageManager();
+        LauncherApps launcherApps = getSystemService(LauncherApps.class);
+        List<String> slotSnapshot = new ArrayList<>(workingSlots);
+        IO.execute(() -> {
+            Set<String> missing = new LinkedHashSet<>();
+            boolean labelsAdded = false;
+            for (String tok : slotSnapshot) {
+                if (tok == null || !tok.startsWith(ModuleConfig.QA_APP_PREFIX)) continue;
+                String target = tok.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+                if (!isAppTargetInstalled(pm, launcherApps, target)) {
+                    missing.add(target);
+                } else {
+                    String pkg = ModuleConfig.extractAppTargetPackage(target);
+                    if (!appLabelCache.containsKey(pkg)) {
+                        String resolved = resolvePackageLabel(pm, pkg);
+                        if (resolved != null && !resolved.isEmpty()) {
+                            appLabelCache.put(pkg, resolved);
+                            labelsAdded = true;
+                        }
+                    }
+                }
+            }
+            if (!missing.isEmpty() || labelsAdded) {
+                mainHandler.post(() -> {
+                    if (isDestroyed() || !dialog.isShowing()) return;
+                    uninstalledAppTargets.clear();
+                    uninstalledAppTargets.addAll(missing);
+                    refreshUiRef[0].run();
+                });
+            }
+        });
+    }
+
+    private void showSingleAppPickerForQuickSlot(String dialogTitle, Consumer<String> onSelected) {
+        boolean compact = isCompactCoverUi();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean ultraCompactHeight = safeHeight < dp(330);
+
+        Dialog appDialog = trackDialog(new Dialog(this));
+        appDialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        int padH = compact ? dp(10) : dp(20);
+        int padV = dp(ultraCompactHeight ? 8 : 14);
+        sheet.setPadding(padH, padV, padH, padV);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
+
+        TextView titleView = createText(
+                dialogTitle != null ? dialogTitle : getString(R.string.qa_action_app),
+                ultraCompactHeight ? 15f : 18f,
+                palette.onSurface,
+                FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        titleView.setPadding(0, 0, 0, dp(8));
+        sheet.addView(titleView);
+
+        LinearLayout searchBox = new LinearLayout(this);
+        searchBox.setOrientation(LinearLayout.HORIZONTAL);
+        searchBox.setGravity(Gravity.CENTER_VERTICAL);
+        searchBox.setPadding(dp(12), dp(2), dp(12), dp(2));
+        searchBox.setBackground(rounded(palette.surfaceContainerHigh, 20f));
+
+        EditText searchInput = new EditText(this);
+        searchInput.setHint(R.string.picker_search_hint);
+        searchInput.setHintTextColor(palette.onSurfaceVariant);
+        searchInput.setTextColor(palette.onSurface);
+        searchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        searchInput.setSingleLine(true);
+        searchInput.setBackground(null);
+        searchInput.setMinHeight(dp(40));
+        searchBox.addView(searchInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        searchLp.bottomMargin = dp(6);
+        sheet.addView(searchBox, searchLp);
+
+        final List<AppEntry> allApps = new ArrayList<>();
+        final List<AppEntry> filteredApps = new ArrayList<>();
+        BaseAdapter singleAdapter = new BaseAdapter() {
+            @Override public int getCount() { return filteredApps.size(); }
+            @Override public AppEntry getItem(int position) { return filteredApps.get(position); }
+            @Override public long getItemId(int position) { return position; }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                AppRowHolder holder;
+                if (convertView != null && convertView.getTag() instanceof AppRowHolder h) {
+                    holder = h;
+                } else {
+                    holder = new AppRowHolder(false);
+                }
+                holder.bind(filteredApps.get(position), position, filteredApps.size(), false);
+                return holder.row;
+            }
+        };
+
+        FrameLayout listFrame = new FrameLayout(this);
+        ListView listView = new ListView(this);
+        listView.setVerticalScrollBarEnabled(false);
+        listView.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        listView.setDividerHeight(dp(2));
+        listView.setSelector(new ColorDrawable(Color.TRANSPARENT));
+        listView.setAdapter(singleAdapter);
+        TextView emptyView = createText(getString(R.string.picker_loading), 13f, palette.onSurfaceVariant, FONT_REGULAR);
+        emptyView.setGravity(Gravity.CENTER);
+        listFrame.addView(listView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listFrame.addView(emptyView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listView.setEmptyView(emptyView);
+        sheet.addView(listFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= filteredApps.size()) return;
+            AppEntry chosen = filteredApps.get(position);
+            appDialog.dismiss();
+            if (onSelected != null) onSelected.accept(chosen.targetKey);
+        });
+
+        Runnable refilter = () -> {
+            String q = searchInput.getText() == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
+            filteredApps.clear();
+            for (AppEntry app : allApps) {
+                if (!q.isEmpty() && !app.labelLower.contains(q) && !app.targetKey.toLowerCase(Locale.ROOT).contains(q)) {
+                    continue;
+                }
+                filteredApps.add(app);
+            }
+            singleAdapter.notifyDataSetChanged();
+        };
+
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                mainHandler.removeCallbacks(refilter);
+                mainHandler.postDelayed(refilter, 120);
+            }
+        });
+
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        footer.setGravity(Gravity.END);
+        footer.setPadding(0, dp(8), 0, 0);
+        TextView closeBtn = createText(getString(R.string.btn_cancel), 13.5f, palette.primary, FONT_MEDIUM);
+        closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setSingleLine(true);
+        closeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        closeBtn.setMinHeight(dp(44));
+        closeBtn.setPadding(dp(16), dp(8), dp(16), dp(8));
+        closeBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 22f));
+        closeBtn.setOnClickListener(v -> appDialog.dismiss());
+        footer.addView(closeBtn);
+        sheet.addView(footer);
+
+        appDialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        appDialog.setOnDismissListener(d -> mainHandler.removeCallbacks(refilter));
+        configureCoverSafePickerWindow(appDialog, true);
+        appDialog.show();
+        configureCoverSafePickerWindow(appDialog, true);
+
+        PackageManager pm = getPackageManager();
+        LauncherApps launcherApps = getSystemService(LauncherApps.class);
+        IO.execute(() -> {
+            List<AppEntry> loaded;
+            try {
+                loaded = loadLaunchableAppsForWidget(pm, launcherApps, List.of(), true);
+                for (AppEntry e : loaded) {
+                    if (e.userId == 0) appLabelCache.put(e.packageName, e.label);
+                }
+            } catch (RuntimeException e) {
+                loaded = List.of();
+            }
+            final List<AppEntry> result = loaded;
+            mainHandler.post(() -> {
+                if (isDestroyed() || !appDialog.isShowing()) return;
+                allApps.addAll(result);
+                emptyView.setText(R.string.picker_empty);
+                refilter.run();
+            });
+        });
+    }
+
+    // ==================== Feature 1, 2, 4, 6 Summary Helpers & Dialogs ====================
+
+    private static void addTextIfPresent(List<TextView> bucket, TextView tv) {
+        if (bucket != null && tv != null) bucket.add(tv);
+    }
+
+    private static void updateTextBucket(List<TextView> bucket, String value) {
+        for (TextView tv : bucket) {
+            if (tv != null) tv.setText(value);
+        }
+    }
+
+    private String orbActionLabel(String token) {
+        String normalized = ModuleConfig.normalizeOrbActionToken(token);
+        if (ModuleConfig.QA_NONE.equals(normalized)) {
+            return getString(R.string.orb_action_none);
+        }
+        return quickActionLabel(normalized);
+    }
+
+    private void refreshOrbActionSummaries() {
+        updateTextBucket(orbTapSummaryTexts, orbActionLabel(ModuleConfig.orbTapAction()));
+        updateTextBucket(orbLongSummaryTexts, orbActionLabel(ModuleConfig.orbLongPressAction()));
+    }
+
+    private String foldContinuityModeSummary() {
+        return switch (ModuleConfig.foldContinuityMode()) {
+            case ModuleConfig.FOLD_CONT_SELECTED ->
+                    getString(R.string.fold_mode_selected_fmt, ModuleConfig.foldContinuityApps().size());
+            case ModuleConfig.FOLD_CONT_ALL -> getString(R.string.fold_mode_all);
+            default -> getString(R.string.fold_mode_system);
+        };
+    }
+
+    private String foldContinuityAppsSummary() {
+        Set<String> apps = ModuleConfig.foldContinuityApps();
+        if (apps.isEmpty()) return getString(R.string.row_fold_apps_empty);
+        String sep = getString(R.string.list_separator);
+        StringBuilder sb = new StringBuilder();
+        int shown = 0;
+        for (String pkg : apps) {
+            if (shown >= 4) {
+                sb.append(sep).append("…");
+                break;
+            }
+            String label = cachedLabelOrPkg(pkg);
+            if (sb.length() > 0) sb.append(sep);
+            sb.append(label);
+            shown++;
+        }
+        return getString(R.string.row_fold_apps_summary, apps.size(), sb.toString());
+    }
+
+    private void refreshFoldContinuitySummaries() {
+        updateTextBucket(foldModeSummaryTexts, foldContinuityModeSummary());
+        updateTextBucket(foldAppsSummaryTexts, foldContinuityAppsSummary());
+    }
+
+    private String imeInsetLabel(int insetPx) {
+        if (insetPx < 0) return getString(R.string.ime_inset_auto);
+        if (insetPx == 0) return getString(R.string.ime_inset_none);
+        if (insetPx == 260) return getString(R.string.ime_inset_compact);
+        if (insetPx == 398) return getString(R.string.ime_inset_standard);
+        if (insetPx == 430) return getString(R.string.ime_inset_wide);
+        return insetPx + "px";
+    }
+
+    private String imeTuningSummary() {
+        return getString(
+                R.string.row_ime_tuning_summary,
+                ModuleConfig.imeDpiScalePercent(),
+                ModuleConfig.imeMaxHeightPercent(),
+                imeInsetLabel(ModuleConfig.imeTopInsetPx()));
+    }
+
+    private void refreshImeTuningSummaries() {
+        updateTextBucket(imeTuningSummaryTexts, imeTuningSummary());
+    }
+
+    private String perAppRulesSummary() {
+        int count = ModuleConfig.perAppRules().size();
+        return count == 0
+                ? getString(R.string.row_per_app_rules_empty)
+                : getString(R.string.row_per_app_rules_summary, count);
+    }
+
+    private void refreshPerAppRulesSummaries() {
+        updateTextBucket(perAppRulesSummaryTexts, perAppRulesSummary());
+    }
+
+    private String formatPerAppRuleSummary(ModuleConfig.PerAppRule rule) {
+        if (rule == null || rule.isDefault()) return getString(R.string.tag_rule_default);
+        List<String> parts = new ArrayList<>(3);
+        if (rule.topGapPx() >= 0) parts.add(rule.topGapPx() + "px");
+        if (rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) parts.add("1208px");
+        else if (rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) parts.add("810px");
+        if (rule.scalePercent() > 0) parts.add(rule.scalePercent() + "%");
+        return parts.isEmpty() ? getString(R.string.tag_rule_default) : TextUtils.join(" · ", parts);
+    }
+
+    private String resolvePackageLabel(PackageManager pm, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return "";
+        try {
+            ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            CharSequence cs = pm.getApplicationLabel(ai);
+            if (cs != null && cs.length() > 0) return cs.toString();
+        } catch (Throwable ignored) {
+        }
+        return pkg;
+    }
+
+    private TextView createChoicePill(String text, boolean selectedPill, boolean compact) {
+        TextView pill = createText(
+                text,
+                compact ? 11.5f : 12.5f,
+                selectedPill ? palette.onPrimaryContainer : palette.onSurfaceVariant,
+                FONT_MEDIUM);
+        pill.setSingleLine(true);
+        pill.setEllipsize(TextUtils.TruncateAt.END);
+        pill.setGravity(Gravity.CENTER);
+        pill.setMinHeight(dp(44));
+        pill.setMinimumHeight(dp(44));
+        pill.setPadding(dp(compact ? 11 : 14), 0, dp(compact ? 11 : 14), 0);
+        Drawable bg = new InsetDrawable(
+                pillRipple(
+                        selectedPill ? palette.primaryContainer : palette.surfaceContainerHigh,
+                        palette.rippleColor,
+                        16f),
+                0, dp(3), 0, dp(3));
+        pill.setBackground(bg);
+        pill.setClickable(true);
+        pill.setFocusable(true);
+        pill.setSelected(selectedPill);
+        return pill;
+    }
+
+    private void showOrbActionPickerDialog(boolean isLongPress) {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        final String key = isLongPress ? ModuleConfig.KEY_ORB_LONG_PRESS_ACTION : ModuleConfig.KEY_ORB_TAP_ACTION;
+        final String[] current = {isLongPress ? ModuleConfig.orbLongPressAction() : ModuleConfig.orbTapAction()};
+
+        boolean compact = isCompactCoverUi();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean compactHeight = safeHeight < dp(440);
+        boolean ultraCompactHeight = safeHeight < dp(330);
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        int sheetPadH = compact ? dp(10) : dp(20);
+        int sheetPadV = dp(ultraCompactHeight ? 8 : (compactHeight ? 12 : 16));
+        sheet.setPadding(sheetPadH, sheetPadV, sheetPadH, sheetPadV);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
+
+        TextView titleView = createText(
+                getString(isLongPress ? R.string.picker_orb_long_title : R.string.picker_orb_tap_title),
+                ultraCompactHeight ? 15f : (compact ? 18f : 20f),
+                palette.onSurface,
+                FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        sheet.addView(titleView);
+        TextView subView = createText(
+                getString(R.string.picker_orb_sub),
+                ultraCompactHeight ? 10.5f : 12f,
+                palette.onSurfaceVariant,
+                FONT_REGULAR);
+        subView.setPadding(0, dp(3), 0, dp(8));
+        sheet.addView(subView);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(col);
+        sheet.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        List<QuickOptionSpec> specs = List.of(
+                new QuickOptionSpec(ModuleConfig.QA_NONE, R.string.orb_action_none, R.string.orb_action_none_desc),
+                new QuickOptionSpec(ModuleConfig.QA_TORCH, R.string.qa_action_torch, R.string.qa_action_torch_desc),
+                new QuickOptionSpec(ModuleConfig.QA_LOCK, R.string.qa_action_lock, R.string.qa_action_lock_desc),
+                new QuickOptionSpec(ModuleConfig.QA_ROTATION_LOCK, R.string.qa_action_rotation_lock, R.string.qa_action_rotation_lock_desc),
+                new QuickOptionSpec(ModuleConfig.QA_MEDIA_PLAY_PAUSE, R.string.qa_action_media_play_pause, R.string.qa_action_media_play_pause_desc),
+                new QuickOptionSpec(ModuleConfig.QA_BRIGHTNESS, R.string.qa_action_brightness, R.string.qa_action_brightness_desc),
+                new QuickOptionSpec(ModuleConfig.QA_SCAN, R.string.qa_action_scan, R.string.qa_action_scan_desc),
+                new QuickOptionSpec(ModuleConfig.QA_CONTROL_CENTER, R.string.qa_action_control_center, R.string.qa_action_control_center_desc),
+                new QuickOptionSpec(ModuleConfig.QA_NOTIFICATIONS, R.string.qa_action_notifications, R.string.qa_action_notifications_desc),
+                new QuickOptionSpec(ModuleConfig.QA_SCREENSHOT, R.string.qa_action_screenshot, R.string.qa_action_screenshot_desc),
+                new QuickOptionSpec(ModuleConfig.QA_RINGER, R.string.qa_action_ringer, R.string.qa_action_ringer_desc),
+                new QuickOptionSpec(ModuleConfig.QA_HOME, R.string.qa_action_home, R.string.qa_action_home_desc),
+                new QuickOptionSpec(ModuleConfig.QA_RECENTS, R.string.qa_action_recents, R.string.qa_action_recents_desc),
+                new QuickOptionSpec(ModuleConfig.QA_BACK, R.string.qa_action_back, R.string.qa_action_back_desc),
+                new QuickOptionSpec(ModuleConfig.QA_APP_PREFIX, R.string.qa_action_app, R.string.qa_action_app_desc));
+
+        Consumer<String> applyOrbChoice = chosen -> {
+            String normalized = ModuleConfig.normalizeOrbActionToken(chosen);
+            try {
+                prefs.edit().putString(key, normalized).apply();
+                refreshOrbActionSummaries();
+                if (coverPreview != null) coverPreview.invalidate();
+                show(getString(R.string.msg_orb_action_saved, orbActionLabel(normalized)));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        };
+
+        int count = specs.size();
+        for (int i = 0; i < count; i++) {
+            QuickOptionSpec spec = specs.get(i);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(compact ? 10 : 14), dp(ultraCompactHeight ? 7 : 10),
+                    dp(compact ? 10 : 14), dp(ultraCompactHeight ? 7 : 10));
+            float rTop = (i == 0) ? 18f : 5f;
+            float rBot = (i == count - 1) ? 18f : 5f;
+            row.setBackground(ripple(palette.surfaceContainer, palette.rippleColor, rTop, rTop, rBot, rBot, 0, 0));
+            row.setClickable(true);
+            row.setFocusable(true);
+
+            FrameLayout iconBadge = new FrameLayout(this);
+            iconBadge.setBackground(rounded(palette.secondaryContainer, 12f));
+            QuickActionPreviewIcon icon = new QuickActionPreviewIcon(this, palette.onSecondaryContainer);
+            String glyphTok = ModuleConfig.QA_APP_PREFIX.equals(spec.token) ? "app_placeholder"
+                    : (ModuleConfig.QA_NONE.equals(spec.token) ? "none" : spec.token);
+            icon.bind(glyphTok, palette.onSecondaryContainer);
+            iconBadge.addView(icon, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+            LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(dp(34), dp(34));
+            badgeLp.rightMargin = dp(10);
+            row.addView(iconBadge, badgeLp);
+
+            LinearLayout textCol = new LinearLayout(this);
+            textCol.setOrientation(LinearLayout.VERTICAL);
+            boolean isAppMatch = ModuleConfig.QA_APP_PREFIX.equals(spec.token)
+                    && current[0].startsWith(ModuleConfig.QA_APP_PREFIX);
+            String titleStr = isAppMatch
+                    ? getString(R.string.qa_action_app_fmt, orbActionLabel(current[0]))
+                    : getString(spec.titleRes);
+            TextView tView = createText(titleStr, compact ? 13.5f : 14.5f, palette.onSurface, FONT_MEDIUM);
+            textCol.addView(tView);
+            TextView sView = createText(getString(spec.descRes), 11.5f, palette.onSurfaceVariant, FONT_REGULAR);
+            sView.setPadding(0, dp(2), 0, 0);
+            textCol.addView(sView);
+            row.addView(textCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            boolean active = isAppMatch || spec.token.equals(current[0]);
+            TextView tag = createText(getString(R.string.tag_enabled), 10.5f, palette.onPrimaryContainer, FONT_MEDIUM);
+            tag.setPadding(dp(8), dp(3), dp(8), dp(3));
+            tag.setBackground(rounded(palette.primaryContainer, 10f));
+            tag.setVisibility(active ? View.VISIBLE : View.GONE);
+            row.addView(tag);
+
+            row.setOnClickListener(v -> {
+                dialog.dismiss();
+                if (ModuleConfig.QA_APP_PREFIX.equals(spec.token)) {
+                    showSingleAppPickerForQuickSlot(
+                            getString(isLongPress ? R.string.picker_orb_long_app_title : R.string.picker_orb_tap_app_title),
+                            target -> applyOrbChoice.accept(ModuleConfig.QA_APP_PREFIX + target));
+                } else {
+                    applyOrbChoice.accept(spec.token);
+                }
+            });
+
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.bottomMargin = (i == count - 1) ? 0 : dp(2);
+            col.addView(row, rowLp);
+        }
+
+        LinearLayout footer = new LinearLayout(this);
+        footer.setOrientation(LinearLayout.HORIZONTAL);
+        footer.setGravity(Gravity.END);
+        footer.setPadding(0, dp(8), 0, 0);
+        TextView closeBtn = createText(getString(R.string.btn_cancel), 13.5f, palette.primary, FONT_MEDIUM);
+        closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setSingleLine(true);
+        closeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        closeBtn.setMinHeight(dp(44));
+        closeBtn.setPadding(dp(16), dp(8), dp(16), dp(8));
+        closeBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 22f));
+        closeBtn.setOnClickListener(v -> dialog.dismiss());
+        footer.addView(closeBtn);
+        sheet.addView(footer);
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        configureCoverSafePickerWindow(dialog, true);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, true);
+    }
+
+    private void showFoldContinuityModeDialog() {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        int curMode = ModuleConfig.foldContinuityMode();
+        int[] modes = {
+                ModuleConfig.FOLD_CONT_SYSTEM,
+                ModuleConfig.FOLD_CONT_SELECTED,
+                ModuleConfig.FOLD_CONT_ALL
+        };
+        int[] labels = {
+                R.string.fold_mode_system,
+                R.string.fold_mode_selected,
+                R.string.fold_mode_all
+        };
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(20), dp(8), dp(20), dp(4));
+
+        Dialog[] dialogHolder = new Dialog[1];
+        for (int i = 0; i < modes.length; i++) {
+            final int mode = modes[i];
+            boolean selectedMode = (mode == curMode);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(14), dp(12), dp(14), dp(12));
+            float rTop = (i == 0) ? 18f : 5f;
+            float rBot = (i == modes.length - 1) ? 18f : 5f;
+            row.setBackground(ripple(
+                    selectedMode ? palette.primaryContainer : palette.surfaceContainer,
+                    palette.rippleColor,
+                    rTop, rTop, rBot, rBot, 0, 0));
+            TextView tv = createText(
+                    getString(labels[i]),
+                    14.5f,
+                    selectedMode ? palette.onPrimaryContainer : palette.onSurface,
+                    FONT_MEDIUM);
+            row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            if (selectedMode) {
+                TextView tag = createText(getString(R.string.tag_enabled), 10.5f, palette.primary, FONT_MEDIUM);
+                row.addView(tag);
+            }
+            row.setOnClickListener(v -> {
+                if (dialogHolder[0] != null) dialogHolder[0].dismiss();
+                try {
+                    prefs.edit().putInt(ModuleConfig.KEY_FOLD_CONTINUITY_MODE, mode).apply();
+                    refreshFoldContinuitySummaries();
+                    show(getString(R.string.msg_effect_realtime));
+                    if (mode == ModuleConfig.FOLD_CONT_SELECTED && ModuleConfig.foldContinuityApps().isEmpty()) {
+                        showFoldContinuityAppsDialog();
+                    }
+                } catch (RuntimeException e) {
+                    show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+                }
+            });
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.bottomMargin = (i == modes.length - 1) ? 0 : dp(2);
+            content.addView(row, rowLp);
+        }
+
+        AlertDialog d = trackDialog(dialogBuilder()
+                .setTitle(R.string.row_fold_mode_title)
+                .setView(content)
+                .setNegativeButton(R.string.btn_cancel, null)
+                .show());
+        dialogHolder[0] = d;
+        configureCoverSafeDialogWindow(d, false, false);
+    }
+
+    private void showFoldContinuityAppsDialog() {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        final Set<String> selectedPkgs = new LinkedHashSet<>(ModuleConfig.foldContinuityApps());
+        final Set<String> uninstalledPkgs = new LinkedHashSet<>();
+
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean compactHeight = safeHeight < dp(420);
+        boolean ultraCompactHeight = safeHeight < dp(320);
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        int sheetPadH = compact ? dp(8) : dp(20);
+        int sheetPadV = dp(ultraCompactHeight ? 6 : (compactHeight ? 10 : 16));
+        sheet.setPadding(sheetPadH, sheetPadV, sheetPadH, sheetPadV);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
+
+        TextView titleView = createText(getString(R.string.picker_fold_apps_title),
+                ultraCompactHeight ? 15f : (compact ? 18f : 20f), palette.onSurface, FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        sheet.addView(titleView);
+        TextView subView = createText(getString(R.string.picker_fold_apps_sub),
+                ultraCompactHeight ? 10.5f : 12f, palette.onSurfaceVariant, FONT_REGULAR);
+        if (ultraCompactHeight) {
+            subView.setSingleLine(true);
+            subView.setEllipsize(TextUtils.TruncateAt.END);
+            subView.setPadding(0, dp(1), 0, dp(3));
+        } else {
+            subView.setPadding(0, dp(3), 0, dp(6));
+        }
+        sheet.addView(subView);
+
+        final List<AppEntry> allApps = new ArrayList<>();
+        final Runnable[] refilterRef = new Runnable[1];
+        final PruneBannerHolder[] pruneBannerRef = new PruneBannerHolder[1];
+        pruneBannerRef[0] = createUninstalledPruneBanner(compact, ultraCompactHeight, () -> {
+            int removed = 0;
+            for (String missing : new ArrayList<>(uninstalledPkgs)) {
+                if (selectedPkgs.remove(missing)) removed++;
+            }
+            allApps.removeIf(e -> e.uninstalled);
+            uninstalledPkgs.clear();
+            pruneBannerRef[0].update(this, 0);
+            if (refilterRef[0] != null) refilterRef[0].run();
+            if (removed > 0) show(getString(R.string.msg_uninstalled_pruned, removed));
+        });
+        LinearLayout.LayoutParams pruneLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pruneLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
+        sheet.addView(pruneBannerRef[0].container(), pruneLp);
+
+        LinearLayout searchBox = new LinearLayout(this);
+        searchBox.setOrientation(LinearLayout.HORIZONTAL);
+        searchBox.setGravity(Gravity.CENTER_VERTICAL);
+        searchBox.setPadding(dp(12), dp(2), dp(12), dp(2));
+        searchBox.setBackground(rounded(palette.surfaceContainerHigh, 20f));
+        EditText searchInput = new EditText(this);
+        searchInput.setHint(R.string.picker_search_hint);
+        searchInput.setHintTextColor(palette.onSurfaceVariant);
+        searchInput.setTextColor(palette.onSurface);
+        searchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        searchInput.setSingleLine(true);
+        searchInput.setBackground(null);
+        searchInput.setMinHeight(dp(40));
+        searchBox.addView(searchInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        searchLp.bottomMargin = dp(4);
+        sheet.addView(searchBox, searchLp);
+
+        final int[] activeFilter = {0};
+        int[] filterRes = {R.string.filter_third, R.string.filter_selected, R.string.filter_all, R.string.filter_system};
+        final List<TextView> chipViews = new ArrayList<>();
+        final AppListAdapter adapter = new AppListAdapter(false);
+
+        HorizontalScrollView chipScroll = new HorizontalScrollView(this);
+        chipScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout chipRow = new LinearLayout(this);
+        chipRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < filterRes.length; i++) {
+            final int idx = i;
+            TextView chip = createChip(getString(filterRes[i]), palette.onSurfaceVariant, ultraCompactHeight);
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clp.rightMargin = dp(6);
+            chip.setOnClickListener(v -> {
+                activeFilter[0] = idx;
+                if (refilterRef[0] != null) refilterRef[0].run();
+            });
+            chipViews.add(chip);
+            chipRow.addView(chip, clp);
+        }
+        chipScroll.addView(chipRow);
+        LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chipLp.bottomMargin = dp(4);
+        sheet.addView(chipScroll, chipLp);
+
+        FrameLayout listFrame = new FrameLayout(this);
+        ListView listView = new ListView(this);
+        listView.setVerticalScrollBarEnabled(false);
+        listView.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        listView.setDividerHeight(dp(2));
+        listView.setSelector(new ColorDrawable(Color.TRANSPARENT));
+        listView.setAdapter(adapter);
+        TextView emptyView = createText(getString(R.string.picker_loading), 13.5f, palette.onSurfaceVariant, FONT_REGULAR);
+        emptyView.setGravity(Gravity.CENTER);
+        listFrame.addView(listView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listFrame.addView(emptyView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listView.setEmptyView(emptyView);
+        sheet.addView(listFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= adapter.items.size()) return;
+            AppEntry app = adapter.items.get(position);
+            app.selected = !app.selected;
+            if (app.selected) {
+                selectedPkgs.add(app.packageName);
+                if (app.uninstalled) {
+                    uninstalledPkgs.add(app.packageName);
+                    pruneBannerRef[0].update(this, uninstalledPkgs.size());
+                }
+            } else {
+                selectedPkgs.remove(app.packageName);
+                if (uninstalledPkgs.remove(app.packageName)) {
+                    pruneBannerRef[0].update(this, uninstalledPkgs.size());
+                }
+            }
+            if (view.getTag() instanceof AppRowHolder h && h.entry == app) {
+                h.sw.setChecked(app.selected, false);
+            } else {
+                adapter.notifyDataSetChanged();
+            }
+        });
+
+        refilterRef[0] = () -> {
+            for (int i = 0; i < chipViews.size(); i++) {
+                boolean sel = (i == activeFilter[0]);
+                chipViews.get(i).setBackground(chipBackground(sel, ultraCompactHeight));
+                chipViews.get(i).setTextColor(sel ? palette.onSecondaryContainer : palette.onSurfaceVariant);
+            }
+            String q = searchInput.getText() == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
+            adapter.items.clear();
+            for (AppEntry app : allApps) {
+                boolean match = switch (activeFilter[0]) {
+                    case 0 -> !app.systemApp;
+                    case 1 -> app.selected;
+                    case 3 -> app.systemApp;
+                    default -> true;
+                };
+                if (!match) continue;
+                if (!q.isEmpty() && !app.labelLower.contains(q) && !app.packageName.toLowerCase(Locale.ROOT).contains(q)) {
+                    continue;
+                }
+                adapter.items.add(app);
+            }
+            adapter.notifyDataSetChanged();
+        };
+
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                mainHandler.removeCallbacks(refilterRef[0]);
+                mainHandler.postDelayed(refilterRef[0], 120);
+            }
+        });
+
+        float btnSp = compact ? 12.5f : 13.5f;
+        int btnMinH = dp(ultraCompactHeight ? 36 : 44);
+        int btnPadH = compact ? dp(10) : dp(14);
+        int savePadH = compact ? dp(12) : dp(18);
+        int btnPadV = dp(ultraCompactHeight ? 6 : 8);
+
+        TextView clearBtn = createText(getString(R.string.picker_pinned_clear), btnSp, palette.onSurfaceVariant, FONT_MEDIUM);
+        clearBtn.setGravity(Gravity.CENTER);
+        clearBtn.setSingleLine(true);
+        clearBtn.setEllipsize(TextUtils.TruncateAt.END);
+        clearBtn.setMinHeight(btnMinH);
+        clearBtn.setPadding(btnPadH, btnPadV, btnPadH, btnPadV);
+        clearBtn.setBackground(pillRipple(palette.surfaceContainerHigh, palette.rippleColor, 20f));
+        clearBtn.setOnClickListener(v -> {
+            selectedPkgs.clear();
+            uninstalledPkgs.clear();
+            allApps.removeIf(e -> e.uninstalled);
+            pruneBannerRef[0].update(this, 0);
+            for (AppEntry app : allApps) app.selected = false;
+            refilterRef[0].run();
+        });
+
+        TextView cancelBtn = createText(getString(R.string.btn_cancel), btnSp, palette.primary, FONT_MEDIUM);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setSingleLine(true);
+        cancelBtn.setEllipsize(TextUtils.TruncateAt.END);
+        cancelBtn.setMinHeight(btnMinH);
+        cancelBtn.setPadding(btnPadH, btnPadV, btnPadH, btnPadV);
+        cancelBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 20f));
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+
+        TextView saveBtn = createText(getString(R.string.btn_save_fold_apps), btnSp, palette.onPrimary, FONT_MEDIUM);
+        saveBtn.setGravity(Gravity.CENTER);
+        saveBtn.setSingleLine(true);
+        saveBtn.setEllipsize(TextUtils.TruncateAt.END);
+        saveBtn.setMinHeight(btnMinH);
+        saveBtn.setPadding(savePadH, btnPadV, savePadH, btnPadV);
+        saveBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 20f));
+        saveBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            try {
+                String serialized = ModuleConfig.serializePackageList(selectedPkgs);
+                SharedPreferences.Editor ed = prefs.edit()
+                        .putString(ModuleConfig.KEY_FOLD_CONTINUITY_APPS, serialized);
+                if (!selectedPkgs.isEmpty() && ModuleConfig.foldContinuityMode() == ModuleConfig.FOLD_CONT_SYSTEM) {
+                    ed.putInt(ModuleConfig.KEY_FOLD_CONTINUITY_MODE, ModuleConfig.FOLD_CONT_SELECTED);
+                }
+                ed.apply();
+                refreshFoldContinuitySummaries();
+                show(getString(R.string.msg_fold_apps_saved, selectedPkgs.size()));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        });
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(ultraCompactHeight ? 4 : 8), 0, 0);
+            LinearLayout topBtnRow = new LinearLayout(this);
+            topBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams clrLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            clrLp.rightMargin = dp(6);
+            topBtnRow.addView(clearBtn, clrLp);
+            topBtnRow.addView(cancelBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            footerCol.addView(topBtnRow);
+            LinearLayout.LayoutParams saveFullLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveFullLp.topMargin = dp(6);
+            footerCol.addView(saveBtn, saveFullLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            bottomRow.setPadding(0, dp(ultraCompactHeight ? 4 : 8), 0, 0);
+            bottomRow.addView(clearBtn);
+            bottomRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            bottomRow.addView(cancelBtn);
+            LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveLp.leftMargin = dp(4);
+            bottomRow.addView(saveBtn, saveLp);
+            sheet.addView(bottomRow);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        dialog.setOnDismissListener(d -> mainHandler.removeCallbacks(refilterRef[0]));
+        configureCoverSafePickerWindow(dialog, false);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, false);
+
+        PackageManager pm = getPackageManager();
+        List<String> orderSnapshot = new ArrayList<>(selectedPkgs);
+        IO.execute(() -> {
+            List<AppEntry> loaded;
+            try {
+                loaded = loadLaunchableAppsForWidget(pm, orderSnapshot);
+                for (AppEntry e : loaded) appLabelCache.put(e.packageName, e.label);
+            } catch (RuntimeException e) {
+                loaded = List.of();
+            }
+            Set<String> seenPkgs = new HashSet<>();
+            for (AppEntry e : loaded) seenPkgs.add(e.packageName);
+            List<String> missing = new ArrayList<>();
+            List<AppEntry> combined = new ArrayList<>(loaded);
+            for (String pkg : orderSnapshot) {
+                if (seenPkgs.contains(pkg)) continue;
+                if (!isAppTargetInstalled(pm, null, pkg)) {
+                    missing.add(pkg);
+                    combined.add(0, new AppEntry(pkg, pkg, false, true, "", null, 0, true));
+                }
+            }
+            mainHandler.post(() -> {
+                if (isDestroyed() || !dialog.isShowing()) return;
+                allApps.addAll(combined);
+                for (AppEntry e : combined) {
+                    e.selected = selectedPkgs.contains(e.packageName);
+                }
+                uninstalledPkgs.clear();
+                uninstalledPkgs.addAll(missing);
+                pruneBannerRef[0].update(this, uninstalledPkgs.size());
+                emptyView.setText(R.string.picker_empty);
+                refilterRef[0].run();
+            });
+        });
+    }
+
+    private void showImeTuningDialog() {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        final int[] scaleState = {ModuleConfig.imeDpiScalePercent()};
+        final int[] heightState = {ModuleConfig.imeMaxHeightPercent()};
+        final int[] insetState = {ModuleConfig.imeTopInsetPx()};
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setPadding(dp(compact ? 12 : 20), dp(14), dp(compact ? 12 : 20), dp(14));
+        sheet.setBackground(rounded(palette.surfaceContainerLow, 26f));
+
+        TextView titleView = createText(getString(R.string.dialog_ime_tuning_title),
+                compact ? 18f : 20f, palette.onSurface, FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        titleView.setPadding(0, 0, 0, dp(10));
+        sheet.addView(titleView);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(body);
+        sheet.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        final int[] scaleOptions = {80, 90, 100, 110, 120};
+        final int[] heightOptions = {80, 90, 100, 110};
+        final int[] insetOptions = {-1, 0, 260, 398, 430};
+        final Runnable[] refreshChips = new Runnable[1];
+
+        java.util.function.BiConsumer<String, LinearLayout> addLabel = (txt, parent) -> {
+            TextView lbl = createText(txt, 13f, palette.primary, FONT_MEDIUM);
+            lbl.setPadding(dp(2), dp(8), dp(2), dp(4));
+            parent.addView(lbl);
+        };
+
+        addLabel.accept(getString(R.string.ime_tuning_scale_label), body);
+        HorizontalScrollView scaleScroll = new HorizontalScrollView(this);
+        scaleScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout scaleRow = new LinearLayout(this);
+        scaleScroll.addView(scaleRow);
+        body.addView(scaleScroll);
+
+        addLabel.accept(getString(R.string.ime_tuning_height_label), body);
+        HorizontalScrollView heightScroll = new HorizontalScrollView(this);
+        heightScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout heightRow = new LinearLayout(this);
+        heightScroll.addView(heightRow);
+        body.addView(heightScroll);
+
+        addLabel.accept(getString(R.string.ime_tuning_inset_label), body);
+        HorizontalScrollView insetScroll = new HorizontalScrollView(this);
+        insetScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout insetRow = new LinearLayout(this);
+        insetScroll.addView(insetRow);
+        body.addView(insetScroll);
+
+        refreshChips[0] = () -> {
+            scaleRow.removeAllViews();
+            for (int v : scaleOptions) {
+                TextView p = createChoicePill(v + "%", v == scaleState[0], compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(view -> {
+                    scaleState[0] = v;
+                    refreshChips[0].run();
+                });
+                scaleRow.addView(p, lp);
+            }
+            heightRow.removeAllViews();
+            for (int v : heightOptions) {
+                TextView p = createChoicePill(v + "%", v == heightState[0], compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(view -> {
+                    heightState[0] = v;
+                    refreshChips[0].run();
+                });
+                heightRow.addView(p, lp);
+            }
+            insetRow.removeAllViews();
+            for (int v : insetOptions) {
+                TextView p = createChoicePill(imeInsetLabel(v), v == insetState[0], compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(view -> {
+                    insetState[0] = v;
+                    refreshChips[0].run();
+                });
+                insetRow.addView(p, lp);
+            }
+        };
+        refreshChips[0].run();
+
+        TextView switchImeBtn = createText(getString(R.string.btn_switch_ime), 13f, palette.onSecondaryContainer, FONT_MEDIUM);
+        switchImeBtn.setGravity(Gravity.CENTER);
+        switchImeBtn.setSingleLine(true);
+        switchImeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        switchImeBtn.setMinHeight(dp(44));
+        switchImeBtn.setPadding(dp(14), dp(10), dp(14), dp(10));
+        switchImeBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 20f));
+        LinearLayout.LayoutParams swImeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        swImeLp.topMargin = dp(12);
+        switchImeBtn.setOnClickListener(v -> {
+            InputMethodManager imm = getSystemService(InputMethodManager.class);
+            if (imm != null) imm.showInputMethodPicker();
+        });
+        body.addView(switchImeBtn, swImeLp);
+
+        float btnSp = compact ? 12.5f : 13.5f;
+        int btnPadH = compact ? dp(10) : dp(14);
+        TextView resetBtn = createText(getString(R.string.btn_reset_default), btnSp, palette.onSurfaceVariant, FONT_MEDIUM);
+        resetBtn.setGravity(Gravity.CENTER);
+        resetBtn.setSingleLine(true);
+        resetBtn.setEllipsize(TextUtils.TruncateAt.END);
+        resetBtn.setMinHeight(dp(44));
+        resetBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        resetBtn.setBackground(pillRipple(palette.surfaceContainerHigh, palette.rippleColor, 20f));
+        resetBtn.setOnClickListener(v -> {
+            scaleState[0] = ModuleConfig.DEFAULT_IME_DPI_SCALE_PERCENT;
+            heightState[0] = ModuleConfig.DEFAULT_IME_MAX_HEIGHT_PERCENT;
+            insetState[0] = ModuleConfig.IME_TOP_INSET_AUTO;
+            refreshChips[0].run();
+        });
+
+        TextView cancelBtn = createText(getString(R.string.btn_cancel), btnSp, palette.primary, FONT_MEDIUM);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setSingleLine(true);
+        cancelBtn.setEllipsize(TextUtils.TruncateAt.END);
+        cancelBtn.setMinHeight(dp(44));
+        cancelBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        cancelBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 20f));
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+
+        TextView saveBtn = createText(getString(R.string.btn_save_quick_slots), btnSp, palette.onPrimary, FONT_MEDIUM);
+        saveBtn.setGravity(Gravity.CENTER);
+        saveBtn.setSingleLine(true);
+        saveBtn.setEllipsize(TextUtils.TruncateAt.END);
+        saveBtn.setMinHeight(dp(44));
+        saveBtn.setPadding(compact ? dp(14) : dp(18), dp(8), compact ? dp(14) : dp(18), dp(8));
+        saveBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 20f));
+        saveBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            try {
+                prefs.edit()
+                        .putInt(ModuleConfig.KEY_IME_DPI_SCALE_PERCENT, scaleState[0])
+                        .putInt(ModuleConfig.KEY_IME_MAX_HEIGHT_PERCENT, heightState[0])
+                        .putInt(ModuleConfig.KEY_IME_TOP_INSET_PX, insetState[0])
+                        .apply();
+                refreshImeTuningSummaries();
+                show(getString(R.string.msg_ime_tuning_saved));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        });
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(10), 0, 0);
+            LinearLayout topBtnRow = new LinearLayout(this);
+            topBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams resetLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            resetLp.rightMargin = dp(6);
+            topBtnRow.addView(resetBtn, resetLp);
+            topBtnRow.addView(cancelBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            footerCol.addView(topBtnRow);
+            LinearLayout.LayoutParams saveFullLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveFullLp.topMargin = dp(6);
+            footerCol.addView(saveBtn, saveFullLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+            bottomRow.setPadding(0, dp(12), 0, 0);
+            bottomRow.addView(resetBtn);
+            bottomRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            bottomRow.addView(cancelBtn);
+            LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveLp.leftMargin = dp(4);
+            bottomRow.addView(saveBtn, saveLp);
+            sheet.addView(bottomRow);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        configureCoverSafePickerWindow(dialog, true);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, true);
+    }
+
+    private void showPerAppRulesManagerDialog() {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        int safeHeight = currentSafeWindowFrame().safeRect().height();
+        boolean compactHeight = safeHeight < dp(420);
+        boolean ultraCompactHeight = safeHeight < dp(320);
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        int sheetPadH = compact ? dp(8) : dp(20);
+        int sheetPadV = dp(ultraCompactHeight ? 6 : (compactHeight ? 10 : 16));
+        sheet.setPadding(sheetPadH, sheetPadV, sheetPadH, sheetPadV);
+        sheet.setBackground(rounded(palette.surfaceContainerLow, ultraCompactHeight ? 22f : 28f));
+
+        TextView titleView = createText(getString(R.string.picker_rules_title),
+                ultraCompactHeight ? 15f : (compact ? 18f : 20f), palette.onSurface, FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        sheet.addView(titleView);
+        TextView subView = createText(getString(R.string.picker_rules_sub),
+                ultraCompactHeight ? 10.5f : 12f, palette.onSurfaceVariant, FONT_REGULAR);
+        if (ultraCompactHeight) {
+            subView.setSingleLine(true);
+            subView.setEllipsize(TextUtils.TruncateAt.END);
+            subView.setPadding(0, dp(1), 0, dp(3));
+        } else {
+            subView.setPadding(0, dp(3), 0, dp(6));
+        }
+        sheet.addView(subView);
+
+        final List<AppEntry> allApps = new ArrayList<>();
+        final List<AppEntry> filteredApps = new ArrayList<>();
+        final Set<String> uninstalledRulePkgs = new LinkedHashSet<>();
+        final Runnable[] refilterRef = new Runnable[1];
+
+        final PruneBannerHolder[] pruneBannerRef = new PruneBannerHolder[1];
+        pruneBannerRef[0] = createUninstalledPruneBanner(compact, ultraCompactHeight, () -> {
+            if (uninstalledRulePkgs.isEmpty()) return;
+            try {
+                Map<String, ModuleConfig.PerAppRule> next = new LinkedHashMap<>(ModuleConfig.perAppRules());
+                int removed = 0;
+                for (String missing : new ArrayList<>(uninstalledRulePkgs)) {
+                    if (next.remove(missing) != null) removed++;
+                }
+                String json = ModuleConfig.serializePerAppRulesJson(next, false);
+                prefs.edit().putString(ModuleConfig.KEY_PER_APP_RULES, json).apply();
+                allApps.removeIf(e -> e.uninstalled);
+                uninstalledRulePkgs.clear();
+                pruneBannerRef[0].update(this, 0);
+                refreshPerAppRulesSummaries();
+                if (refilterRef[0] != null) refilterRef[0].run();
+                if (removed > 0) show(getString(R.string.msg_uninstalled_pruned, removed));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        });
+        LinearLayout.LayoutParams pruneLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pruneLp.bottomMargin = dp(ultraCompactHeight ? 3 : 6);
+        sheet.addView(pruneBannerRef[0].container(), pruneLp);
+
+        LinearLayout searchBox = new LinearLayout(this);
+        searchBox.setOrientation(LinearLayout.HORIZONTAL);
+        searchBox.setGravity(Gravity.CENTER_VERTICAL);
+        searchBox.setPadding(dp(12), dp(2), dp(12), dp(2));
+        searchBox.setBackground(rounded(palette.surfaceContainerHigh, 20f));
+        EditText searchInput = new EditText(this);
+        searchInput.setHint(R.string.picker_search_hint);
+        searchInput.setHintTextColor(palette.onSurfaceVariant);
+        searchInput.setTextColor(palette.onSurface);
+        searchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        searchInput.setSingleLine(true);
+        searchInput.setBackground(null);
+        searchInput.setMinHeight(dp(40));
+        searchBox.addView(searchInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        searchLp.bottomMargin = dp(4);
+        sheet.addView(searchBox, searchLp);
+
+        final int[] activeFilter = {ModuleConfig.perAppRules().isEmpty() ? 1 : 0};
+        int[] filterRes = {R.string.filter_has_rules, R.string.filter_third, R.string.filter_system, R.string.filter_all};
+        final List<TextView> chipViews = new ArrayList<>();
+
+        BaseAdapter ruleAdapter = new BaseAdapter() {
+            @Override public int getCount() { return filteredApps.size(); }
+            @Override public AppEntry getItem(int pos) { return filteredApps.get(pos); }
+            @Override public long getItemId(int pos) { return pos; }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                AppRowHolder holder;
+                if (convertView != null && convertView.getTag() instanceof AppRowHolder h) {
+                    holder = h;
+                } else {
+                    holder = new AppRowHolder(false);
+                }
+                AppEntry entry = filteredApps.get(position);
+                holder.bind(entry, position, filteredApps.size(), false);
+                ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(entry.packageName);
+                if (rule != null && !rule.isDefault()) {
+                    holder.tag.setText(formatPerAppRuleSummary(rule));
+                    holder.tag.setVisibility(View.VISIBLE);
+                } else {
+                    holder.tag.setVisibility(View.GONE);
+                }
+                holder.syncBadgeRow();
+                return holder.row;
+            }
+        };
+
+        HorizontalScrollView chipScroll = new HorizontalScrollView(this);
+        chipScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout chipRow = new LinearLayout(this);
+        chipRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < filterRes.length; i++) {
+            final int idx = i;
+            TextView chip = createChip(getString(filterRes[i]), palette.onSurfaceVariant, ultraCompactHeight);
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clp.rightMargin = dp(6);
+            chip.setOnClickListener(v -> {
+                activeFilter[0] = idx;
+                if (refilterRef[0] != null) refilterRef[0].run();
+            });
+            chipViews.add(chip);
+            chipRow.addView(chip, clp);
+        }
+        chipScroll.addView(chipRow);
+        LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chipLp.bottomMargin = dp(4);
+        sheet.addView(chipScroll, chipLp);
+
+        FrameLayout listFrame = new FrameLayout(this);
+        ListView listView = new ListView(this);
+        listView.setVerticalScrollBarEnabled(false);
+        listView.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        listView.setDividerHeight(dp(2));
+        listView.setSelector(new ColorDrawable(Color.TRANSPARENT));
+        listView.setAdapter(ruleAdapter);
+        TextView emptyView = createText(getString(R.string.picker_loading), 13.5f, palette.onSurfaceVariant, FONT_REGULAR);
+        emptyView.setGravity(Gravity.CENTER);
+        listFrame.addView(listView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listFrame.addView(emptyView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        listView.setEmptyView(emptyView);
+        sheet.addView(listFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        refilterRef[0] = () -> {
+            for (int i = 0; i < chipViews.size(); i++) {
+                boolean sel = (i == activeFilter[0]);
+                chipViews.get(i).setBackground(chipBackground(sel, ultraCompactHeight));
+                chipViews.get(i).setTextColor(sel ? palette.onSecondaryContainer : palette.onSurfaceVariant);
+            }
+            Map<String, ModuleConfig.PerAppRule> rulesMap = ModuleConfig.perAppRules();
+            uninstalledRulePkgs.removeIf(pkg -> !rulesMap.containsKey(pkg));
+            pruneBannerRef[0].update(this, uninstalledRulePkgs.size());
+            String q = searchInput.getText() == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
+            filteredApps.clear();
+            for (AppEntry app : allApps) {
+                boolean hasRule = rulesMap.containsKey(app.packageName);
+                boolean match = switch (activeFilter[0]) {
+                    case 0 -> hasRule;
+                    case 1 -> !app.systemApp;
+                    case 2 -> app.systemApp;
+                    default -> true;
+                };
+                if (!match) continue;
+                if (!q.isEmpty() && !app.labelLower.contains(q) && !app.packageName.toLowerCase(Locale.ROOT).contains(q)) {
+                    continue;
+                }
+                filteredApps.add(app);
+            }
+            filteredApps.sort(Comparator
+                    .comparing((AppEntry a) -> !rulesMap.containsKey(a.packageName))
+                    .thenComparing(a -> a.systemApp)
+                    .thenComparing(a -> a.label, String.CASE_INSENSITIVE_ORDER));
+            ruleAdapter.notifyDataSetChanged();
+        };
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= filteredApps.size()) return;
+            AppEntry app = filteredApps.get(position);
+            showSingleAppRuleDialog(app.packageName, app.label, () -> {
+                refreshPerAppRulesSummaries();
+                if (refilterRef[0] != null) refilterRef[0].run();
+            });
+        });
+
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable s) {
+                mainHandler.removeCallbacks(refilterRef[0]);
+                mainHandler.postDelayed(refilterRef[0], 120);
+            }
+        });
+
+        int btnMinH = dp(ultraCompactHeight ? 36 : 44);
+        float btnSp = compact ? 12.5f : 13.5f;
+        TextView jsonBtn = createText(getString(R.string.row_rules_json_title), btnSp, palette.onSecondaryContainer, FONT_MEDIUM);
+        jsonBtn.setGravity(Gravity.CENTER);
+        jsonBtn.setSingleLine(true);
+        jsonBtn.setEllipsize(TextUtils.TruncateAt.END);
+        jsonBtn.setMinHeight(btnMinH);
+        jsonBtn.setPadding(dp(12), dp(8), dp(12), dp(8));
+        jsonBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 20f));
+        jsonBtn.setOnClickListener(v -> showPerAppRulesJsonDialog(() -> {
+            refreshPerAppRulesSummaries();
+            if (refilterRef[0] != null) refilterRef[0].run();
+        }));
+
+        TextView closeBtn = createText(getString(R.string.btn_close), btnSp, palette.primary, FONT_MEDIUM);
+        closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setSingleLine(true);
+        closeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        closeBtn.setMinHeight(btnMinH);
+        closeBtn.setPadding(dp(16), dp(8), dp(16), dp(8));
+        closeBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 20f));
+        closeBtn.setOnClickListener(v -> dialog.dismiss());
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(ultraCompactHeight ? 4 : 8), 0, 0);
+            footerCol.addView(jsonBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            LinearLayout.LayoutParams clsLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clsLp.topMargin = dp(4);
+            footerCol.addView(closeBtn, clsLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout footer = new LinearLayout(this);
+            footer.setOrientation(LinearLayout.HORIZONTAL);
+            footer.setGravity(Gravity.CENTER_VERTICAL);
+            footer.setPadding(0, dp(ultraCompactHeight ? 4 : 8), 0, 0);
+            footer.addView(jsonBtn);
+            footer.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            footer.addView(closeBtn);
+            sheet.addView(footer);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        dialog.setOnDismissListener(d -> mainHandler.removeCallbacks(refilterRef[0]));
+        configureCoverSafePickerWindow(dialog, false);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, false);
+
+        PackageManager pm = getPackageManager();
+        IO.execute(() -> {
+            List<AppEntry> entries = new ArrayList<>();
+            List<String> missingRulePkgs = new ArrayList<>();
+            try {
+                LinkedHashSet<String> seen = new LinkedHashSet<>();
+                for (AppEntry e : loadLaunchableAppsForWidget(pm, List.of())) {
+                    if (ModuleConfig.isValidRuleTargetPackage(e.packageName) && seen.add(e.packageName)) {
+                        entries.add(e);
+                        appLabelCache.put(e.packageName, e.label);
+                    }
+                }
+                Set<String> configuredRulePkgs = new LinkedHashSet<>(ModuleConfig.perAppRules().keySet());
+                LinkedHashSet<String> extraPkgs = new LinkedHashSet<>(DEEP_COMPAT_ORDER);
+                extraPkgs.addAll(configuredRulePkgs);
+                for (String pkg : extraPkgs) {
+                    if (!ModuleConfig.isValidRuleTargetPackage(pkg) || !seen.add(pkg)) continue;
+                    try {
+                        ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        String label = resolvePackageLabel(pm, pkg);
+                        appLabelCache.put(pkg, label);
+                        entries.add(new AppEntry(label, pkg, isSystemApp(ai), false, null));
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                        if (configuredRulePkgs.contains(pkg)) {
+                            missingRulePkgs.add(pkg);
+                            entries.add(0, new AppEntry(pkg, pkg, false, false, "", null, 0, true));
+                        }
+                    }
+                }
+            } catch (RuntimeException ignored) {
+            }
+            mainHandler.post(() -> {
+                if (isDestroyed() || !dialog.isShowing()) return;
+                allApps.addAll(entries);
+                uninstalledRulePkgs.clear();
+                uninstalledRulePkgs.addAll(missingRulePkgs);
+                pruneBannerRef[0].update(this, uninstalledRulePkgs.size());
+                emptyView.setText(R.string.picker_empty);
+                refilterRef[0].run();
+            });
+        });
+    }
+
+    private Display findOuterDisplay() {
+        try {
+            Display current = getDisplay();
+            if (CoverDisplay.isOuterDisplay(current)) return current;
+            DisplayManager dm = getSystemService(DisplayManager.class);
+            if (dm != null) {
+                for (Display d : dm.getDisplays()) {
+                    if (CoverDisplay.isOuterDisplay(d) && d.getState() != Display.STATE_OFF) {
+                        return d;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void launchPackageForCoverTest(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return;
+        try {
+            Intent launch = getPackageManager().getLaunchIntentForPackage(pkg);
+            if (launch == null) {
+                show(getString(R.string.msg_launch_app_failed));
+                return;
+            }
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Display outer = findOuterDisplay();
+            if (outer != null) {
+                try {
+                    ActivityOptions opts = ActivityOptions.makeBasic();
+                    opts.setLaunchDisplayId(outer.getDisplayId());
+                    startActivity(launch, opts.toBundle());
+                    return;
+                } catch (RuntimeException ignored) {
+                }
+            }
+            startActivity(launch);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "launchPackageForCoverTest failed for " + pkg, e);
+            show(getString(R.string.msg_launch_app_failed));
+        }
+    }
+
+    private void showSingleAppRuleDialog(String pkg, String appLabel, Runnable onUpdated) {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        ModuleConfig.PerAppRule existing = ModuleConfig.perAppRule(pkg);
+        final int[] gapState = {existing != null ? existing.topGapPx() : ModuleConfig.TOP_GAP_DEFAULT};
+        final int[] widthState = {existing != null ? existing.widthMode() : ModuleConfig.WIDTH_MODE_DEFAULT};
+        final int[] scaleState = {existing != null ? existing.scalePercent() : ModuleConfig.SCALE_DEFAULT};
+
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setPadding(dp(compact ? 12 : 20), dp(14), dp(compact ? 12 : 20), dp(14));
+        sheet.setBackground(rounded(palette.surfaceContainerLow, 26f));
+
+        TextView titleView = createText(getString(R.string.rule_editor_title, appLabel),
+                compact ? 17f : 19f, palette.onSurface, FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        titleView.setSingleLine(true);
+        titleView.setEllipsize(TextUtils.TruncateAt.END);
+        sheet.addView(titleView);
+        TextView pkgView = createText(pkg, 11.5f, palette.onSurfaceVariant, FONT_MONO);
+        pkgView.setPadding(0, dp(2), 0, dp(8));
+        sheet.addView(pkgView);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(body);
+        sheet.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        final int[] gapOptions = {-1, 0, 30, 60, 114};
+        final int[] gapLabelRes = {
+                R.string.rule_top_gap_default, R.string.rule_top_gap_zero,
+                R.string.rule_top_gap_30, R.string.rule_top_gap_60, R.string.rule_top_gap_114
+        };
+        final int[] widthOptions = {
+                ModuleConfig.WIDTH_MODE_DEFAULT, ModuleConfig.WIDTH_MODE_SAFE_COLUMN, ModuleConfig.WIDTH_MODE_FULL
+        };
+        final int[] widthLabelRes = {
+                R.string.rule_width_default, R.string.rule_width_column, R.string.rule_width_full
+        };
+        final int[] scaleOptions = {0, 70, 75, 80, 90, 100, 110};
+        final Runnable[] refreshUi = new Runnable[1];
+
+        java.util.function.BiConsumer<String, LinearLayout> addLabel = (txt, parent) -> {
+            TextView lbl = createText(txt, 13f, palette.primary, FONT_MEDIUM);
+            lbl.setPadding(dp(2), dp(8), dp(2), dp(4));
+            parent.addView(lbl);
+        };
+
+        addLabel.accept(getString(R.string.rule_top_gap_label), body);
+        HorizontalScrollView gapScroll = new HorizontalScrollView(this);
+        gapScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout gapRow = new LinearLayout(this);
+        gapScroll.addView(gapRow);
+        body.addView(gapScroll);
+
+        addLabel.accept(getString(R.string.rule_width_label), body);
+        HorizontalScrollView widthScroll = new HorizontalScrollView(this);
+        widthScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout widthRow = new LinearLayout(this);
+        widthScroll.addView(widthRow);
+        body.addView(widthScroll);
+
+        addLabel.accept(getString(R.string.rule_scale_label), body);
+        HorizontalScrollView scaleScroll = new HorizontalScrollView(this);
+        scaleScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout scaleRow = new LinearLayout(this);
+        scaleScroll.addView(scaleRow);
+        body.addView(scaleScroll);
+
+        refreshUi[0] = () -> {
+            gapRow.removeAllViews();
+            boolean presetGapMatched = false;
+            for (int i = 0; i < gapOptions.length; i++) {
+                final int val = gapOptions[i];
+                boolean sel = (val == gapState[0]);
+                if (sel) presetGapMatched = true;
+                TextView p = createChoicePill(getString(gapLabelRes[i]), sel, compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(v -> {
+                    gapState[0] = val;
+                    refreshUi[0].run();
+                });
+                gapRow.addView(p, lp);
+            }
+            String customLabel = (!presetGapMatched && gapState[0] >= 0)
+                    ? (gapState[0] + "px")
+                    : getString(R.string.rule_top_gap_custom);
+            TextView customPill = createChoicePill(customLabel, !presetGapMatched && gapState[0] >= 0, compact);
+            customPill.setOnClickListener(v -> {
+                EditText input = new EditText(this);
+                input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+                input.setHint(R.string.rule_gap_custom_hint);
+                if (gapState[0] >= 0) input.setText(String.valueOf(gapState[0]));
+                AlertDialog customDlg = trackDialog(dialogBuilder()
+                        .setTitle(R.string.rule_top_gap_label)
+                        .setView(input)
+                        .setNegativeButton(R.string.btn_cancel, null)
+                        .setPositiveButton(R.string.btn_save_rule, (d, w) -> {
+                            try {
+                                int px = Integer.parseInt(input.getText().toString().trim());
+                                gapState[0] = Math.max(ModuleConfig.MIN_TOP_GAP_PX,
+                                        Math.min(ModuleConfig.MAX_TOP_GAP_PX, px));
+                                refreshUi[0].run();
+                            } catch (NumberFormatException ignored) {
+                            }
+                        })
+                        .show());
+                configureCoverSafeDialogWindow(customDlg, false, false);
+            });
+            gapRow.addView(customPill);
+
+            widthRow.removeAllViews();
+            for (int i = 0; i < widthOptions.length; i++) {
+                final int val = widthOptions[i];
+                TextView p = createChoicePill(getString(widthLabelRes[i]), val == widthState[0], compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(v -> {
+                    widthState[0] = val;
+                    refreshUi[0].run();
+                });
+                widthRow.addView(p, lp);
+            }
+
+            scaleRow.removeAllViews();
+            for (int v : scaleOptions) {
+                String lbl = v == 0 ? getString(R.string.rule_scale_default) : getString(R.string.rule_scale_fmt, v);
+                TextView p = createChoicePill(lbl, v == scaleState[0], compact);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.rightMargin = dp(6);
+                p.setOnClickListener(view -> {
+                    scaleState[0] = v;
+                    refreshUi[0].run();
+                });
+                scaleRow.addView(p, lp);
+            }
+        };
+        refreshUi[0].run();
+
+        // "Launch on cover" test button inside scroll body
+        TextView launchTestBtn = createText(getString(R.string.btn_launch_cover_test),
+                13f, palette.onSecondaryContainer, FONT_MEDIUM);
+        launchTestBtn.setGravity(Gravity.CENTER);
+        launchTestBtn.setSingleLine(true);
+        launchTestBtn.setEllipsize(TextUtils.TruncateAt.END);
+        launchTestBtn.setMinHeight(dp(44));
+        launchTestBtn.setPadding(dp(14), dp(10), dp(14), dp(10));
+        launchTestBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 20f));
+        LinearLayout.LayoutParams launchLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        launchLp.topMargin = dp(12);
+        launchTestBtn.setOnClickListener(v -> {
+            ModuleConfig.PerAppRule rule = ModuleConfig.PerAppRule.of(gapState[0], widthState[0], scaleState[0]);
+            savePerAppRuleUpdate(pkg, rule);
+            if (onUpdated != null) onUpdated.run();
+            launchPackageForCoverTest(pkg);
+        });
+        body.addView(launchTestBtn, launchLp);
+
+        float btnSp = compact ? 12.5f : 13.5f;
+        int btnPadH = compact ? dp(10) : dp(14);
+        TextView resetBtn = createText(getString(R.string.btn_reset_default), btnSp, palette.onSurfaceVariant, FONT_MEDIUM);
+        resetBtn.setGravity(Gravity.CENTER);
+        resetBtn.setSingleLine(true);
+        resetBtn.setEllipsize(TextUtils.TruncateAt.END);
+        resetBtn.setMinHeight(dp(44));
+        resetBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        resetBtn.setBackground(pillRipple(palette.surfaceContainerHigh, palette.rippleColor, 20f));
+        resetBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            savePerAppRuleUpdate(pkg, ModuleConfig.PerAppRule.DEFAULT);
+            show(getString(R.string.msg_rule_cleared, appLabel));
+            if (onUpdated != null) onUpdated.run();
+        });
+
+        TextView cancelBtn = createText(getString(R.string.btn_cancel), btnSp, palette.primary, FONT_MEDIUM);
+        cancelBtn.setGravity(Gravity.CENTER);
+        cancelBtn.setSingleLine(true);
+        cancelBtn.setEllipsize(TextUtils.TruncateAt.END);
+        cancelBtn.setMinHeight(dp(44));
+        cancelBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        cancelBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 20f));
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+
+        TextView saveBtn = createText(getString(R.string.btn_save_rule), btnSp, palette.onPrimary, FONT_MEDIUM);
+        saveBtn.setGravity(Gravity.CENTER);
+        saveBtn.setSingleLine(true);
+        saveBtn.setEllipsize(TextUtils.TruncateAt.END);
+        saveBtn.setMinHeight(dp(44));
+        saveBtn.setPadding(compact ? dp(12) : dp(18), dp(8), compact ? dp(12) : dp(18), dp(8));
+        saveBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 20f));
+        saveBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            ModuleConfig.PerAppRule rule = ModuleConfig.PerAppRule.of(gapState[0], widthState[0], scaleState[0]);
+            savePerAppRuleUpdate(pkg, rule);
+            show(rule.isDefault()
+                    ? getString(R.string.msg_rule_cleared, appLabel)
+                    : getString(R.string.msg_rule_saved, appLabel));
+            if (onUpdated != null) onUpdated.run();
+        });
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(10), 0, 0);
+            LinearLayout topBtnRow = new LinearLayout(this);
+            topBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams rstLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            rstLp.rightMargin = dp(6);
+            topBtnRow.addView(resetBtn, rstLp);
+            topBtnRow.addView(cancelBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            footerCol.addView(topBtnRow);
+            LinearLayout.LayoutParams saveFullLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveFullLp.topMargin = dp(6);
+            footerCol.addView(saveBtn, saveFullLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+            bottomRow.setPadding(0, dp(14), 0, 0);
+            bottomRow.addView(resetBtn);
+            bottomRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            bottomRow.addView(cancelBtn);
+            LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            saveLp.leftMargin = dp(4);
+            bottomRow.addView(saveBtn, saveLp);
+            sheet.addView(bottomRow);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        configureCoverSafePickerWindow(dialog, true);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, true);
+    }
+
+    private void savePerAppRuleUpdate(String pkg, ModuleConfig.PerAppRule rule) {
+        if (prefs == null) return;
+        try {
+            Map<String, ModuleConfig.PerAppRule> next = new LinkedHashMap<>(ModuleConfig.perAppRules());
+            if (rule == null || rule.isDefault()) {
+                next.remove(pkg);
+            } else {
+                next.put(pkg, rule);
+            }
+            String json = ModuleConfig.serializePerAppRulesJson(next, false);
+            prefs.edit().putString(ModuleConfig.KEY_PER_APP_RULES, json).apply();
+            refreshPerAppRulesSummaries();
+        } catch (RuntimeException e) {
+            show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+        }
+    }
+
+    private void showPerAppRulesJsonDialog() {
+        showPerAppRulesJsonDialog(null);
+    }
+
+    private void showPerAppRulesJsonDialog(Runnable onUpdated) {
+        if (!CoverDisplay.isSupportedFirmware() || prefs == null || service == null) return;
+        boolean compact = isCompactCoverUi();
+        boolean narrowFooter = isNarrowDialogFooter();
+        Map<String, ModuleConfig.PerAppRule> currentRules = ModuleConfig.perAppRules();
+        String initialJson = ModuleConfig.serializePerAppRulesJson(currentRules, true);
+
+        Dialog dialog = trackDialog(new Dialog(this));
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setPadding(dp(compact ? 10 : 20), dp(14), dp(compact ? 10 : 20), dp(14));
+        sheet.setBackground(rounded(palette.surfaceContainerLow, 26f));
+
+        TextView titleView = createText(getString(R.string.dialog_rules_json_title),
+                compact ? 18f : 20f, palette.onSurface, FONT_BOLD);
+        titleView.setAccessibilityHeading(true);
+        sheet.addView(titleView);
+        TextView subView = createText(getString(R.string.dialog_rules_json_sub, currentRules.size()),
+                12f, palette.onSurfaceVariant, FONT_REGULAR);
+        subView.setPadding(0, dp(3), 0, dp(8));
+        sheet.addView(subView);
+
+        EditText jsonEdit = new EditText(this);
+        jsonEdit.setText(initialJson);
+        jsonEdit.setHint(R.string.dialog_rules_json_hint);
+        jsonEdit.setHintTextColor(palette.onSurfaceVariant);
+        jsonEdit.setTextColor(palette.onSurface);
+        jsonEdit.setTypeface(FONT_MONO);
+        jsonEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        jsonEdit.setGravity(Gravity.TOP | Gravity.START);
+        jsonEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        jsonEdit.setPadding(dp(12), dp(10), dp(12), dp(10));
+        jsonEdit.setBackground(rounded(palette.surfaceContainerHigh, 16f));
+        sheet.addView(jsonEdit, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout topActions = new LinearLayout(this);
+        topActions.setOrientation(LinearLayout.HORIZONTAL);
+        topActions.setPadding(0, dp(10), 0, 0);
+
+        TextView copyBtn = createText(getString(R.string.btn_copy_json), 12.5f, palette.onSecondaryContainer, FONT_MEDIUM);
+        copyBtn.setGravity(Gravity.CENTER);
+        copyBtn.setSingleLine(true);
+        copyBtn.setEllipsize(TextUtils.TruncateAt.END);
+        copyBtn.setMinHeight(dp(44));
+        copyBtn.setPadding(dp(12), dp(8), dp(12), dp(8));
+        copyBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 20f));
+        copyBtn.setOnClickListener(v -> {
+            copyToClipboard(jsonEdit.getText().toString());
+            show(getString(R.string.msg_json_copied));
+        });
+        LinearLayout.LayoutParams actLp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+        actLp.rightMargin = dp(6);
+        topActions.addView(copyBtn, actLp);
+
+        TextView shareBtn = createText(getString(R.string.btn_share_json), 12.5f, palette.onSecondaryContainer, FONT_MEDIUM);
+        shareBtn.setGravity(Gravity.CENTER);
+        shareBtn.setSingleLine(true);
+        shareBtn.setEllipsize(TextUtils.TruncateAt.END);
+        shareBtn.setMinHeight(dp(44));
+        shareBtn.setPadding(dp(12), dp(8), dp(12), dp(8));
+        shareBtn.setBackground(pillRipple(palette.secondaryContainer, palette.rippleColor, 20f));
+        shareBtn.setOnClickListener(v -> {
+            try {
+                Intent send = new Intent(Intent.ACTION_SEND)
+                        .setType("application/json")
+                        .putExtra(Intent.EXTRA_SUBJECT, "MixFlip2Cover Per-App Rules")
+                        .putExtra(Intent.EXTRA_TEXT, jsonEdit.getText().toString());
+                startActivity(Intent.createChooser(send, getString(R.string.btn_share_json)));
+            } catch (RuntimeException ignored) {
+            }
+        });
+        topActions.addView(shareBtn, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        sheet.addView(topActions);
+
+        java.util.function.Consumer<Boolean> doImport = replaceAll -> {
+            try {
+                Map<String, ModuleConfig.PerAppRule> incoming =
+                        ModuleConfig.parsePerAppRulesJsonStrict(jsonEdit.getText().toString());
+                Map<String, ModuleConfig.PerAppRule> merged =
+                        ModuleConfig.mergePerAppRules(ModuleConfig.perAppRules(), incoming, replaceAll);
+                prefs.edit()
+                        .putString(ModuleConfig.KEY_PER_APP_RULES, ModuleConfig.serializePerAppRulesJson(merged, false))
+                        .apply();
+                refreshPerAppRulesSummaries();
+                dialog.dismiss();
+                show(getString(R.string.msg_json_imported, incoming.size()));
+                if (onUpdated != null) onUpdated.run();
+            } catch (IllegalArgumentException e) {
+                show(getString(R.string.msg_json_invalid, String.valueOf(e.getMessage())));
+            } catch (RuntimeException e) {
+                show(getString(R.string.msg_save_failed, String.valueOf(e.getMessage())));
+            }
+        };
+
+        float btnSp = compact ? 12.5f : 13f;
+        int btnPadH = compact ? dp(10) : dp(14);
+        TextView closeBtn = createText(getString(R.string.btn_close), btnSp, palette.primary, FONT_MEDIUM);
+        closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setSingleLine(true);
+        closeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        closeBtn.setMinHeight(dp(44));
+        closeBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        closeBtn.setBackground(pillRipple(Color.TRANSPARENT, palette.rippleColor, 20f));
+        closeBtn.setOnClickListener(v -> dialog.dismiss());
+
+        TextView mergeBtn = createText(getString(R.string.btn_import_merge), btnSp, palette.onPrimaryContainer, FONT_MEDIUM);
+        mergeBtn.setGravity(Gravity.CENTER);
+        mergeBtn.setSingleLine(true);
+        mergeBtn.setEllipsize(TextUtils.TruncateAt.END);
+        mergeBtn.setMinHeight(dp(44));
+        mergeBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        mergeBtn.setBackground(pillRipple(palette.primaryContainer, palette.rippleColor, 20f));
+        mergeBtn.setOnClickListener(v -> doImport.accept(false));
+
+        TextView replaceBtn = createText(getString(R.string.btn_import_replace), btnSp, palette.onPrimary, FONT_MEDIUM);
+        replaceBtn.setGravity(Gravity.CENTER);
+        replaceBtn.setSingleLine(true);
+        replaceBtn.setEllipsize(TextUtils.TruncateAt.END);
+        replaceBtn.setMinHeight(dp(44));
+        replaceBtn.setPadding(btnPadH, dp(8), btnPadH, dp(8));
+        replaceBtn.setBackground(pillRipple(palette.primary, palette.rippleColor, 20f));
+        replaceBtn.setOnClickListener(v -> doImport.accept(true));
+
+        if (narrowFooter) {
+            LinearLayout footerCol = new LinearLayout(this);
+            footerCol.setOrientation(LinearLayout.VERTICAL);
+            footerCol.setPadding(0, dp(8), 0, 0);
+            LinearLayout importRow = new LinearLayout(this);
+            importRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams mLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            mLp.rightMargin = dp(6);
+            importRow.addView(mergeBtn, mLp);
+            importRow.addView(replaceBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            footerCol.addView(importRow);
+            LinearLayout.LayoutParams clsLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            clsLp.topMargin = dp(4);
+            footerCol.addView(closeBtn, clsLp);
+            sheet.addView(footerCol);
+        } else {
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+            bottomRow.setPadding(0, dp(8), 0, 0);
+            bottomRow.addView(closeBtn);
+            bottomRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            LinearLayout.LayoutParams mLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            mLp.rightMargin = dp(6);
+            bottomRow.addView(mergeBtn, mLp);
+            bottomRow.addView(replaceBtn);
+            sheet.addView(bottomRow);
+        }
+
+        dialog.setContentView(sheet, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        configureCoverSafePickerWindow(dialog, false);
+        dialog.show();
+        configureCoverSafePickerWindow(dialog, false);
     }
 
     /** Shows a message on every page; Toast is used because only the home page has a status card. */
@@ -3487,7 +6940,9 @@ public final class MainActivity extends Activity {
         private void publishState() {
             String state = stateText(checked);
             setStateDescription(state);
-            if (hostRow != null) hostRow.setStateDescription(state);
+            if (hostRow != null) {
+                hostRow.setStateDescription(getVisibility() == View.VISIBLE ? state : null);
+            }
         }
 
         /** Sets the state without animation (used when recycling list rows). */
@@ -3577,10 +7032,13 @@ public final class MainActivity extends Activity {
      */
     private final class CoverPreviewView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF rect = new RectF();
 
         CoverPreviewView(Context context) {
             super(context);
+            textPaint.setTypeface(FONT_BOLD);
+            textPaint.setTextAlign(Paint.Align.CENTER);
         }
 
         @Override
@@ -3614,26 +7072,78 @@ public final class MainActivity extends Activity {
             c.drawCircle(camX, cam1Y, camR * 0.42f, paint);
             c.drawCircle(camX, cam2Y, camR * 0.42f, paint);
 
-            // Status Orb above lenses (if panel_enabled)
+            // Status Orb above lenses (live Battery %, Dual-SIM dots & Orb interaction indicator)
             if (value(ModuleConfig.KEY_PANEL)) {
-                float orbY = h * 0.22f;
-                float orbR = dp(7.5f);
+                float orbY = h * 0.20f;
+                float orbR = dp(8.2f);
+                boolean orbInteractive = ModuleConfig.hasOrbInteraction();
+                if (orbInteractive) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(dp(1.2f));
+                    paint.setColor(palette.primary);
+                    paint.setAlpha(95);
+                    c.drawCircle(camX, orbY, orbR + dp(2.8f), paint);
+                    paint.setAlpha(255);
+                }
                 paint.setStyle(Paint.Style.STROKE);
-                paint.setStrokeWidth(dp(2.2f));
+                paint.setStrokeWidth(dp(2.0f));
                 paint.setColor(palette.primary);
                 c.drawCircle(camX, orbY, orbR, paint);
-                paint.setStyle(Paint.Style.FILL);
-                c.drawCircle(camX, orbY, dp(2f), paint);
+
+                boolean showBatt = value(ModuleConfig.KEY_BATTERY_NUMBER);
+                boolean showDual = value(ModuleConfig.KEY_DUAL_SIM);
+                if (showBatt) {
+                    textPaint.setColor(palette.primary);
+                    textPaint.setTextSize(dp(6.2f));
+                    float textY = orbY + (showDual ? dp(0.6f) : dp(2.2f));
+                    c.drawText("88", camX, textY, textPaint);
+                } else if (!showDual) {
+                    paint.setStyle(Paint.Style.FILL);
+                    c.drawCircle(camX, orbY, dp(2f), paint);
+                }
+                if (showDual) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(palette.primary);
+                    float dotR = dp(1.05f);
+                    float row1Y = showBatt ? (orbY + dp(3.4f)) : (orbY - dp(1.4f));
+                    float row2Y = showBatt ? (orbY + dp(5.8f)) : (orbY + dp(1.8f));
+                    for (int i = -1; i <= 1; i++) {
+                        float dx = camX + i * dp(2.8f);
+                        c.drawCircle(dx, row1Y, dotR, paint);
+                        c.drawCircle(dx, row2Y, dotR, paint);
+                    }
+                }
+                if (orbInteractive) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(palette.primary);
+                    c.drawCircle(camX + orbR * 0.88f, orbY - orbR * 0.88f, dp(1.8f), paint);
+                }
             }
 
-            // Square Live Island card between Status Orb and Lenses (if live_island)
-            if (value(ModuleConfig.KEY_LIVE_ISLAND)) {
-                float boxHalf = dp(7.5f);
+            // Square Quick Actions 2x2 card or Live Island card between Status Orb and Lenses
+            boolean quickEnabled = value(ModuleConfig.KEY_QUICK_WIDGET_ENABLED);
+            boolean islandEnabled = value(ModuleConfig.KEY_LIVE_ISLAND);
+            if (quickEnabled || islandEnabled) {
+                float boxHalf = dp(8.2f);
                 float boxY = h * 0.40f;
                 rect.set(camX - boxHalf, boxY - boxHalf, camX + boxHalf, boxY + boxHalf);
                 paint.setStyle(Paint.Style.FILL);
                 paint.setColor(palette.secondaryContainer);
-                c.drawRoundRect(rect, dp(4), dp(4), paint);
+                c.drawRoundRect(rect, dp(4.5f), dp(4.5f), paint);
+                if (quickEnabled) {
+                    paint.setColor(palette.primary);
+                    float cellHalf = dp(2.4f);
+                    float off = dp(3.3f);
+                    float cr = dp(1.4f);
+                    c.drawRoundRect(camX - off - cellHalf, boxY - off - cellHalf,
+                            camX - off + cellHalf, boxY - off + cellHalf, cr, cr, paint);
+                    c.drawRoundRect(camX + off - cellHalf, boxY - off - cellHalf,
+                            camX + off + cellHalf, boxY - off + cellHalf, cr, cr, paint);
+                    c.drawRoundRect(camX - off - cellHalf, boxY + off - cellHalf,
+                            camX - off + cellHalf, boxY + off + cellHalf, cr, cr, paint);
+                    c.drawRoundRect(camX + off - cellHalf, boxY + off - cellHalf,
+                            camX + off + cellHalf, boxY + off + cellHalf, cr, cr, paint);
+                }
             }
 
             // Left-side 5-row app grid preview
@@ -3683,6 +7193,7 @@ public final class MainActivity extends Activity {
         static final int LINK = 17;
         static final int LOG = 18;
         static final int LICENSE = 19;
+        static final int QUICK_GRID = 20;
     }
 
     private final class GlyphView extends View {
@@ -3866,6 +7377,19 @@ public final class MainActivity extends Activity {
                     c.drawLine(9f, 8f, 15f, 8f, paint);
                     c.drawLine(9f, 12f, 15f, 12f, paint);
                     c.drawLine(9f, 16f, glyph == Glyph.LOG ? 13f : 15f, 16f, paint);
+                }
+                case Glyph.QUICK_GRID -> {
+                    rect.set(3.2f, 3.2f, 20.8f, 20.8f);
+                    c.drawRoundRect(rect, 4.4f, 4.4f, paint);
+                    paint.setStrokeWidth(1.9f);
+                    rect.set(6.2f, 6.2f, 10.8f, 10.8f);
+                    c.drawRoundRect(rect, 1.5f, 1.5f, paint);
+                    rect.set(13.2f, 6.2f, 17.8f, 10.8f);
+                    c.drawRoundRect(rect, 1.5f, 1.5f, paint);
+                    rect.set(6.2f, 13.2f, 10.8f, 17.8f);
+                    c.drawRoundRect(rect, 1.5f, 1.5f, paint);
+                    rect.set(13.2f, 13.2f, 17.8f, 17.8f);
+                    c.drawRoundRect(rect, 1.5f, 1.5f, paint);
                 }
                 default -> {
                     c.drawCircle(12, 12, 8f, paint);

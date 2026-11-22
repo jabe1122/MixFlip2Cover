@@ -7,6 +7,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.SparseArray;
 import android.view.Display;
 import android.view.MotionEvent;
 import android.view.View;
@@ -18,6 +19,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
 
@@ -51,12 +55,16 @@ final class SystemBarMask {
         }
     }
 
-    static final WeakHashMap<View, Bar> bars = new WeakHashMap<>();
+    static final Map<View, Bar> bars = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<View, Region> savedPhoneTouchableRegions = Collections.synchronizedMap(new WeakHashMap<>());
     static final ThreadLocal<Boolean> ownChange = new ThreadLocal<>();
     static boolean observing;
 
     private static Class<?> phoneStatusBarViewClass;
     private static Field phoneStatusBarTouchableRegionField;
+    private static Field viewListenerInfoField;
+    private static Field listenerInfoOnTouchField;
+    private static boolean touchListenerReflectionResolved;
     private static Class<?> listenerInterface;
     private static Class<?> infoClass;
     private static Method addInsetsListener;
@@ -135,8 +143,14 @@ final class SystemBarMask {
         }
     }
 
+    private static List<Map.Entry<View, Bar>> barsSnapshot() {
+        synchronized (bars) {
+            return new ArrayList<>(bars.entrySet());
+        }
+    }
+
     static boolean anyOuterBar() {
-        for (var entry : bars.entrySet()) {
+        for (var entry : barsSnapshot()) {
             View v = entry.getKey();
             Bar b = entry.getValue();
             if (v != null && b != null && v.isAttachedToWindow() && outer(v, b)) return true;
@@ -180,6 +194,11 @@ final class SystemBarMask {
         try {
             Object r = phoneStatusBarTouchableRegionField.get(phoneView);
             if (r instanceof Region region) {
+                synchronized (savedPhoneTouchableRegions) {
+                    if (!savedPhoneTouchableRegions.containsKey(phoneView)) {
+                        savedPhoneTouchableRegions.put(phoneView, new Region(region));
+                    }
+                }
                 region.set(
                         -CoverDisplay.WIDTH,
                         -CoverDisplay.HEIGHT,
@@ -190,18 +209,62 @@ final class SystemBarMask {
         }
     }
 
+    private static void restorePhoneStatusBarTouchableRegion(View phoneView) {
+        if (phoneView == null || phoneStatusBarTouchableRegionField == null) return;
+        Region saved = savedPhoneTouchableRegions.remove(phoneView);
+        if (saved == null) return;
+        try {
+            Object r = phoneStatusBarTouchableRegionField.get(phoneView);
+            if (r instanceof Region region) {
+                region.set(saved);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static View.OnTouchListener getCurrentTouchListener(View v) {
+        if (v == null) return null;
+        if (!touchListenerReflectionResolved) {
+            touchListenerReflectionResolved = true;
+            try {
+                Field liField = View.class.getDeclaredField("mListenerInfo");
+                liField.setAccessible(true);
+                Class<?> liClass = Class.forName("android.view.View$ListenerInfo");
+                Field touchField = liClass.getDeclaredField("mOnTouchListener");
+                touchField.setAccessible(true);
+                viewListenerInfoField = liField;
+                listenerInfoOnTouchField = touchField;
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            if (viewListenerInfoField != null && listenerInfoOnTouchField != null) {
+                Object li = viewListenerInfoField.get(v);
+                if (li != null && listenerInfoOnTouchField.get(li) instanceof View.OnTouchListener l) {
+                    return l;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private static void attachCutoutTouchForwarder(View v, Bar b) {
         if (v == null || b == null || b.touchForwarderAttached) return;
         b.touchForwarderAttached = true;
+        final View.OnTouchListener previous = getCurrentTouchListener(v);
         v.setOnTouchListener((view, event) -> {
             Bar cur = bars.get(view);
-            if (event == null || !ModuleConfig.frameworkFullscreen() || !outer(view, cur)) {
-                return false;
+            if (event != null && ModuleConfig.frameworkFullscreen() && outer(view, cur)) {
+                View phoneView = findPhoneStatusBarView(view, cur);
+                if (phoneView != null) {
+                    expandPhoneStatusBarTouchableRegion(phoneView);
+                    if (phoneView.onTouchEvent(event)) {
+                        return true;
+                    }
+                }
             }
-            View phoneView = findPhoneStatusBarView(view, cur);
-            if (phoneView == null) return false;
-            expandPhoneStatusBarTouchableRegion(phoneView);
-            return phoneView.onTouchEvent(event);
+            return previous != null && previous.onTouch(view, event);
         });
     }
 
@@ -376,6 +439,10 @@ final class SystemBarMask {
             b.lastMasked = masked;
             b.lastHidePanel = hidePanel;
             b.lastRotation = rotation;
+            if (!masked) {
+                View phoneView = findPhoneStatusBarView(v, b);
+                if (phoneView != null) restorePhoneStatusBarTouchableRegion(phoneView);
+            }
             attachCutoutTouchForwarder(v, b);
             attachInsetsComputer(v, b);
             syncVriTouchableRegion(v, b, masked);
@@ -385,7 +452,11 @@ final class SystemBarMask {
     }
 
     static void refresh() {
-        for (View v : new ArrayList<>(bars.keySet())) {
+        List<View> keys;
+        synchronized (bars) {
+            keys = new ArrayList<>(bars.keySet());
+        }
+        for (View v : keys) {
             if (v != null) apply(v);
         }
     }
@@ -443,11 +514,14 @@ final class SystemBarMask {
                 phoneStatusBarTouchableRegionField.setAccessible(true);
                 Method onTouchEvent = phoneStatusBarViewClass.getDeclaredMethod("onTouchEvent", MotionEvent.class);
                 module.hook(onTouchEvent).intercept(chain -> {
-                    if (ModuleConfig.frameworkFullscreen() && chain.getThisObject() instanceof View phoneView) {
-                        if (outer(phoneView, null)
-                                || anyOuterBar()
-                                || Boolean.TRUE.equals(CoverGeometry.defaultDisplayOuter())) {
+                    if (chain.getThisObject() instanceof View phoneView) {
+                        if (ModuleConfig.frameworkFullscreen()
+                                && (outer(phoneView, null)
+                                        || anyOuterBar()
+                                        || Boolean.TRUE.equals(CoverGeometry.defaultDisplayOuter()))) {
                             expandPhoneStatusBarTouchableRegion(phoneView);
+                        } else {
+                            restorePhoneStatusBarTouchableRegion(phoneView);
                         }
                     }
                     return chain.proceed();
@@ -486,7 +560,7 @@ final class SystemBarMask {
                     if (!bars.isEmpty() && !Boolean.TRUE.equals(ownRegionChange.get())) {
                         Object win = chain.getArg(0);
                         if (win != null) {
-                            for (var entry : bars.entrySet()) {
+                            for (var entry : barsSnapshot()) {
                                 View v = entry.getKey();
                                 Bar b = entry.getValue();
                                 if (v != null && b != null && win == getIWindow(v)) {
@@ -516,7 +590,7 @@ final class SystemBarMask {
                     if (!bars.isEmpty() && !Boolean.TRUE.equals(ownRegionChange.get())) {
                         Object win = chain.getArg(0);
                         if (win != null) {
-                            for (var entry : bars.entrySet()) {
+                            for (var entry : barsSnapshot()) {
                                 View v = entry.getKey();
                                 Bar b = entry.getValue();
                                 if (v != null && b != null && win == getIWindow(v)) {
@@ -553,7 +627,7 @@ final class SystemBarMask {
                 module.hook(vriSetTouchableRegion).intercept(chain -> {
                     if (!bars.isEmpty() && !Boolean.TRUE.equals(ownRegionChange.get())) {
                         Object vri = chain.getThisObject();
-                        for (var entry : bars.entrySet()) {
+                        for (var entry : barsSnapshot()) {
                             View v = entry.getKey();
                             Bar b = entry.getValue();
                             if (v != null && b != null && vri == getViewRootImpl.invoke(v)) {
@@ -583,7 +657,7 @@ final class SystemBarMask {
                     if (!bars.isEmpty() && chain.getThisObject() instanceof ViewTreeObserver vto) {
                         Object info = chain.getArg(0);
                         if (info != null) {
-                            for (var entry : bars.entrySet()) {
+                            for (var entry : barsSnapshot()) {
                                 View v = entry.getKey();
                                 Bar b = entry.getValue();
                                 if (v != null && b != null && v.getViewTreeObserver() == vto) {
@@ -627,12 +701,31 @@ final class SystemBarMask {
         ModuleConfig.addListener(SystemBarMask::refresh);
         DisplayManager dm = c.getSystemService(DisplayManager.class);
         if (dm != null) {
+            SparseArray<String> displayKeys = new SparseArray<>();
             dm.registerDisplayListener(new DisplayManager.DisplayListener() {
-                @Override public void onDisplayAdded(int id) { refresh(); }
-                @Override public void onDisplayChanged(int id) { refresh(); }
-                @Override public void onDisplayRemoved(int id) { refresh(); }
+                @Override public void onDisplayAdded(int id) { displayKeys.remove(id); refresh(); }
+                @Override public void onDisplayRemoved(int id) { displayKeys.remove(id); refresh(); }
+                @Override public void onDisplayChanged(int id) {
+                    String key = displayStateKey(dm, id);
+                    if (key != null && key.equals(displayKeys.get(id))) return;
+                    if (key != null) displayKeys.put(id, key);
+                    refresh();
+                }
             }, new Handler(Looper.getMainLooper()));
         }
         refresh();
+    }
+
+    private static String displayStateKey(DisplayManager dm, int id) {
+        try {
+            Display d = dm.getDisplay(id);
+            if (d == null) return id + ":null";
+            Display.Mode m = d.getMode();
+            int w = m != null ? m.getPhysicalWidth() : 0;
+            int h = m != null ? m.getPhysicalHeight() : 0;
+            return id + ":" + d.getState() + ":" + w + "x" + h + ":" + d.getRotation();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 }

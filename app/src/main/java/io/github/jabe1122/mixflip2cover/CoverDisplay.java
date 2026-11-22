@@ -197,6 +197,12 @@ final class CoverDisplay {
         return rotation == Surface.ROTATION_180 ? WIDTH - CAMERA_LEFT : 0;
     }
 
+    /** Customizable candidate-bar left inset (px) in ROTATION_180; negative uses the 398 px camera width. */
+    static int coverImeCandidateLeftInset(int rotation, int customInsetPx) {
+        if (rotation != Surface.ROTATION_180) return 0;
+        return customInsetPx >= 0 ? ModuleConfig.clampImeTopInsetPx(customInsetPx) : (WIDTH - CAMERA_LEFT);
+    }
+
     /**
      * Maximum vertical height the bottom-anchored keyboard may occupy on the cover screen:
      * - ROTATION_180: 730 px (top at y = 662, matching native SogouIME; the top 144 px candidate bar avoids the
@@ -213,13 +219,43 @@ final class CoverDisplay {
         };
     }
 
+    /** Scaled maximum keyboard height (px) for the cover screen based on user height percentage (75..115). */
+    static int coverImeMaxHeight(int rotation, int heightPercent) {
+        int pct = ModuleConfig.clampImeHeightPercent(heightPercent);
+        if (pct == 100) return coverImeMaxHeight(rotation);
+        int displayH = coverImeDisplayHeight(rotation);
+        int base = switch (rotation) {
+            case Surface.ROTATION_180 -> IME_TARGET_HEIGHT_PX;
+            case Surface.ROTATION_90 -> CAMERA_LEFT;
+            case Surface.ROTATION_0 -> pct < 100 ? IME_TARGET_HEIGHT_PX : displayH;
+            default -> displayH;
+        };
+        int scaled = Math.round(base * (pct / 100f));
+        int upper = rotation == Surface.ROTATION_90 ? CAMERA_LEFT : displayH;
+        return Math.max(420, Math.min(upper, scaled));
+    }
+
     /** Minimum y-coordinate (top edge) for a full-width bottom keyboard so it never overlaps a top camera cutout. */
     static int coverImeMinTop(int rotation) {
         return coverImeDisplayHeight(rotation) - coverImeMaxHeight(rotation);
     }
 
+    /** Scaled minimum y-coordinate (top edge) for the cover keyboard. */
+    static int coverImeMinTop(int rotation, int heightPercent) {
+        return Math.max(0, coverImeDisplayHeight(rotation) - coverImeMaxHeight(rotation, heightPercent));
+    }
+
     static int coverImeDensityDpi(int rotation) {
-        return rotation == Surface.ROTATION_0 ? IME_DENSITY_DPI_ROT0 : IME_DENSITY_DPI_WIDE;
+        return (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_270)
+                ? IME_DENSITY_DPI_ROT0
+                : IME_DENSITY_DPI_WIDE;
+    }
+
+    /** Scaled cover IME density DPI (75%..125% of the baseline cover IME density). */
+    static int coverImeDensityDpi(int rotation, int scalePercent) {
+        int pct = ModuleConfig.clampImeDpiScale(scalePercent);
+        if (pct == 100) return coverImeDensityDpi(rotation);
+        return Math.max(220, Math.min(600, Math.round(coverImeDensityDpi(rotation) * (pct / 100f))));
     }
 
     static int coverImeScreenWidthDp(int rotation) {
@@ -227,8 +263,22 @@ final class CoverDisplay {
         return Math.min(IME_MAX_SCREEN_WIDTH_DP, raw);
     }
 
+    static int coverImeScreenWidthDp(int rotation, int scalePercent) {
+        int pct = ModuleConfig.clampImeDpiScale(scalePercent);
+        if (pct == 100) return coverImeScreenWidthDp(rotation);
+        int dpi = coverImeDensityDpi(rotation, pct);
+        int raw = Math.round(coverImeWidth(rotation) * 160f / dpi);
+        return Math.max(240, Math.min(480, raw));
+    }
+
     static int coverImeScreenHeightDp(int rotation) {
         return Math.round(coverImeDisplayHeight(rotation) * 160f / coverImeDensityDpi(rotation));
+    }
+
+    static int coverImeScreenHeightDp(int rotation, int scalePercent) {
+        int pct = ModuleConfig.clampImeDpiScale(scalePercent);
+        if (pct == 100) return coverImeScreenHeightDp(rotation);
+        return Math.round(coverImeDisplayHeight(rotation) * 160f / coverImeDensityDpi(rotation, pct));
     }
 
     static android.graphics.Rect coverImeSafeBounds(int rotation) {
@@ -362,6 +412,52 @@ final class CoverDisplay {
             if (isOuterActive(d)) return d;
         }
         return null;
+    }
+
+    /**
+     * Resolves the integer scale used by {@link android.provider.Settings.System#SCREEN_BRIGHTNESS}
+     * from {@code android:integer/config_screenBrightnessSettingMaximum} (255 on HyperOS 4 {@code bixi}
+     * via {@code FrameworksResTarget_Vendor.apk}, matching {@code BrightnessSynchronizerStub}'s
+     * {@code brightnessIntToFloatForLowLevel} / {@code brightnessFloatToIntRangeForLowLevel} {@code 1..255}
+     * conversion). Do NOT read {@code config_screenBrightnessSettingMaximum_hyper} ({@code 0x010e0162},
+     * 16383 on {@code bixi}), which is the internal HAL/panel backlight scale and would clamp every
+     * {@code Settings.System.SCREEN_BRIGHTNESS} write to 100% brightness.
+     */
+    @android.annotation.SuppressLint("DiscouragedApi")
+    static int maxScreenBrightnessInt() {
+        try {
+            android.content.res.Resources sys = android.content.res.Resources.getSystem();
+            if (sys != null) {
+                int id = sys.getIdentifier("config_screenBrightnessSettingMaximum", "integer", "android");
+                if (id > 0) {
+                    int val = sys.getInteger(id);
+                    if (val > 0) {
+                        return Math.max(255, val);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 255;
+    }
+
+    /**
+     * Computes the next manual brightness integer level in the cover brightness cycle
+     * (AUTO -> LOW ~20% -> MED ~55% -> HIGH ~90% -> AUTO), or {@code -1} to switch back to
+     * {@link android.provider.Settings.System#SCREEN_BRIGHTNESS_MODE_AUTOMATIC}.
+     */
+    static int nextCoverBrightnessLevel(int currentMode, int currentVal, int maxVal) {
+        int max = Math.max(255, maxVal);
+        if (currentMode == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC) {
+            return Math.max(1, Math.round(max * 0.20f));
+        }
+        if (currentVal < Math.round(max * 0.37f)) {
+            return Math.round(max * 0.55f);
+        }
+        if (currentVal < Math.round(max * 0.72f)) {
+            return Math.round(max * 0.90f);
+        }
+        return -1;
     }
 
     /** Sends a broadcast as the calling user (used from system_server, which runs as user 0). */

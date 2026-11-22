@@ -5,6 +5,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.SparseArray;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.Surface;
@@ -136,11 +137,30 @@ final class PrivacyAnchor {
         ModuleConfig.addListener(PrivacyAnchor::refresh);
         DisplayManager dm = c.getSystemService(DisplayManager.class);
         if (dm != null) {
+            SparseArray<String> displayKeys = new SparseArray<>();
             dm.registerDisplayListener(new DisplayManager.DisplayListener() {
-                @Override public void onDisplayAdded(int id) { refresh(); }
-                @Override public void onDisplayRemoved(int id) { refresh(); }
-                @Override public void onDisplayChanged(int id) { refresh(); }
+                @Override public void onDisplayAdded(int id) { displayKeys.remove(id); refresh(); }
+                @Override public void onDisplayRemoved(int id) { displayKeys.remove(id); refresh(); }
+                @Override public void onDisplayChanged(int id) {
+                    String key = displayStateKey(dm, id);
+                    if (key != null && key.equals(displayKeys.get(id))) return;
+                    if (key != null) displayKeys.put(id, key);
+                    refresh();
+                }
             }, new Handler(Looper.getMainLooper()));
+        }
+    }
+
+    private static String displayStateKey(DisplayManager dm, int id) {
+        try {
+            Display d = dm.getDisplay(id);
+            if (d == null) return id + ":null";
+            Display.Mode m = d.getMode();
+            int w = m != null ? m.getPhysicalWidth() : 0;
+            int h = m != null ? m.getPhysicalHeight() : 0;
+            return id + ":" + d.getState() + ":" + w + "x" + h + ":" + d.getRotation();
+        } catch (RuntimeException e) {
+            return null;
         }
     }
 

@@ -4,6 +4,7 @@ import android.app.Application;
 import android.graphics.Canvas;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.util.Log;
 import android.view.View;
 import java.lang.ref.WeakReference;
@@ -58,6 +59,11 @@ public final class SystemUiEntry extends XposedModule {
             return;
         }
         if (!CoverGeometry.SYSTEMUI.equals(pkg) && !AppCompatibility.supports(pkg)) return;
+        // SystemUI and FlipHome run duplicate processes for Dual Apps (u999); restrict core hooks to primary user 0.
+        if ((CoverGeometry.SYSTEMUI.equals(pkg) || CoverGeometry.FLIPHOME.equals(pkg))
+                && (Process.myUid() / 100000) != 0) {
+            return;
+        }
 
         try {
             ModuleConfig.init(this);
@@ -82,32 +88,66 @@ public final class SystemUiEntry extends XposedModule {
         if (CoverGeometry.FLIPHOME.equals(pkg)) {
             ClassLoader loader = param.getClassLoader();
             try {
+                Class<?> flipAppClass = loader.loadClass("com.miui.fliphome.FlipApplication");
+                Method flipOnCreate = flipAppClass.getDeclaredMethod("onCreate");
+                hook(flipOnCreate).intercept(chain -> {
+                    Object res = chain.proceed();
+                    try {
+                        if (chain.getThisObject() instanceof Application app) {
+                            ModLog.registerLogCollector(app, CoverGeometry.FLIPHOME);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return res;
+                });
+            } catch (Throwable ignored) {
+            }
+            main.post(() -> {
+                Application app = CoverGeometry.application();
+                if (app != null) {
+                    ModLog.registerLogCollector(app, CoverGeometry.FLIPHOME);
+                }
+            });
+            int flipHomeOk = 0;
+            try {
                 CoverResourceOverlay.installCoreResourceGuard(this);
+                flipHomeOk++;
             } catch (Throwable t) {
                 Log.w(TAG, "resource guard unavailable", t);
             }
             try {
                 SquareCards.install(this, pkg);
                 WidgetAnchor.install(this, loader);
+                flipHomeOk++;
             } catch (Throwable t) {
                 Log.w(TAG, "native widget region unavailable", t);
             }
             try {
                 DesktopAlignment.install(this, loader);
+                flipHomeOk++;
             } catch (Throwable t) {
                 Log.w(TAG, "desktop layout hooks unavailable", t);
             }
             try {
                 LauncherPullDown.install(this, loader);
+                flipHomeOk++;
             } catch (Throwable t) {
                 Log.w(TAG, "launcher pull-down priority unavailable", t);
             }
             try {
+                CoverLauncherApps.install(this, loader);
+                flipHomeOk++;
+            } catch (Throwable t) {
+                Log.w(TAG, "cover launcher apps unlock unavailable", t);
+            }
+            try {
                 UnlockMotion.install(this, loader);
+                flipHomeOk++;
             } catch (Throwable t) {
                 Log.w(TAG, "unlock frame mirror unavailable", t);
             }
             installWidgetHide(param);
+            ModLog.recordHookHealth("fliphome_hooks", flipHomeOk == 6 ? "ok" : ("partial:" + flipHomeOk + "/6"));
             return;
         }
 
@@ -268,6 +308,7 @@ public final class SystemUiEntry extends XposedModule {
                     return result;
                 }));
             }
+            ModLog.recordHookHealth("systemui_hooks", "ok");
             ModLog.i(TAG, "system UI hooks ready");
         } catch (Throwable t) {
             for (HookHandle h : handles) {
@@ -276,14 +317,14 @@ public final class SystemUiEntry extends XposedModule {
                 } catch (Throwable ignored) {
                 }
             }
+            ModLog.recordHookHealth("systemui_hooks", "failed:" + t.getClass().getSimpleName());
             Log.e(TAG, "setup failed: hooks rolled back", t);
         }
     }
 
     static boolean coverNotificationDirectOpenActive() {
         return (!systemUiProcessActive || FrameworkRuntime.active())
-                && ModuleConfig.directOpenCoverNotifications()
-                && ModuleConfig.allowAllCoverApps();
+                && ModuleConfig.directOpenCoverNotifications();
     }
 
     /**
@@ -614,8 +655,13 @@ public final class SystemUiEntry extends XposedModule {
     private void onControlChanged(Object controller, boolean expanded) {
         try {
             Object actual = getExpanded.invoke(controller);
-            controlExpanded = actual instanceof Boolean && ((Boolean) actual) == expanded ? expanded : null;
-            ModLog.i(TAG, "control callback=" + expanded + ", consistent=" + (controlExpanded != null));
+            if (actual instanceof Boolean b) {
+                controlExpanded = b;
+                ModLog.i(TAG, "control callback=" + expanded + ", actual=" + b);
+            } else {
+                controlExpanded = expanded;
+                ModLog.i(TAG, "control callback=" + expanded + ", actual=non-boolean");
+            }
         } catch (Throwable t) {
             controlExpanded = null;
             Log.e(TAG, "control state unavailable", t);
@@ -630,6 +676,7 @@ public final class SystemUiEntry extends XposedModule {
             orb.setSystemPanelExpanded(true);
             return;
         }
+        orb.setSystemPanelExpanded(false);
         PanelMotion.expanded(notificationExpanded, controlExpanded);
     }
 

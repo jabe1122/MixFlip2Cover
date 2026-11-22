@@ -23,10 +23,14 @@ final class NetworkStatus {
     private final Context context;
     private final Runnable changed;
     private TelephonyManager callbackManager;
-    private DisplayCallback callback;
+    private TelephonyCallback callback;
+    private TelephonyManager secondaryManager;
+    private TelephonyCallback secondaryCallback;
     private TelephonyDisplayInfo displayInfo;
     private int callbackSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    private int secondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
     private int failedSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    private int failedSecondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
     private boolean watching;
 
     NetworkStatus(Context context, Runnable changed) {
@@ -34,7 +38,11 @@ final class NetworkStatus {
         this.changed = changed;
     }
 
-    void start() { watching = true; failedSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID; }
+    void start() {
+        watching = true;
+        failedSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+        failedSecondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    }
     void stop() { watching = false; clearCallback(); }
 
     boolean dualSimActive() {
@@ -60,6 +68,7 @@ final class NetworkStatus {
         } catch (ReflectiveOperationException | RuntimeException ignored) { }
         SubscriptionManager subscriptions = context.getSystemService(SubscriptionManager.class);
         TelephonyManager telephony = context.getSystemService(TelephonyManager.class);
+        int[] activeSubIds = {SubscriptionManager.INVALID_SUBSCRIPTION_ID, SubscriptionManager.INVALID_SUBSCRIPTION_ID};
         for (int slot = 0; slot < 2; slot++) {
             signals[slot] = -1;
             try {
@@ -74,6 +83,7 @@ final class NetworkStatus {
                 if (simState == TelephonyManager.SIM_STATE_ABSENT
                         || simState == TelephonyManager.SIM_STATE_NOT_READY
                         || simState == TelephonyManager.SIM_STATE_UNKNOWN) continue;
+                activeSubIds[slot] = sim.getSubscriptionId();
                 signals[slot] = 0;
                 TelephonyManager manager = telephony.createForSubscriptionId(sim.getSubscriptionId());
                 ServiceState service = manager.getServiceState();
@@ -99,6 +109,18 @@ final class NetworkStatus {
             }
             TelephonyManager data = telephony.createForSubscriptionId(subId);
             watchDataSubscription(data, subId);
+            int otherSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            for (int candidate : activeSubIds) {
+                if (SubscriptionManager.isValidSubscriptionId(candidate) && candidate != subId) {
+                    otherSubId = candidate;
+                    break;
+                }
+            }
+            if (SubscriptionManager.isValidSubscriptionId(otherSubId)) {
+                watchSecondarySubscription(telephony.createForSubscriptionId(otherSubId), otherSubId);
+            } else {
+                clearSecondaryCallback();
+            }
             if (airplane || !data.isDataEnabled()) return;
             ServiceState service = data.getServiceState();
             if (service != null && service.getState() != ServiceState.STATE_IN_SERVICE) return;
@@ -131,21 +153,57 @@ final class NetworkStatus {
 
     private void watchDataSubscription(TelephonyManager manager, int subId) {
         if (!watching || failedSubId == subId || (callback != null && callbackSubId == subId)) return;
-        clearCallback();
-        DisplayCallback next = new DisplayCallback();
-        callback = next;
-        callbackManager = manager;
-        callbackSubId = subId;
-        try {
-            manager.registerTelephonyCallback(context.getMainExecutor(), next);
-        } catch (RuntimeException e) {
-            failedSubId = subId;
-            android.util.Log.w("MF2C.Orb", "Network display callback unavailable; using reported network type", e);
-            clearCallback();
+        clearPrimaryCallback();
+        TelephonyCallback[] candidates = {
+                new FullRadioCallback(),
+                new SignalAndDataCallback(),
+                new DisplayOnlyCallback()
+        };
+        for (TelephonyCallback next : candidates) {
+            callback = next;
+            callbackManager = manager;
+            callbackSubId = subId;
+            try {
+                manager.registerTelephonyCallback(context.getMainExecutor(), next);
+                return;
+            } catch (SecurityException se) {
+                clearPrimaryCallback();
+            } catch (RuntimeException e) {
+                failedSubId = subId;
+                android.util.Log.w("MF2C.Orb", "Network radio callback unavailable; using periodic read", e);
+                clearPrimaryCallback();
+                return;
+            }
         }
+        failedSubId = subId;
     }
 
-    private void clearCallback() {
+    private void watchSecondarySubscription(TelephonyManager manager, int subId) {
+        if (!watching || failedSecondarySubId == subId || (secondaryCallback != null && secondarySubId == subId)) return;
+        clearSecondaryCallback();
+        TelephonyCallback[] candidates = {
+                new SecondaryRadioCallback(),
+                new SecondarySignalOnlyCallback()
+        };
+        for (TelephonyCallback next : candidates) {
+            secondaryCallback = next;
+            secondaryManager = manager;
+            secondarySubId = subId;
+            try {
+                manager.registerTelephonyCallback(context.getMainExecutor(), next);
+                return;
+            } catch (SecurityException se) {
+                clearSecondaryCallback();
+            } catch (RuntimeException e) {
+                failedSecondarySubId = subId;
+                clearSecondaryCallback();
+                return;
+            }
+        }
+        failedSecondarySubId = subId;
+    }
+
+    private void clearPrimaryCallback() {
         if (callbackManager != null && callback != null) {
             try { callbackManager.unregisterTelephonyCallback(callback); } catch (RuntimeException ignored) { }
         }
@@ -155,10 +213,97 @@ final class NetworkStatus {
         callbackSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
     }
 
-    private final class DisplayCallback extends TelephonyCallback implements TelephonyCallback.DisplayInfoListener {
+    private void clearSecondaryCallback() {
+        if (secondaryManager != null && secondaryCallback != null) {
+            try { secondaryManager.unregisterTelephonyCallback(secondaryCallback); } catch (RuntimeException ignored) { }
+        }
+        secondaryManager = null;
+        secondaryCallback = null;
+        secondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    }
+
+    private void clearCallback() {
+        clearPrimaryCallback();
+        clearSecondaryCallback();
+    }
+
+    private final class FullRadioCallback extends TelephonyCallback
+            implements TelephonyCallback.DisplayInfoListener,
+            TelephonyCallback.SignalStrengthsListener,
+            TelephonyCallback.ServiceStateListener,
+            TelephonyCallback.ActiveDataSubscriptionIdListener {
         @Override public void onDisplayInfoChanged(TelephonyDisplayInfo info) {
             if (callback != this || !watching) return;
             displayInfo = info;
+            changed.run();
+        }
+
+        @Override public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+            if (callback != this || !watching) return;
+            changed.run();
+        }
+
+        @Override public void onServiceStateChanged(ServiceState serviceState) {
+            if (callback != this || !watching) return;
+            changed.run();
+        }
+
+        @Override public void onActiveDataSubscriptionIdChanged(int subId) {
+            if (callback != this || !watching) return;
+            failedSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            failedSecondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            changed.run();
+        }
+    }
+
+    private final class SignalAndDataCallback extends TelephonyCallback
+            implements TelephonyCallback.DisplayInfoListener,
+            TelephonyCallback.SignalStrengthsListener,
+            TelephonyCallback.ActiveDataSubscriptionIdListener {
+        @Override public void onDisplayInfoChanged(TelephonyDisplayInfo info) {
+            if (callback != this || !watching) return;
+            displayInfo = info;
+            changed.run();
+        }
+
+        @Override public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+            if (callback != this || !watching) return;
+            changed.run();
+        }
+
+        @Override public void onActiveDataSubscriptionIdChanged(int subId) {
+            if (callback != this || !watching) return;
+            failedSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            failedSecondarySubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+            changed.run();
+        }
+    }
+
+    private final class DisplayOnlyCallback extends TelephonyCallback implements TelephonyCallback.DisplayInfoListener {
+        @Override public void onDisplayInfoChanged(TelephonyDisplayInfo info) {
+            if (callback != this || !watching) return;
+            displayInfo = info;
+            changed.run();
+        }
+    }
+
+    private final class SecondaryRadioCallback extends TelephonyCallback
+            implements TelephonyCallback.SignalStrengthsListener, TelephonyCallback.ServiceStateListener {
+        @Override public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+            if (secondaryCallback != this || !watching) return;
+            changed.run();
+        }
+
+        @Override public void onServiceStateChanged(ServiceState serviceState) {
+            if (secondaryCallback != this || !watching) return;
+            changed.run();
+        }
+    }
+
+    private final class SecondarySignalOnlyCallback extends TelephonyCallback
+            implements TelephonyCallback.SignalStrengthsListener {
+        @Override public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+            if (secondaryCallback != this || !watching) return;
             changed.run();
         }
     }

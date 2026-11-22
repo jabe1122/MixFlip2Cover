@@ -11,12 +11,16 @@ import android.view.Display;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
+import android.view.ViewGroup;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import io.github.libxposed.api.XposedModule;
 
@@ -51,8 +55,8 @@ final class PanelMotion {
         }
     }
 
-    static final WeakHashMap<View, Header> headers = new WeakHashMap<>();
-    static final Set<View> scanned = Collections.newSetFromMap(new WeakHashMap<>());
+    static final Map<View, Header> headers = Collections.synchronizedMap(new WeakHashMap<>());
+    static final Set<View> scanned = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
     static final ThreadLocal<Boolean> ownAlpha = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> inTouchRemap = new ThreadLocal<>();
     private static volatile long activeRemapDownTime = -1L;
@@ -61,12 +65,16 @@ final class PanelMotion {
     private static volatile long finishedRemapDownTime = -1L;
     private static volatile float finishedRemapDeltaX = 0f;
     private static volatile int finishedRemapWidth = CoverDisplay.WIDTH;
+    private static volatile long suppressedRemapDownTime = -1L;
     static long keepSamplingUntil;
     static int lastBucket = -1, logged;
 
-    /** Reflection cache for the per-frame expansion sampling (keyed by the controller's class). */
-    private static Class<?> expansionOwner, valueOwner, containerOwner;
-    private static Method getExpansionState, getValue, getContainer;
+    /** Reflection cache for per-frame expansion sampling (keyed per class so Notification & Control don't thrash). */
+    private static final ConcurrentHashMap<Class<?>, Method> expansionStateMethods = new ConcurrentHashMap<>(4);
+    private static final ConcurrentHashMap<Class<?>, Method> valueMethods = new ConcurrentHashMap<>(4);
+    private static final ConcurrentHashMap<Class<?>, Method> pinnedRowMethods = new ConcurrentHashMap<>(4);
+    private static Class<?> containerOwner;
+    private static Method getContainer;
     private static int[] headerIds;
     private static final Choreographer.FrameCallback FRAME = t -> frame();
 
@@ -251,6 +259,18 @@ final class PanelMotion {
                 activeRemapDeltaX = 0f;
                 finishedRemapDownTime = -1L;
                 finishedRemapDeltaX = 0f;
+                if (downTime == suppressedRemapDownTime) {
+                    return event;
+                }
+                suppressedRemapDownTime = -1L;
+                if (context != null && CoverGeometry.keyguardLocked(context)) {
+                    suppressedRemapDownTime = downTime;
+                    return event;
+                }
+                if (hostView != null && hitsHeadsUpOrInteractiveTopView(hostView, event.getRawX(), event.getRawY())) {
+                    suppressedRemapDownTime = downTime;
+                    return event;
+                }
                 boolean outer = isLiveOuterDisplay(hostView);
                 boolean notifExpanded = notification != null
                         ? fraction(notification, false) > 0.05f
@@ -305,6 +325,95 @@ final class PanelMotion {
             Log.w(TAG, "handlePullDownTouchStream skipped", t);
             return event;
         }
+    }
+
+    /**
+     * Returns true when {@code (rawX, rawY)} lands on a visible pinned Heads-Up notification card or
+     * interactive top banner control inside {@code NotificationShadeWindowView}, so taps on Heads-Up
+     * banners and action buttons are never shifted horizontally.
+     */
+    private static boolean hitsHeadsUpOrInteractiveTopView(View root, float rawX, float rawY) {
+        if (root == null || root.getVisibility() != View.VISIBLE || root.getAlpha() < 0.05f) {
+            return false;
+        }
+        int[] loc = new int[2];
+        return hitsHeadsUpDescendant(root, root, rawX, rawY, loc, 0);
+    }
+
+    private static boolean hitsHeadsUpDescendant(
+            View root, View node, float rawX, float rawY, int[] loc, int depth) {
+        if (node == null || depth > 20 || node.getVisibility() != View.VISIBLE || node.getAlpha() < 0.05f) {
+            return false;
+        }
+        if (node != root) {
+            String cls = node.getClass().getName();
+            if (isHeadsUpOrNotificationBannerClass(cls)) {
+                if (isPointInsideScreenBounds(node, rawX, rawY, loc) && isActiveHeadsUpView(node, cls)) {
+                    return true;
+                }
+                return false;
+            }
+            if (!(node instanceof ViewGroup) && node.isClickable()
+                    && node.getHeight() > 0 && node.getHeight() < 280
+                    && isPointInsideScreenBounds(node, rawX, rawY, loc)) {
+                return true;
+            }
+        }
+        if (node instanceof ViewGroup vg) {
+            for (int i = vg.getChildCount() - 1; i >= 0; i--) {
+                if (hitsHeadsUpDescendant(root, vg.getChildAt(i), rawX, rawY, loc, depth + 1)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isHeadsUpOrNotificationBannerClass(String cls) {
+        return cls.contains("ExpandableNotificationRow")
+                || cls.contains("HeadsUp")
+                || cls.contains("NotificationSnooze")
+                || cls.contains("SmartReplyView")
+                || cls.contains("RemoteInputView")
+                || cls.contains("FloatingNotification");
+    }
+
+    private static boolean isActiveHeadsUpView(View node, String cls) {
+        if (!cls.contains("ExpandableNotificationRow")) {
+            return true;
+        }
+        try {
+            Class<?> c = node.getClass();
+            Method m = pinnedRowMethods.get(c);
+            if (m == null) {
+                for (String name : new String[]{"isPinned", "isHeadsUp", "isHeadsUpState"}) {
+                    try {
+                        Method found = c.getMethod(name);
+                        if (found.getReturnType() == boolean.class) {
+                            found.setAccessible(true);
+                            m = found;
+                            pinnedRowMethods.put(c, m);
+                            break;
+                        }
+                    } catch (NoSuchMethodException ignored) {
+                    }
+                }
+            }
+            if (m != null) {
+                return Boolean.TRUE.equals(m.invoke(node));
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
+    private static boolean isPointInsideScreenBounds(View v, float rawX, float rawY, int[] loc) {
+        v.getLocationOnScreen(loc);
+        float w = v.getWidth() * v.getScaleX();
+        float h = v.getHeight() * v.getScaleY();
+        if (w <= 0f || h <= 0f) return false;
+        return rawX >= loc[0] && rawX <= (loc[0] + w)
+                && rawY >= loc[1] && rawY <= (loc[1] + h);
     }
 
     private static MotionEvent obtainShiftedEvent(MotionEvent event, float deltaX, int width) {
@@ -480,22 +589,23 @@ final class PanelMotion {
         if (controller == null) return fallback ? 1f : 0f;
         try {
             Class<?> type = controller.getClass();
-            if (type != expansionOwner) {
-                getExpansionState = type.getMethod("getExpansionState");
-                expansionOwner = type;
+            Method expMethod = expansionStateMethods.get(type);
+            if (expMethod == null) {
+                expMethod = type.getMethod("getExpansionState");
+                expansionStateMethods.put(type, expMethod);
             }
-            Object state = getExpansionState.invoke(controller);
+            Object state = expMethod.invoke(controller);
             if (state != null) {
                 Class<?> stateType = state.getClass();
-                if (stateType != valueOwner) {
-                    getValue = stateType.getMethod("getValue");
-                    valueOwner = stateType;
+                Method valMethod = valueMethods.get(stateType);
+                if (valMethod == null) {
+                    valMethod = stateType.getMethod("getValue");
+                    valueMethods.put(stateType, valMethod);
                 }
-                Object value = getValue.invoke(state);
+                Object value = valMethod.invoke(state);
                 if (value instanceof Number n) return Math.max(0f, Math.min(1f, n.floatValue()));
             }
         } catch (ReflectiveOperationException | RuntimeException ignored) {
-            expansionOwner = valueOwner = null;
         }
         return fallback ? 1f : 0f;
     }
@@ -578,7 +688,11 @@ final class PanelMotion {
         } catch (ReflectiveOperationException | RuntimeException ignored) {
             containerOwner = null;
         }
-        for (var entry : new ArrayList<>(headers.entrySet())) {
+        List<Map.Entry<View, Header>> snapshot;
+        synchronized (headers) {
+            snapshot = new ArrayList<>(headers.entrySet());
+        }
+        for (var entry : snapshot) {
             View v = entry.getKey();
             Header h = entry.getValue();
             if (v != null && v.isAttachedToWindow()) {

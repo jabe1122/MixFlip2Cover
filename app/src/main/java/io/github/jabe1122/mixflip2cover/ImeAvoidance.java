@@ -101,13 +101,15 @@ final class ImeAvoidance {
     private static void send(int display) {
         if (context == null) return;
         try {
-            context.sendBroadcast(
+            StatusOrb.sendBroadcastAsCurrentUser(
+                    context,
                     new Intent(ACTION)
                             .setPackage("com.miui.fliphome")
                             .putExtra("display", display)
                             .putExtra("visible", Boolean.TRUE.equals(visible.get(display)))
                             .putExtra("frame", frames.get(display)),
-                    CoverGeometry.STATUS_BAR_PERMISSION);
+                    CoverGeometry.STATUS_BAR_PERMISSION,
+                    null);
         } catch (RuntimeException e) {
             android.util.Log.w("MF2C.Ime", "IME visibility broadcast skipped", e);
         }

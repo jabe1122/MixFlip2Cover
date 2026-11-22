@@ -6,16 +6,20 @@ import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.UserHandle;
+import android.os.UserManager;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
 import android.view.DisplayCutout;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import io.github.libxposed.api.XposedModule;
 
 /**
@@ -54,14 +58,17 @@ final class CoverResourceOverlay {
     /** Any display whose longer edge reaches this size is the inner panel (2912 px); the cover panel is 1392 px. */
     private static final int INNER_DISPLAY_MIN_LONG_EDGE = 2000;
 
-    /** Small LRU of resource-id -> "is a status bar height dimen" decisions. */
-    private static final Map<Long, Boolean> statusHeightIdCache =
-            Collections.synchronizedMap(new LinkedHashMap<Long, Boolean>(256, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
-                    return size() > 2048;
-                }
-            });
+    /** Lock-free bounded cache of resource-id -> "is a status bar height dimen" decisions. */
+    private static final int STATUS_HEIGHT_CACHE_MAX = 2048;
+    private static final ConcurrentHashMap<Long, Boolean> statusHeightIdCache = new ConcurrentHashMap<>(256);
+    private static volatile boolean dmgProbed;
+    private static volatile Object dmgInstance;
+    private static volatile Method dmgGetDisplayInfoMethod;
+    private static volatile Method dmgGetRealDisplayMethod;
+    private static volatile Field diLogicalWidthField;
+    private static volatile Field diLogicalHeightField;
+    private static volatile Context observedContext;
+    private static final Set<Integer> previouslyEnabledUsers = new LinkedHashSet<>();
     private static boolean observing;
     private static boolean valueRegisteredThisBoot;
     private static boolean legacyCleaned;
@@ -110,13 +117,14 @@ final class CoverResourceOverlay {
                 Object res = chain.proceed();
                 try {
                     TypedValue out = (TypedValue) chain.getArg(1);
-                    if (out != null && out.type == TypedValue.TYPE_DIMENSION
-                            && (out.data == 0 || TypedValue.complexToFloat(out.data) <= CORE_GUARD_MAX_PATCHED_PX + 0.5f)) {
+                    if (out != null && out.type == TypedValue.TYPE_DIMENSION) {
                         Resources r = (Resources) chain.getThisObject();
-                        int id = (Integer) chain.getArg(0);
-                        if (isStatusHeightResource(r, id)) {
-                            int px = nativeStatusBarPx(r);
-                            out.data = (px << TypedValue.COMPLEX_MANTISSA_SHIFT) | TypedValue.COMPLEX_UNIT_PX;
+                        if (out.data == 0 || isPatchedDimenPx(out.data, r)) {
+                            int id = (Integer) chain.getArg(0);
+                            if (isStatusHeightResource(r, id)) {
+                                int px = nativeStatusBarPx(r);
+                                out.data = (px << TypedValue.COMPLEX_MANTISSA_SHIFT) | TypedValue.COMPLEX_UNIT_PX;
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -162,6 +170,38 @@ final class CoverResourceOverlay {
         }
     }
 
+    private static boolean isPatchedDimenPx(int data, Resources r) {
+        DisplayMetrics dm = r != null ? r.getDisplayMetrics() : null;
+        float px = dm != null ? TypedValue.complexToDimension(data, dm) : TypedValue.complexToFloat(data);
+        return px <= CORE_GUARD_MAX_PATCHED_PX + 0.5f;
+    }
+
+    private static void ensureDmgReflection() {
+        if (dmgProbed) return;
+        dmgProbed = true;
+        try {
+            Class<?> dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
+            Object inst = dmgClass.getDeclaredMethod("getInstance").invoke(null);
+            dmgInstance = inst;
+            if (inst != null) {
+                Method getInfo = dmgClass.getDeclaredMethod("getDisplayInfo", int.class);
+                getInfo.setAccessible(true);
+                dmgGetDisplayInfoMethod = getInfo;
+                Method getReal = dmgClass.getDeclaredMethod("getRealDisplay", int.class);
+                getReal.setAccessible(true);
+                dmgGetRealDisplayMethod = getReal;
+            }
+            Class<?> diClass = Class.forName("android.view.DisplayInfo");
+            Field fw = diClass.getDeclaredField("logicalWidth");
+            fw.setAccessible(true);
+            diLogicalWidthField = fw;
+            Field fh = diClass.getDeclaredField("logicalHeight");
+            fh.setAccessible(true);
+            diLogicalHeightField = fh;
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static int nativeStatusBarPx(Resources r) {
         try {
             if (r != null) {
@@ -182,6 +222,7 @@ final class CoverResourceOverlay {
     /** system_server only: follows display 0 between the cover and inner panel. */
     static synchronized void observe(Context context) {
         if (android.os.Process.myUid() != 1000) return;
+        if (context != null) observedContext = context;
         if (observing) return;
         observing = true;
         try {
@@ -214,6 +255,7 @@ final class CoverResourceOverlay {
 
     static synchronized void sync(Context context) {
         if (shuttingDown || uninstalled || android.os.Process.myUid() != 1000) return;
+        if (context != null) observedContext = context;
         boolean folded = isDefaultDisplayOuter(context);
         // onDisplayChanged also fires for brightness/refresh-rate changes; only act on real fold transitions.
         if (folded == lastFoldedState && syncedOnce) return;
@@ -223,15 +265,16 @@ final class CoverResourceOverlay {
     static boolean isDefaultDisplayOuter(Context context) {
         boolean imeClamped = false;
         try {
-            Object dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
-                    .getDeclaredMethod("getInstance").invoke(null);
-            if (dmg != null) {
-                Object info = dmg.getClass()
-                        .getDeclaredMethod("getDisplayInfo", int.class)
-                        .invoke(dmg, Display.DEFAULT_DISPLAY);
+            ensureDmgReflection();
+            Object dmg = dmgInstance;
+            Method getInfo = dmgGetDisplayInfoMethod;
+            Field fw = diLogicalWidthField;
+            Field fh = diLogicalHeightField;
+            if (dmg != null && getInfo != null && fw != null && fh != null) {
+                Object info = getInfo.invoke(dmg, Display.DEFAULT_DISPLAY);
                 if (info != null) {
-                    int w = info.getClass().getDeclaredField("logicalWidth").getInt(info);
-                    int h = info.getClass().getDeclaredField("logicalHeight").getInt(info);
+                    int w = fw.getInt(info);
+                    int h = fh.getInt(info);
                     if (CoverDisplay.isOuterDimensions(w, h)) return true;
                     imeClamped = (w == CoverDisplay.CAMERA_LEFT && h == CoverDisplay.HEIGHT)
                             || (w == CoverDisplay.HEIGHT && h == CoverDisplay.CAMERA_LEFT);
@@ -287,14 +330,56 @@ final class CoverResourceOverlay {
         }
     }
 
-    /** Users whose overlay state is managed: the system user and the current foreground user. */
+    /**
+     * Users whose overlay state is managed: user 0, current foreground user, all running profile users
+     * (including HyperOS Dual Apps u999 / Work Profile u10), plus any previously enabled users so switching
+     * away while folded still disables them on unfold.
+     */
     private static int[] managedUsers() {
-        int current = 0;
+        LinkedHashSet<Integer> users = new LinkedHashSet<>();
+        users.add(0);
         try {
-            current = (Integer) android.app.ActivityManager.class.getMethod("getCurrentUser").invoke(null);
+            Object current = android.app.ActivityManager.class.getMethod("getCurrentUser").invoke(null);
+            if (current instanceof Integer cur && cur >= 0) users.add(cur);
         } catch (Throwable ignored) {
         }
-        return current == 0 ? new int[]{0} : new int[]{0, current};
+        try {
+            Object ams = android.app.ActivityManager.class.getMethod("getService").invoke(null);
+            if (ams != null) {
+                Object running = ams.getClass().getMethod("getRunningUserIds").invoke(ams);
+                if (running instanceof int[] ids) {
+                    for (int id : ids) {
+                        if (id >= 0) users.add(id);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        Context ctx = observedContext;
+        if (ctx != null) {
+            try {
+                UserManager um = ctx.getSystemService(UserManager.class);
+                if (um != null) {
+                    List<UserHandle> profiles = um.getUserProfiles();
+                    if (profiles != null) {
+                        for (UserHandle uh : profiles) {
+                            if (uh == null) continue;
+                            try {
+                                int uid = (Integer) UserHandle.class.getMethod("getIdentifier").invoke(uh);
+                                if (uid >= 0 && um.isUserRunning(uh)) users.add(uid);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        users.addAll(previouslyEnabledUsers);
+        int[] out = new int[users.size()];
+        int i = 0;
+        for (int u : users) out[i++] = u;
+        return out;
     }
 
     static synchronized void syncForFoldState(boolean coverFolded) {
@@ -314,7 +399,12 @@ final class CoverResourceOverlay {
             boolean registered = false;
             boolean allMatch = true;
             for (int user : users) {
-                Object info = om.info(identifier, user);
+                Object info;
+                try {
+                    info = om.info(identifier, user);
+                } catch (Throwable ignored) {
+                    continue;
+                }
                 registered |= info != null;
                 boolean enabled = info != null && Boolean.TRUE.equals(info.getClass().getMethod("isEnabled").invoke(info));
                 if (enabled != shouldEnable) allMatch = false;
@@ -323,6 +413,8 @@ final class CoverResourceOverlay {
             if (!shouldEnable && !registered && legacyCleaned) return;
 
             Object builder = om.txBuilderClass.getDeclaredConstructor().newInstance();
+            boolean didLegacyClean = false;
+            boolean didRegister = false;
             if (!legacyCleaned) {
                 for (String[] legacy : LEGACY_OVERLAYS) {
                     try {
@@ -331,7 +423,7 @@ final class CoverResourceOverlay {
                     } catch (Throwable ignored) {
                     }
                 }
-                legacyCleaned = true;
+                didLegacyClean = true;
             }
             if (shouldEnable && !valueRegisteredThisBoot) {
                 Object fab = om.fabCtor.newInstance(OVERLAY_NAME, TARGET_PACKAGE);
@@ -345,14 +437,28 @@ final class CoverResourceOverlay {
                     om.setResDimen.invoke(fab, resName, (float) COVER_APP_STATUS_BAR_PX, TypedValue.COMPLEX_UNIT_PX, null);
                 }
                 om.registerFab.invoke(builder, fab);
-                valueRegisteredThisBoot = true;
+                didRegister = true;
                 registered = true;
             }
             if (registered) {
-                for (int user : users) om.setEnabled.invoke(builder, identifier, shouldEnable, user);
+                for (int user : users) {
+                    try {
+                        om.setEnabled.invoke(builder, identifier, shouldEnable, user);
+                    } catch (Throwable ignored) {
+                    }
+                }
             }
             om.commit.invoke(om.service, om.buildTx.invoke(builder));
-            ModLog.i(TAG, "status bar overlay synced folded=" + coverFolded + " enabled=" + shouldEnable);
+            // Latch state ONLY after commit succeeds so transient early-boot failures retry on next sync.
+            if (didLegacyClean) legacyCleaned = true;
+            if (didRegister) valueRegisteredThisBoot = true;
+            if (shouldEnable) {
+                for (int user : users) previouslyEnabledUsers.add(user);
+            } else {
+                previouslyEnabledUsers.clear();
+            }
+            ModLog.i(TAG, "status bar overlay synced folded=" + coverFolded + " enabled=" + shouldEnable
+                    + " users=" + users.length);
         } catch (Throwable t) {
             Log.w(TAG, "status bar overlay sync skipped", t);
         }
@@ -395,6 +501,7 @@ final class CoverResourceOverlay {
             }
             if (any) om.commit.invoke(om.service, om.buildTx.invoke(builder));
             valueRegisteredThisBoot = false;
+            previouslyEnabledUsers.clear();
             Log.i(TAG, "status bar overlay removed");
         } catch (Throwable t) {
             Log.w(TAG, "status bar overlay removal failed", t);
@@ -410,12 +517,11 @@ final class CoverResourceOverlay {
                     if (d != null) return d;
                 }
             }
-            Object dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
-                    .getDeclaredMethod("getInstance").invoke(null);
-            if (dmg != null) {
-                return (Display) dmg.getClass()
-                        .getDeclaredMethod("getRealDisplay", int.class)
-                        .invoke(dmg, Display.DEFAULT_DISPLAY);
+            ensureDmgReflection();
+            Object dmg = dmgInstance;
+            Method getReal = dmgGetRealDisplayMethod;
+            if (dmg != null && getReal != null) {
+                return (Display) getReal.invoke(dmg, Display.DEFAULT_DISPLAY);
             }
         } catch (Throwable ignored) {
         }
@@ -427,19 +533,18 @@ final class CoverResourceOverlay {
         long cacheKey = ((id >>> 24) == 0x01)
                 ? (id & 0xffffffffL)
                 : ((((long) System.identityHashCode(r)) << 32) | (id & 0xffffffffL));
-        synchronized (statusHeightIdCache) {
-            Boolean cached = statusHeightIdCache.get(cacheKey);
-            if (cached != null) return cached;
-        }
+        Boolean cached = statusHeightIdCache.get(cacheKey);
+        if (cached != null) return cached;
         try {
             String entry = r.getResourceEntryName(id);
             boolean match = entry != null && (entry.equals("status_bar_height")
                     || entry.startsWith("status_bar_height_")
                     || entry.equals("all_in_one_status_bar_height")
                     || entry.equals("miui_status_bar_height"));
-            synchronized (statusHeightIdCache) {
-                statusHeightIdCache.put(cacheKey, match);
+            if (statusHeightIdCache.size() >= STATUS_HEIGHT_CACHE_MAX) {
+                statusHeightIdCache.clear();
             }
+            statusHeightIdCache.put(cacheKey, match);
             return match;
         } catch (Throwable e) {
             return false;

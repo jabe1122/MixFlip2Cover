@@ -324,7 +324,11 @@ final class NativeStatusStyle {
         context.registerReceiver(receiver, filter, CoverGeometry.STATUS_BAR_PERMISSION, null, Context.RECEIVER_EXPORTED);
         transitionReceiverRegistered = true;
         try {
-            context.sendBroadcast(new Intent(ACTION_QUERY_RIGHT_PANE_BG).setPackage(CoverGeometry.FLIPHOME));
+            StatusOrb.sendBroadcastAsCurrentUser(
+                    context,
+                    new Intent(ACTION_QUERY_RIGHT_PANE_BG).setPackage(CoverGeometry.FLIPHOME),
+                    null,
+                    null);
         } catch (RuntimeException ignored) {
         }
     }

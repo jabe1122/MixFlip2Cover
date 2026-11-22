@@ -9,6 +9,10 @@ import android.content.pm.PackageItemInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Rect;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
@@ -45,6 +49,8 @@ import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam;
  */
 public final class SystemServerEntry extends XposedModule {
     private static final String TAG = "MF2C.Framework";
+    static final String ACTION_COVER_QUICK_ACTION = "io.github.jabe1122.mixflip2cover.COVER_QUICK_ACTION";
+    static final String EXTRA_QUICK_ACTION = "quick_action";
     private static final int MAX_TOP_BAR_SOURCE_HEIGHT = 220;
     private static final int INNER_DISPLAY_WIDTH = 1224;
     private static final int INNER_DISPLAY_HEIGHT = 2912;
@@ -53,21 +59,33 @@ public final class SystemServerEntry extends XposedModule {
     private static final int COVER_SAFE_WIDTH = 810;
     private static final int FIXED_ASPECT_RATIO_STATE = 8;
     private static final int SNAPSHOT_REF_BROADCAST = 16;
+    private static final Configuration EMPTY_CONFIG = resolveEmptyConfiguration();
+
+    private static Configuration resolveEmptyConfiguration() {
+        try {
+            Field f = Configuration.class.getDeclaredField("EMPTY");
+            f.setAccessible(true);
+            Object v = f.get(null);
+            return v instanceof Configuration c ? c : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
 
     private final ArrayList<HookHandle> hooks = new ArrayList<>();
     private final Map<Object, String> published = Collections.synchronizedMap(new WeakHashMap<>());
-    private final Set<Object> deliveryLogged = Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
-    private final Set<Object> knownImeProcesses = Collections.newSetFromMap(Collections.synchronizedMap(new WeakHashMap<>()));
-    private final Map<ComponentName, Boolean> nativeFlipActivityCache = new ConcurrentHashMap<>();
+    private final Set<Object> deliveryLogged = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    private final Set<Object> knownImeProcesses = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    private final Map<String, Boolean> nativeFlipActivityCache = new ConcurrentHashMap<>();
     private final Map<Integer, String> uidPackageCache = new ConcurrentHashMap<>();
     private final AtomicBoolean receiversRegistered = new AtomicBoolean(false);
 
     private Field attrs, record, rawTypes, infoUnique, infoWidth, infoHeight, displayFocus;
     private Field serviceHandler, serviceLock, serviceRoot, serviceContext, windowConfigField;
-    private Field ownerUidField, arPkgField, arComponentField, arInfoField, arFinishingField;
+    private Field ownerUidField, arPkgField, arComponentField, arInfoField, arFinishingField, arUserIdField;
     private Method arIsVisibleRequestedMethod, displayGetIdMethod;
     private final ThreadLocal<Boolean> sendingCompatState = new ThreadLocal<>();
-    private Method getDisplay, getInfo, getMode, sourceSize, sourceAt, sourceType, getSourceFrame, addSource, sourceFrame, sourceVisibleFrame, sourceVisible;
+    private Method getDisplay, getInfo, getMode, sourceSize, sourceAt, sourceType, getSourceFrame, addSource, sourceFrame, sourceVisibleFrame, sourceVisible, sourceIsVisible;
     private Method getDisplayCutout, setDisplayCutout, wcGetBounds, wcGetAppBounds, wcSetBounds, wcSetAppBounds, asActivityMethod;
     private Method wcSetMaxBounds, wcGetMaxBounds, wcGetRotation, wcGetDisplayRotation;
     private Method ccGetReqOverrideConfig, ccGetResolvedOverrideConfig, ccGetConfig, ccOnConfigChanged, wcGetMergedOverrideConfig;
@@ -94,17 +112,32 @@ public final class SystemServerEntry extends XposedModule {
     private Method isFlipFoldedMethod;
     private volatile Object service;
     private static final Object FOLD_TOKEN = new Object();
+    private static final Object POCKET_GUARD_TOKEN = new Object();
+    private static final int SENSOR_TYPE_PROXIMITY_BACK = 33171123;
+    private static final int SENSOR_TYPE_OEM_POCKET = 33171095;
     private final Object foldLock = new Object();
     private Boolean lastFoldDispatched;
     private volatile boolean imeCompatApplied;
     private volatile boolean installed;
     private volatile boolean moduleUninstalled;
     private volatile ClassLoader systemServerClassLoader;
-    private final Object voiceAssistLetterboxGuard = new Object();
+    private final Object letterboxGuard = new Object();
+    private final Set<String> strippedLetterboxPackages = ConcurrentHashMap.newKeySet();
     private final Set<String> removedHideLetterboxEntries = new HashSet<>();
     private final Set<String> removedAspectBlacklistEntries = new HashSet<>();
+    private final Set<Integer> appliedCoverImeDpis = ConcurrentHashMap.newKeySet();
+    private volatile Object interceptActivityControllerRef;
+    private Field iacTopActivityField, iacPolicyField, iacIsTopKeepedField;
+    private Method policyGetFgPkgMethod;
+    private Field flipPolicyNeedContinueField;
+    private volatile long lastSeamlessFoldContinuityAt;
+    private final Object pocketSensorLock = new Object();
+    private SensorManager activePocketSensorManager;
+    private SensorEventListener activePocketSensorListener;
     private volatile boolean lastCoverDisplayState;
     private volatile boolean lastCoverDisplayInitialized;
+    private volatile long lastDeviceStateChangeAtMs;
+    private volatile int cachedCoverDisplayRotation = -1;
     private long lastError;
 
 
@@ -163,6 +196,7 @@ public final class SystemServerEntry extends XposedModule {
             sourceFrame = method(source, "setFrame", source, int.class, int.class, int.class, int.class);
             sourceVisibleFrame = method(source, "setVisibleFrame", source, Rect.class);
             sourceVisible = method(source, "setVisible", source, boolean.class);
+            sourceIsVisible = optionalMethod(source, "isVisible", boolean.class);
             getDisplayCutout = method(state, "getDisplayCutout", DisplayCutout.class);
             setDisplayCutout = method(state, "setDisplayCutout", void.class, DisplayCutout.class);
             noCutout = field(DisplayCutout.class, "NO_CUTOUT", DisplayCutout.class).get(null);
@@ -211,6 +245,7 @@ public final class SystemServerEntry extends XposedModule {
             arComponentField = optionalField(arClass, "mActivityComponent", ComponentName.class);
             arInfoField = optionalField(arClass, "info", ActivityInfo.class);
             arFinishingField = optionalField(arClass, "finishing", boolean.class);
+            arUserIdField = optionalField(arClass, "mUserId", int.class);
             arIsVisibleRequestedMethod = optionalMethod(arClass, "isVisibleRequested", boolean.class);
             displayGetIdMethod = method(display, "getDisplayId", int.class);
             Method tokenMode = method(token, "getWindowingMode", int.class);
@@ -219,6 +254,7 @@ public final class SystemServerEntry extends XposedModule {
             verifySourceCopies(state, source);
             ModuleConfig.init(this);
             CoverResourceOverlay.installCoreResourceGuard(this);
+            ModLog.recordHookHealth("overlay_hooks", "ok");
             setProperty.invoke(null, FrameworkRuntime.READY, "0");
 
             hooks.add(hook(insetsBool).intercept(chain -> {
@@ -317,7 +353,7 @@ public final class SystemServerEntry extends XposedModule {
                             int mode = target == null ? 1 : (Integer) tokenMode.invoke(target);
                             if (tokenPolicyApplies(target, caller)
                                     && displayEligible(dc, type, true, mode)
-                                    && !isNativeFlipFullscreenToken(target)) {
+                                    && !skipsStatusStrippingForToken(target, caller)) {
                                 stripStatus(chain.getArg(2), targetTopPxForToken(target, caller));
                             }
                         }
@@ -333,7 +369,7 @@ public final class SystemServerEntry extends XposedModule {
                     Object w = chain.getThisObject();
                     if (runtimeActive() && eligibleWindow(w)) {
                         reportFocus(w);
-                        if (windowPolicyApplies(w) && !isNativeFlipFullscreenWindow(w)) {
+                        if (windowPolicyApplies(w) && !skipsStatusStrippingForWindow(w)) {
                             return FrameworkPolicy.filteredTypes(
                                     original,
                                     WindowInsets.Type.statusBars());
@@ -363,14 +399,15 @@ public final class SystemServerEntry extends XposedModule {
                 Object original = chain.proceed();
                 try {
                     checkDisplayTransition(service);
-                    if (enabled()) {
+                    if (enabled() && caller % 100000 >= 10000 && !isThirdPartyImeUid(caller)) {
                         Object t = chain.getArg(0);
                         Object dc = t != null ? tokenDisplay.invoke(t) : policyDisplay.get(chain.getThisObject());
                         int type = t != null ? tokenType.getInt(t) : 1;
+                        if (type == 2011 || type == 2012) return original;
                         int mode = t != null ? (Integer) tokenMode.invoke(t) : 1;
                         if (tokenPolicyApplies(t, caller)
                                 && displayEligible(dc, type, true, mode)
-                                && !isNativeFlipFullscreenToken(t)) {
+                                && !skipsStatusStrippingForToken(t, caller)) {
                             stripStatus(chain.getArg(1), targetTopPxForToken(t, caller));
                         }
                     }
@@ -406,7 +443,8 @@ public final class SystemServerEntry extends XposedModule {
                                     refreshActiveThirdPartyImeUid(ctx);
                                     registerSystemReceivers(ctx, h);
                                     syncImeProcessesForFoldState(service, foldedNow);
-                                } catch (Throwable ignored) {
+                                } catch (Throwable bootInitErr) {
+                                    Log.w(TAG, "post-WMS boot init failed", bootInitErr);
                                 }
                             }, 3000L);
                         }
@@ -449,9 +487,12 @@ public final class SystemServerEntry extends XposedModule {
             ModuleConfig.addListener(this::configurationChanged);
             installed = true;
             setProperty.invoke(null, FrameworkRuntime.READY, FrameworkRuntime.VERSION);
+            ModLog.recordHookHealth("insets_hooks", "ok");
+            ModLog.recordHookHealth("system_server_init", "ok");
             Log.i(TAG, "cover Insets policy installed (" + BuildConfig.VERSION_NAME + ")");
         } catch (Throwable t) {
             installed = false;
+            ModLog.recordHookHealth("system_server_init", "err:" + t.getClass().getSimpleName());
             for (HookHandle h : hooks) {
                 try {
                     h.unhook();
@@ -506,9 +547,10 @@ public final class SystemServerEntry extends XposedModule {
                 @Override
                 public void onReceive(Context c, Intent intent) {
                     Log.i(TAG, "shutdown: removing persistent system changes");
+                    cancelFoldPocketGuard();
                     CoverResourceOverlay.onShutdown();
                     CoverImeGuard.onShutdown(ctx);
-                    syncVoiceAssistHideLetterbox(systemServerClassLoader, false);
+                    restoreAllPackageHideLetterboxes(systemServerClassLoader);
                 }
             }, shutdownFilter, null, h, Context.RECEIVER_NOT_EXPORTED);
         } catch (Throwable t) {
@@ -531,15 +573,33 @@ public final class SystemServerEntry extends XposedModule {
                         return;
                     }
                     Log.i(TAG, "restore system defaults requested");
+                    cancelFoldPocketGuard();
                     CoverResourceOverlay.removeAll();
                     CoverImeGuard.restoreSystem(ctx);
-                    syncVoiceAssistHideLetterbox(systemServerClassLoader, false);
+                    restoreAllPackageHideLetterboxes(systemServerClassLoader);
                     syncImeProcessesForFoldState(service, isCoverFolded());
                     configurationChanged();
                 }
             }, new android.content.IntentFilter(FrameworkRuntime.ACTION_RESTORE), null, h, Context.RECEIVER_EXPORTED);
         } catch (Throwable t) {
             Log.w(TAG, "restore receiver unavailable", t);
+        }
+        try {
+            ctx.registerReceiver(new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, Intent intent) {
+                    if (intent == null || !ACTION_COVER_QUICK_ACTION.equals(intent.getAction())) return;
+                    int sender = getSentFromUid();
+                    if (!isTrustedCoverQuickActionSender(ctx, sender)) {
+                        Log.w(TAG, "ignored cover quick action from uid " + sender);
+                        return;
+                    }
+                    String action = intent.getStringExtra(EXTRA_QUICK_ACTION);
+                    handleCoverQuickAction(ctx, action);
+                }
+            }, new android.content.IntentFilter(ACTION_COVER_QUICK_ACTION), null, h, Context.RECEIVER_EXPORTED);
+        } catch (Throwable t) {
+            Log.w(TAG, "cover quick action receiver unavailable", t);
         }
         try {
             android.content.IntentFilter pkgFilter = new android.content.IntentFilter();
@@ -563,9 +623,10 @@ public final class SystemServerEntry extends XposedModule {
                         if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return;
                         Log.i(TAG, "module package uninstalled: restoring persistent system state");
                         moduleUninstalled = true;
+                        cancelFoldPocketGuard();
                         CoverResourceOverlay.setUninstalled(true);
                         CoverImeGuard.setUninstalled(ctx, true);
-                        syncVoiceAssistHideLetterbox(systemServerClassLoader, false);
+                        restoreAllPackageHideLetterboxes(systemServerClassLoader);
                         syncImeProcessesForFoldState(service, isCoverFolded());
                         configurationChanged();
                     } else if (Intent.ACTION_PACKAGE_ADDED.equals(action)
@@ -601,6 +662,365 @@ public final class SystemServerEntry extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "IME settings observer unavailable", t);
         }
+    }
+
+    private boolean isTrustedCoverQuickActionSender(Context ctx, int sender) {
+        if (sender < 0 || ctx == null) return false;
+        int appId = sender % 100000;
+        int cachedFlipUid = flipHomeUid;
+        if (cachedFlipUid > 0 && appId == (cachedFlipUid % 100000)) {
+            return true;
+        }
+        int cachedSysUiUid = systemUiUid;
+        if (cachedSysUiUid > 0 && appId == (cachedSysUiUid % 100000)) {
+            return true;
+        }
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            if (pm != null) {
+                try {
+                    int fhUid = pm.getPackageUid(CoverGeometry.FLIPHOME, PackageManager.PackageInfoFlags.of(0));
+                    if (fhUid > 0) {
+                        flipHomeUid = fhUid;
+                        if (appId == (fhUid % 100000)) return true;
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    int suUid = pm.getPackageUid(CoverGeometry.SYSTEMUI, PackageManager.PackageInfoFlags.of(0));
+                    if (suUid > 0) {
+                        systemUiUid = suUid;
+                        if (appId == (suUid % 100000)) return true;
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    int modUid = pm.getPackageUid(BuildConfig.APPLICATION_ID, PackageManager.PackageInfoFlags.of(0));
+                    if (modUid > 0 && appId == (modUid % 100000)) return true;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void handleCoverQuickAction(Context ctx, String action) {
+        if (ctx == null || action == null || action.isEmpty()) return;
+        if (!isCoverFolded()) {
+            ModLog.i(TAG, "ignored cover quick action while unfolded: " + action);
+            return;
+        }
+        int displayId = resolveActiveCoverDisplayId(ctx);
+        if (action.startsWith("app:")) {
+            launchCoverTargetApp(ctx, action.substring(4), displayId);
+            return;
+        }
+        switch (action) {
+            case ModuleConfig.QA_BACK -> injectCoverKeyEvent(ctx, android.view.KeyEvent.KEYCODE_BACK, displayId);
+            case ModuleConfig.QA_RECENTS -> injectCoverKeyEvent(ctx, android.view.KeyEvent.KEYCODE_APP_SWITCH, displayId);
+            case ModuleConfig.QA_HOME -> {
+                if (!injectCoverKeyEvent(ctx, android.view.KeyEvent.KEYCODE_HOME, displayId)) {
+                    try {
+                        Intent home = new Intent(Intent.ACTION_MAIN)
+                                .addCategory(Intent.CATEGORY_HOME)
+                                .setPackage(CoverGeometry.FLIPHOME)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        android.app.ActivityOptions ao = android.app.ActivityOptions.makeBasic();
+                        ao.setLaunchDisplayId(displayId);
+                        startActivityForUser(ctx, home, ao.toBundle(), resolveCurrentUserId());
+                    } catch (Throwable t) {
+                        Log.w(TAG, "cover home fallback failed", t);
+                    }
+                }
+            }
+            case ModuleConfig.QA_SCREENSHOT -> injectCoverKeyEvent(ctx, android.view.KeyEvent.KEYCODE_SYSRQ, displayId);
+            case ModuleConfig.QA_LOCK -> {
+                try {
+                    android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
+                    if (pm != null) {
+                        Method goToSleep = android.os.PowerManager.class.getMethod("goToSleep", long.class);
+                        goToSleep.invoke(pm, SystemClock.uptimeMillis());
+                        ModLog.i(TAG, "cover quick action executed: lock");
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "cover lock quick action failed", t);
+                }
+            }
+            case ModuleConfig.QA_ROTATION_LOCK -> handleCoverRotationLock(ctx);
+            case ModuleConfig.QA_MEDIA_PLAY_PAUSE -> handleCoverMediaPlayPause(ctx, displayId);
+            case ModuleConfig.QA_BRIGHTNESS -> handleCoverBrightnessCycle(ctx);
+            case ModuleConfig.QA_SCAN -> handleCoverScan(ctx, displayId);
+            default -> Log.w(TAG, "unknown cover quick action: " + action);
+        }
+    }
+
+    private int resolveCurrentUserId() {
+        try {
+            Object u = android.app.ActivityManager.class.getMethod("getCurrentUser").invoke(null);
+            if (u instanceof Integer id && id >= 0) return id;
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    private int readSystemSettingInt(android.content.ContentResolver cr, String key, int def, int userId) {
+        if (cr == null) return def;
+        try {
+            Method m = android.provider.Settings.System.class.getMethod(
+                    "getIntForUser", android.content.ContentResolver.class, String.class, int.class, int.class);
+            Object v = m.invoke(null, cr, key, def, userId);
+            if (v instanceof Integer i) return i;
+        } catch (Throwable ignored) {
+        }
+        return android.provider.Settings.System.getInt(cr, key, def);
+    }
+
+    private void writeSystemSettingInt(android.content.ContentResolver cr, String key, int value, int userId) {
+        if (cr == null) return;
+        try {
+            Method m = android.provider.Settings.System.class.getMethod(
+                    "putIntForUser", android.content.ContentResolver.class, String.class, int.class, int.class);
+            m.invoke(null, cr, key, value, userId);
+            return;
+        } catch (Throwable ignored) {
+        }
+        try {
+            android.provider.Settings.System.putInt(cr, key, value);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void handleCoverRotationLock(Context ctx) {
+        try {
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            int userId = resolveCurrentUserId();
+            int currentAuto = readSystemSettingInt(cr, android.provider.Settings.System.ACCELEROMETER_ROTATION, 1, userId);
+            int nextAuto = currentAuto == 0 ? 1 : 0;
+            int rot = resolveActiveCoverDisplayRotation(ctx);
+            if (nextAuto == 0 && rot >= 0) {
+                writeSystemSettingInt(cr, android.provider.Settings.System.USER_ROTATION, rot, userId);
+            }
+            writeSystemSettingInt(cr, android.provider.Settings.System.ACCELEROMETER_ROTATION, nextAuto, userId);
+            ModLog.i(TAG, "cover quick action executed: rotation_lock auto=" + nextAuto + " rot=" + rot);
+        } catch (Throwable t) {
+            Log.w(TAG, "cover rotation_lock quick action failed", t);
+        }
+    }
+
+    private void handleCoverMediaPlayPause(Context ctx, int displayId) {
+        try {
+            android.media.AudioManager am = ctx.getSystemService(android.media.AudioManager.class);
+            if (am != null) {
+                long now = SystemClock.uptimeMillis();
+                am.dispatchMediaKeyEvent(new android.view.KeyEvent(
+                        now, now, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
+                am.dispatchMediaKeyEvent(new android.view.KeyEvent(
+                        now, now + 8L, android.view.KeyEvent.ACTION_UP, android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
+                ModLog.i(TAG, "cover quick action executed: media_play_pause");
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "AudioManager media_play_pause dispatch failed; falling back to input inject", t);
+        }
+        injectCoverKeyEvent(ctx, android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, displayId);
+    }
+
+    private void handleCoverBrightnessCycle(Context ctx) {
+        try {
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            int userId = resolveCurrentUserId();
+            int maxVal = CoverDisplay.maxScreenBrightnessInt();
+            int mode = readSystemSettingInt(
+                    cr,
+                    android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE,
+                    android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC,
+                    userId);
+            int level = readSystemSettingInt(
+                    cr,
+                    android.provider.Settings.System.SCREEN_BRIGHTNESS,
+                    Math.round(maxVal * 0.55f),
+                    userId);
+            int next = CoverDisplay.nextCoverBrightnessLevel(mode, level, maxVal);
+            String stage;
+            if (next < 0) {
+                writeSystemSettingInt(cr, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE,
+                        android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC, userId);
+                stage = "AUTO";
+            } else {
+                if (mode != android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) {
+                    writeSystemSettingInt(cr, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE,
+                            android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL, userId);
+                }
+                writeSystemSettingInt(cr, android.provider.Settings.System.SCREEN_BRIGHTNESS, next, userId);
+                stage = next + "/" + maxVal;
+            }
+            ModLog.i(TAG, "cover quick action executed: brightness=" + stage);
+        } catch (Throwable t) {
+            Log.w(TAG, "cover brightness quick action failed", t);
+        }
+    }
+
+    private void handleCoverScan(Context ctx, int displayId) {
+        try {
+            int userId = resolveCurrentUserId();
+            PackageManager pm = resolvePackageManagerForUser(ctx, userId);
+            boolean hasWeChat = false;
+            if (pm != null) {
+                try {
+                    pm.getPackageInfo("com.tencent.mm", 0);
+                    hasWeChat = true;
+                } catch (Throwable ignored) {
+                }
+            }
+            android.app.ActivityOptions ao = android.app.ActivityOptions.makeBasic();
+            ao.setLaunchDisplayId(displayId);
+            if (hasWeChat) {
+                Intent scan = new Intent(Intent.ACTION_MAIN)
+                        .setComponent(new ComponentName("com.tencent.mm", "com.tencent.mm.ui.LauncherUI"))
+                        .putExtra("LauncherUI.From.Scaner.Shortcut", true)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                startActivityForUser(ctx, scan, ao.toBundle(), userId);
+                ModLog.i(TAG, "cover quick action executed: scan (wechat)");
+            } else {
+                Intent alipayScan = new Intent(
+                        Intent.ACTION_VIEW,
+                        android.net.Uri.parse("alipays://platformapi/startapp?saId=10000007"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivityForUser(ctx, alipayScan, ao.toBundle(), userId);
+                ModLog.i(TAG, "cover quick action executed: scan (alipay)");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "cover scan quick action failed", t);
+        }
+    }
+
+    private void launchCoverTargetApp(Context ctx, String target, int displayId) {
+        try {
+            String pkg = ModuleConfig.extractAppTargetPackage(target);
+            if (pkg == null || pkg.isEmpty()) return;
+            int userId = ModuleConfig.extractAppTargetUserId(target);
+            if (userId <= 0) userId = resolveCurrentUserId();
+            PackageManager pm = resolvePackageManagerForUser(ctx, userId);
+            Intent launch = pm != null ? pm.getLaunchIntentForPackage(pkg) : null;
+            if (launch == null) {
+                launch = new Intent(Intent.ACTION_MAIN)
+                        .addCategory(Intent.CATEGORY_LAUNCHER)
+                        .setPackage(pkg);
+            }
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.app.ActivityOptions ao = android.app.ActivityOptions.makeBasic();
+            ao.setLaunchDisplayId(displayId);
+            startActivityForUser(ctx, launch, ao.toBundle(), userId);
+            ModLog.i(TAG, "cover quick action launched app=" + pkg + " user=" + userId);
+        } catch (Throwable t) {
+            Log.w(TAG, "cover app launch fallback failed: " + target, t);
+        }
+    }
+
+    private void startActivityForUser(Context ctx, Intent intent, Bundle options, int userId) throws Throwable {
+        try {
+            Object uh = android.os.UserHandle.class.getMethod("of", int.class).invoke(null, Math.max(0, userId));
+            if (uh != null) {
+                Method m = Context.class.getMethod(
+                        "startActivityAsUser", Intent.class, Bundle.class, android.os.UserHandle.class);
+                m.invoke(ctx, intent, options, uh);
+                return;
+            }
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            throw cause != null ? cause : e;
+        } catch (NoSuchMethodException e) {
+            if (userId > 0) {
+                throw e;
+            }
+        }
+        if (userId > 0) {
+            throw new IllegalStateException("Cannot resolve UserHandle for user " + userId);
+        }
+        ctx.startActivity(intent, options);
+    }
+
+    private int resolveActiveCoverDisplayRotation(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm =
+                    ctx.getSystemService(android.hardware.display.DisplayManager.class);
+            if (dm != null) {
+                for (android.view.Display d : dm.getDisplays()) {
+                    if (CoverDisplay.isOuterDisplay(d)) {
+                        return d.getRotation();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        int cached = cachedCoverDisplayRotation;
+        return cached >= 0 ? cached : 0;
+    }
+
+    private int resolveActiveCoverDisplayId(Context ctx) {
+        try {
+            android.hardware.display.DisplayManager dm =
+                    ctx.getSystemService(android.hardware.display.DisplayManager.class);
+            if (dm != null) {
+                for (android.view.Display d : dm.getDisplays()) {
+                    if (CoverDisplay.isOuterDisplay(d)) {
+                        return d.getDisplayId();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return android.view.Display.DEFAULT_DISPLAY;
+    }
+
+    private boolean injectCoverKeyEvent(Context ctx, int keyCode, int displayId) {
+        try {
+            long now = SystemClock.uptimeMillis();
+            int flags = android.view.KeyEvent.FLAG_FROM_SYSTEM | android.view.KeyEvent.FLAG_VIRTUAL_HARD_KEY;
+            android.view.KeyEvent down = new android.view.KeyEvent(
+                    now, now, android.view.KeyEvent.ACTION_DOWN, keyCode, 0, 0,
+                    android.view.KeyCharacterMap.VIRTUAL_KEYBOARD, 0, flags,
+                    android.view.InputDevice.SOURCE_KEYBOARD);
+            android.view.KeyEvent up = new android.view.KeyEvent(
+                    now, now + 8L, android.view.KeyEvent.ACTION_UP, keyCode, 0, 0,
+                    android.view.KeyCharacterMap.VIRTUAL_KEYBOARD, 0, flags,
+                    android.view.InputDevice.SOURCE_KEYBOARD);
+            try {
+                Method setDisplayId = android.view.InputEvent.class.getMethod("setDisplayId", int.class);
+                setDisplayId.invoke(down, displayId);
+                setDisplayId.invoke(up, displayId);
+            } catch (Throwable ignored) {
+            }
+
+            Object target = null;
+            Method inject = null;
+            try {
+                Class<?> imgClass = Class.forName("android.hardware.input.InputManagerGlobal");
+                target = imgClass.getMethod("getInstance").invoke(null);
+                inject = imgClass.getMethod("injectInputEvent", android.view.InputEvent.class, int.class);
+            } catch (Throwable ignored) {
+            }
+            if (target == null || inject == null) {
+                android.hardware.input.InputManager im =
+                        ctx.getSystemService(android.hardware.input.InputManager.class);
+                if (im != null) {
+                    target = im;
+                    inject = android.hardware.input.InputManager.class.getMethod(
+                            "injectInputEvent", android.view.InputEvent.class, int.class);
+                }
+            }
+            if (target != null && inject != null) {
+                boolean okDown = Boolean.TRUE.equals(inject.invoke(target, down, 0));
+                boolean okUp = Boolean.TRUE.equals(inject.invoke(target, up, 0));
+                ModLog.i(TAG, "cover quick key injected keyCode=" + keyCode + " displayId=" + displayId
+                        + " ok=" + (okDown && okUp));
+                return okDown && okUp;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "injectCoverKeyEvent failed for keyCode=" + keyCode, t);
+        }
+        return false;
     }
 
     private String windowPackageName(Object window) throws ReflectiveOperationException {
@@ -650,7 +1070,18 @@ public final class SystemServerEntry extends XposedModule {
     }
 
     private boolean tokenPolicyApplies(Object token, int callerUid) {
+        int appId = callerUid % 100000;
+        if (appId < 10000 || isThirdPartyImeUid(callerUid)) {
+            return false;
+        }
         String pkg = resolveTokenPackage(token, callerUid);
+        if (pkg != null && ("com.android.systemui".equals(pkg)
+                || "com.miui.home".equals(pkg)
+                || "android".equals(pkg)
+                || "com.sohu.inputmethod.sogou.xiaomi".equals(pkg)
+                || "com.miui.securityinputmethod".equals(pkg))) {
+            return false;
+        }
         if ("com.miui.fliphome".equals(pkg)) {
             return enabled();
         }
@@ -664,22 +1095,49 @@ public final class SystemServerEntry extends XposedModule {
     }
 
     private boolean applies(Object window) throws ReflectiveOperationException {
-        return windowPolicyApplies(window) && eligibleWindow(window) && !isNativeFlipFullscreenWindow(window);
+        return enabled() && eligibleWindow(window) && windowPolicyApplies(window) && !skipsStatusStrippingForWindow(window);
+    }
+
+    private boolean skipsStatusStrippingForWindow(Object window) {
+        try {
+            String pkg = windowPackageName(window);
+            ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(pkg);
+            if (rule != null) {
+                if (rule.topGapPx() >= 0) return false;
+                if (rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        return isNativeFlipFullscreenWindow(window);
+    }
+
+    private boolean skipsStatusStrippingForToken(Object token, int callerUid) {
+        String pkg = resolveTokenPackage(token, callerUid);
+        ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(pkg);
+        if (rule != null) {
+            if (rule.topGapPx() >= 0) return false;
+            if (rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) return false;
+        }
+        return isNativeFlipFullscreenToken(token, callerUid / 100000);
     }
 
     private boolean isNativeFlipFullscreenWindow(Object window) {
         if (window == null || record == null) return false;
         try {
-            return isNativeFlipFullscreenActivityRecord(record.get(window));
+            int fallbackUserId = 0;
+            if (ownerUidField != null) {
+                fallbackUserId = Math.max(0, ownerUidField.getInt(window) / 100000);
+            }
+            return isNativeFlipFullscreenActivityRecord(record.get(window), fallbackUserId);
         } catch (Throwable ignored) {
             return false;
         }
     }
 
-    private boolean isNativeFlipFullscreenToken(Object token) {
+    private boolean isNativeFlipFullscreenToken(Object token, int fallbackUserId) {
         if (token == null || asActivityMethod == null) return false;
         try {
-            return isNativeFlipFullscreenActivityRecord(asActivityMethod.invoke(token));
+            return isNativeFlipFullscreenActivityRecord(asActivityMethod.invoke(token), fallbackUserId);
         } catch (Throwable ignored) {
             return false;
         }
@@ -692,16 +1150,25 @@ public final class SystemServerEntry extends XposedModule {
      * component and cached.
      */
     private boolean isNativeFlipFullscreenActivityRecord(Object ar) {
+        return isNativeFlipFullscreenActivityRecord(ar, 0);
+    }
+
+    private boolean isNativeFlipFullscreenActivityRecord(Object ar, int fallbackUserId) {
         if (ar == null) return false;
         try {
             ComponentName cn = arComponentField != null ? (ComponentName) arComponentField.get(ar) : null;
-            return isNativeFlipFullscreenComponent(cn);
+            int userId = fallbackUserId;
+            if (arUserIdField != null) {
+                int arUser = arUserIdField.getInt(ar);
+                if (arUser >= 0) userId = arUser;
+            }
+            return isNativeFlipFullscreenComponent(cn, userId);
         } catch (Throwable ignored) {
         }
         return false;
     }
 
-    private boolean isNativeFlipFullscreenComponent(ComponentName cn) {
+    private boolean isNativeFlipFullscreenComponent(ComponentName cn, int userId) {
         if (cn == null) return false;
         // The cover launcher declares the flag too, but its status area is managed by this module itself.
         // Super XiaoAi declares supportFlipFullScreen=0 on TabHomeActivity, which we override to left-pane
@@ -711,44 +1178,82 @@ public final class SystemServerEntry extends XposedModule {
             return false;
         }
         if ("com.netease.cloudmusic.activity.MiMiniPlayerActivity".equals(cn.getClassName())) return true;
-        Boolean cached = nativeFlipActivityCache.get(cn);
+        int safeUserId = Math.max(0, userId);
+        String cacheKey = safeUserId + ":" + cn.flattenToShortString();
+        Boolean cached = nativeFlipActivityCache.get(cacheKey);
         if (cached != null) return cached;
         boolean result = false;
+        boolean queryCompleted = false;
         try {
             Bundle activityMeta = null;
             Bundle appMeta = null;
             Object s = service;
             Context ctx = s != null ? (Context) serviceContext.get(s) : null;
-            if (ctx != null) {
-                long token = Binder.clearCallingIdentity();
+            if (ctx == null) {
+                return false;
+            }
+            PackageManager pm = resolvePackageManagerForUser(ctx, safeUserId);
+            if (pm == null) {
+                return false;
+            }
+            long token = Binder.clearCallingIdentity();
+            try {
                 try {
-                    ActivityInfo full = ctx.getPackageManager().getActivityInfo(cn,
+                    ActivityInfo full = pm.getActivityInfo(cn,
                             PackageManager.ComponentInfoFlags.of(PackageManager.GET_META_DATA
                                     | PackageManager.MATCH_DISABLED_COMPONENTS));
                     activityMeta = full.metaData;
                     if (full.applicationInfo != null && full.applicationInfo.metaData != null) {
                         appMeta = full.applicationInfo.metaData;
                     }
-                    if (appMeta == null) {
-                        appMeta = ctx.getPackageManager().getApplicationInfo(cn.getPackageName(),
-                                PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA)).metaData;
-                    }
-                } catch (Throwable ignored) {
-                } finally {
-                    Binder.restoreCallingIdentity(token);
+                    queryCompleted = true;
+                } catch (PackageManager.NameNotFoundException ignored) {
                 }
+                if (appMeta == null) {
+                    try {
+                        appMeta = pm.getApplicationInfo(cn.getPackageName(),
+                                PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA)).metaData;
+                        queryCompleted = true;
+                    } catch (PackageManager.NameNotFoundException ignored) {
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            if (!queryCompleted) {
+                return false;
             }
             if (activityMeta != null && activityMeta.containsKey("miui.supportFlipFullScreen")) {
                 result = activityMeta.getInt("miui.supportFlipFullScreen", -1) == 0;
             } else if (appMeta != null && appMeta.containsKey("miui.supportFlipFullScreen")) {
                 result = appMeta.getInt("miui.supportFlipFullScreen", -1) == 0;
             }
-            nativeFlipActivityCache.put(cn, result);
-            if (result) ModLog.i(TAG, "native cover layout declared by " + cn.flattenToShortString());
+            nativeFlipActivityCache.put(cacheKey, result);
+            if (result) ModLog.i(TAG, "native cover layout declared by " + cacheKey);
             return result;
         } catch (Throwable ignored) {
         }
         return false;
+    }
+
+    private static PackageManager resolvePackageManagerForUser(Context ctx, int userId) {
+        if (ctx == null) return null;
+        if (userId > 0) {
+            try {
+                Object uh = android.os.UserHandle.class.getMethod("of", int.class).invoke(null, userId);
+                if (uh != null) {
+                    Context userCtx = (Context) Context.class
+                            .getMethod("createContextAsUser", android.os.UserHandle.class, int.class)
+                            .invoke(ctx, uh, 0);
+                    if (userCtx != null && userCtx.getPackageManager() != null) {
+                        return userCtx.getPackageManager();
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return ctx.getPackageManager();
     }
 
     private boolean hasNativeFlipFullscreenTopActivity(Object wpc) {
@@ -779,14 +1284,20 @@ public final class SystemServerEntry extends XposedModule {
         return false;
     }
 
-    /** True when the process of this ProcessCompatController shows a natively adapted Activity on the cover. */
+    /** True when the process of this ProcessCompatController shows a natively adapted or full-width Activity on the cover. */
     private boolean isNativeFlipTop(Object pcc) throws ReflectiveOperationException {
         if (pcc == null || !enabled() || !isCoverFolded()) return false;
         Object wpc = pccProcessField.get(pcc);
         if (wpc == null || wpcInfoField == null) return false;
         ApplicationInfo ai = (ApplicationInfo) wpcInfoField.get(wpc);
         if (ai == null || !appCompatEnabled(ai.packageName)) return false;
-        return !isThirdPartyImeProcess(wpc) && hasNativeFlipFullscreenTopActivity(wpc);
+        if (isThirdPartyImeProcess(wpc)) return false;
+        ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(ai.packageName);
+        if (rule != null) {
+            if (rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) return true;
+            if (rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) return false;
+        }
+        return hasNativeFlipFullscreenTopActivity(wpc);
     }
 
     /** Drops the fixed-aspect/scaled compat state. Returns whether anything changed. */
@@ -821,36 +1332,26 @@ public final class SystemServerEntry extends XposedModule {
     }
 
     private int targetTopPxForWindow(Object window) {
+        String pkg = null;
         try {
-            if (window != null) {
-                WindowManager.LayoutParams p = (WindowManager.LayoutParams) attrs.get(window);
-                if (p != null && "com.miui.fliphome".equals(p.packageName)) {
-                    if (ownerUidField != null) {
-                        flipHomeUid = ownerUidField.getInt(window) % 100000;
-                    }
-                    return 0;
+            pkg = windowPackageName(window);
+            if ("com.miui.fliphome".equals(pkg)) {
+                if (window != null && ownerUidField != null) {
+                    flipHomeUid = ownerUidField.getInt(window) % 100000;
                 }
+                return 0;
             }
         } catch (Throwable ignored) {
         }
-        return CoverResourceOverlay.COVER_APP_STATUS_BAR_PX;
+        return ModuleConfig.effectiveAppTopGapPx(pkg, CoverResourceOverlay.COVER_APP_STATUS_BAR_PX);
     }
 
     private int targetTopPxForToken(Object token, int callerUid) {
-        try {
-            int appId = callerUid % 100000;
-            if (appId > 0 && appId == flipHomeUid) {
-                return 0;
-            }
-            if (token != null && asActivityMethod != null && arPkgField != null) {
-                Object ar = asActivityMethod.invoke(token);
-                if (ar != null && "com.miui.fliphome".equals(arPkgField.get(ar))) {
-                    return 0;
-                }
-            }
-        } catch (Throwable ignored) {
+        String pkg = resolveTokenPackage(token, callerUid);
+        if ("com.miui.fliphome".equals(pkg)) {
+            return 0;
         }
-        return CoverResourceOverlay.COVER_APP_STATUS_BAR_PX;
+        return ModuleConfig.effectiveAppTopGapPx(pkg, CoverResourceOverlay.COVER_APP_STATUS_BAR_PX);
     }
 
     private boolean shouldAdjustSource(Object source, int topPx) throws ReflectiveOperationException {
@@ -885,6 +1386,7 @@ public final class SystemServerEntry extends XposedModule {
             Object s = sourceAt.invoke(state, i);
             if (!shouldAdjustSource(s, topPx)) continue;
             Rect frame = (Rect) getSourceFrame.invoke(s);
+            boolean wasVisible = sourceIsVisible == null || Boolean.TRUE.equals(sourceIsVisible.invoke(s));
             Object copy = sourceCopy.newInstance(s);
             if (topPx <= 0) {
                 sourceFrame.invoke(copy, 0, 0, 0, 0);
@@ -896,8 +1398,14 @@ public final class SystemServerEntry extends XposedModule {
                         ? frame.right
                         : Math.max(COVER_DISPLAY_WIDTH, COVER_DISPLAY_HEIGHT);
                 sourceFrame.invoke(copy, left, 0, right, topPx);
-                sourceVisibleFrame.invoke(copy, new Rect(left, 0, right, topPx));
-                sourceVisible.invoke(copy, true);
+                // Preserve hidden visibility for native fullscreen/immersive apps instead of forcing statusBars visible.
+                if (wasVisible) {
+                    sourceVisibleFrame.invoke(copy, new Rect(left, 0, right, topPx));
+                    sourceVisible.invoke(copy, true);
+                } else {
+                    sourceVisibleFrame.invoke(copy, (Object) null);
+                    sourceVisible.invoke(copy, false);
+                }
             }
             addSource.invoke(state, copy);
         }
@@ -950,9 +1458,7 @@ public final class SystemServerEntry extends XposedModule {
             ((Handler) serviceHandler.get(s)).post(() -> {
                 try {
                     synchronized (serviceLock.get(s)) {
-                        if (!appCompatEnabled("com.miui.voiceassist")) {
-                            syncVoiceAssistHideLetterbox(systemServerClassLoader, false);
-                        }
+                        syncConfiguredLetterboxes(systemServerClassLoader);
                         published.clear();
                         Set<Object> displays = new HashSet<>();
                         forAllWindows.invoke(serviceRoot.get(s), (Consumer<Object>) w -> {
@@ -1015,6 +1521,7 @@ public final class SystemServerEntry extends XposedModule {
                 Object res = chain.proceed();
                 try {
                     int state = (Integer) chain.getArg(0);
+                    lastDeviceStateChangeAtMs = SystemClock.uptimeMillis();
                     onFoldStateChanged(chain.getThisObject(), state == 0 || state == 1);
                 } catch (Throwable t) {
                     error(t);
@@ -1029,6 +1536,11 @@ public final class SystemServerEntry extends XposedModule {
 
     private void checkDisplayTransition(Object s) {
         if (s == null || !installed) return;
+        // Let onDisplayDeviceStateChange remain authoritative briefly while DisplayContent(0) switches logical dims.
+        if (lastDeviceStateChangeAtMs > 0L
+                && (SystemClock.uptimeMillis() - lastDeviceStateChangeAtMs) < 400L) {
+            return;
+        }
         try {
             boolean coverNow = isDefaultDisplayCover(s);
             if (lastCoverDisplayInitialized && lastCoverDisplayState == coverNow) return;
@@ -1055,6 +1567,7 @@ public final class SystemServerEntry extends XposedModule {
         try {
             Handler h = (Handler) serviceHandler.get(s);
             if (h == null) {
+                if (!folded) cancelFoldPocketGuard();
                 CoverResourceOverlay.syncForFoldState(folded);
                 syncImeProcessesForFoldState(s, folded);
                 return;
@@ -1066,7 +1579,9 @@ public final class SystemServerEntry extends XposedModule {
                     syncImeProcessesForFoldState(s, true);
                 }, FOLD_TOKEN, 0L);
                 h.postDelayed(() -> syncImeProcessesForFoldState(s, true), FOLD_TOKEN, 150L);
+                scheduleFoldPocketGuardCheck(s, h);
             } else {
+                cancelFoldPocketGuard();
                 h.postDelayed(() -> {
                     CoverResourceOverlay.syncForFoldState(false);
                     syncImeProcessesForFoldState(s, false);
@@ -1079,6 +1594,203 @@ public final class SystemServerEntry extends XposedModule {
         } catch (Throwable t) {
             error(t);
         }
+    }
+
+    private void cancelFoldPocketGuard() {
+        try {
+            Object s = service;
+            Handler h = (s != null && serviceHandler != null) ? (Handler) serviceHandler.get(s) : null;
+            if (h != null) {
+                h.removeCallbacksAndMessages(POCKET_GUARD_TOKEN);
+            }
+        } catch (Throwable ignored) {
+        }
+        SensorManager sm;
+        SensorEventListener l;
+        synchronized (pocketSensorLock) {
+            sm = activePocketSensorManager;
+            l = activePocketSensorListener;
+            activePocketSensorManager = null;
+            activePocketSensorListener = null;
+        }
+        if (sm != null && l != null) {
+            try {
+                sm.unregisterListener(l);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void scheduleFoldPocketGuardCheck(Object s, Handler h) {
+        if (s == null || h == null || !runtimeActive() || !ModuleConfig.foldPocketGuardEnabled()) {
+            return;
+        }
+        boolean seamlessActive = ModuleConfig.foldContinuityMode() != ModuleConfig.FOLD_CONT_SYSTEM
+                || (SystemClock.uptimeMillis() - lastSeamlessFoldContinuityAt) < 3000L;
+        if (!seamlessActive) return;
+        cancelFoldPocketGuard();
+        h.postDelayed(() -> {
+            try {
+                if (!isCoverFolded() || !ModuleConfig.foldPocketGuardEnabled()) return;
+                Context ctx = (Context) serviceContext.get(s);
+                if (ctx == null || isDeviceKeyguardLocked(ctx)) return;
+                android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
+                if (pm == null || !pm.isInteractive()) return;
+                SensorManager sm = ctx.getSystemService(SensorManager.class);
+                if (sm == null) return;
+                Sensor sensor = findBackProximitySensor(sm);
+                if (sensor == null) return;
+
+                final float nearThreshold = Math.min(1.0f, Math.max(0.5f, sensor.getMaximumRange() * 0.5f));
+                final boolean[] pocketNear = {false};
+                final boolean[] settled = {false};
+                final SensorEventListener listener = new SensorEventListener() {
+                    @Override
+                    public void onSensorChanged(SensorEvent event) {
+                        if (settled[0] || event == null || event.values == null || event.values.length == 0) return;
+                        float val = event.values[0];
+                        boolean near = val >= 0f && val < nearThreshold;
+                        pocketNear[0] = near;
+                        if (!near) {
+                            settled[0] = true;
+                            cancelFoldPocketGuard();
+                        }
+                    }
+
+                    @Override
+                    public void onAccuracyChanged(Sensor sensor1, int accuracy) {}
+                };
+                synchronized (pocketSensorLock) {
+                    activePocketSensorManager = sm;
+                    activePocketSensorListener = listener;
+                }
+                if (!sm.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL, h)) {
+                    cancelFoldPocketGuard();
+                    return;
+                }
+                h.postDelayed(() -> {
+                    if (settled[0]) return;
+                    try {
+                        if (pocketNear[0] && isCoverFolded() && ModuleConfig.foldPocketGuardEnabled()) {
+                            android.os.PowerManager power = ctx.getSystemService(android.os.PowerManager.class);
+                            if (power != null && power.isInteractive()) {
+                                Method goToSleep = android.os.PowerManager.class.getMethod("goToSleep", long.class);
+                                goToSleep.invoke(power, SystemClock.uptimeMillis());
+                                ModLog.i(TAG, "fold pocket guard: cover occluded, locking screen");
+                            }
+                        }
+                    } catch (Throwable t) {
+                        error(t);
+                    } finally {
+                        settled[0] = true;
+                        cancelFoldPocketGuard();
+                    }
+                }, POCKET_GUARD_TOKEN, 450L);
+                h.postDelayed(() -> {
+                    if (!settled[0]) {
+                        settled[0] = true;
+                        cancelFoldPocketGuard();
+                    }
+                }, POCKET_GUARD_TOKEN, 1800L);
+            } catch (Throwable t) {
+                cancelFoldPocketGuard();
+                error(t);
+            }
+        }, POCKET_GUARD_TOKEN, 260L);
+    }
+
+    private static Sensor findBackProximitySensor(SensorManager sm) {
+        if (sm == null) return null;
+        Sensor fallback = null;
+        try {
+            for (Sensor sensor : sm.getSensorList(Sensor.TYPE_ALL)) {
+                if (sensor == null) continue;
+                int type = sensor.getType();
+                if (type == SENSOR_TYPE_PROXIMITY_BACK) {
+                    return sensor;
+                }
+                if (type == SENSOR_TYPE_OEM_POCKET && fallback == null) {
+                    fallback = sensor;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return fallback;
+    }
+
+    private static boolean isDeviceKeyguardLocked(Context ctx) {
+        if (ctx == null) return false;
+        try {
+            android.app.KeyguardManager km = ctx.getSystemService(android.app.KeyguardManager.class);
+            return km != null && km.isKeyguardLocked();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isLauncherOrSystemUiPackage(String pkg) {
+        return pkg == null || pkg.isEmpty()
+                || "com.miui.home".equals(pkg)
+                || "com.miui.fliphome".equals(pkg)
+                || "com.android.systemui".equals(pkg)
+                || "android".equals(pkg);
+    }
+
+    private String resolveActiveInnerForegroundApp() {
+        Object iac = interceptActivityControllerRef;
+        if (iac != null) {
+            String iacPkg = resolveFoldForegroundPackage(iac);
+            if (iacPkg != null) return iacPkg;
+        }
+        try {
+            Object s = service;
+            if (s != null && serviceRoot != null && rootDisplay != null && displayFocus != null) {
+                Object root = serviceRoot.get(s);
+                Object dc = root != null ? rootDisplay.invoke(root, 0) : null;
+                Object win = dc != null ? displayFocus.get(dc) : null;
+                String pkg = windowPackageName(win);
+                if (!isLauncherOrSystemUiPackage(pkg)) {
+                    return pkg;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private String resolveFoldForegroundPackage(Object iac) {
+        if (iac == null) return null;
+        try {
+            if (iacTopActivityField != null) {
+                Object ar = iacTopActivityField.get(iac);
+                if (ar != null) {
+                    boolean finishing = arFinishingField != null && arFinishingField.getBoolean(ar);
+                    if (!finishing) {
+                        String pkg = arPkgField != null ? (String) arPkgField.get(ar) : null;
+                        if ((pkg == null || pkg.isEmpty()) && arComponentField != null) {
+                            ComponentName cn = (ComponentName) arComponentField.get(ar);
+                            if (cn != null) pkg = cn.getPackageName();
+                        }
+                        if (!isLauncherOrSystemUiPackage(pkg)) {
+                            return pkg;
+                        }
+                        if ("com.miui.home".equals(pkg) || "com.miui.fliphome".equals(pkg)) {
+                            return null;
+                        }
+                    }
+                }
+            }
+            if (iacPolicyField != null && policyGetFgPkgMethod != null) {
+                Object policy = iacPolicyField.get(iac);
+                if (policy != null && policyGetFgPkgMethod.invoke(policy) instanceof String fgPkg) {
+                    if (!isLauncherOrSystemUiPackage(fgPkg)) {
+                        return fgPkg;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private boolean isDefaultDisplayCover(Object s) throws ReflectiveOperationException {
@@ -1108,11 +1820,41 @@ public final class SystemServerEntry extends XposedModule {
         }
     }
 
-    private volatile boolean voiceAssistLetterboxCleared;
+    private boolean shouldStripLetterboxForPackage(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        if ("com.miui.voiceassist".equals(pkg) && appCompatEnabled(pkg)) {
+            ModuleConfig.PerAppRule r = ModuleConfig.perAppRule(pkg);
+            return r == null || r.widthMode() != ModuleConfig.WIDTH_MODE_FULL;
+        }
+        if (!enabled()) return false;
+        ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(pkg);
+        return rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN;
+    }
+
+    private void syncConfiguredLetterboxes(ClassLoader loader) {
+        if (strippedLetterboxPackages.isEmpty()) return;
+        for (String pkg : new ArrayList<>(strippedLetterboxPackages)) {
+            if (!shouldStripLetterboxForPackage(pkg)) {
+                syncPackageHideLetterbox(loader, pkg, false);
+            }
+        }
+    }
+
+    private void restoreAllPackageHideLetterboxes(ClassLoader loader) {
+        if (strippedLetterboxPackages.isEmpty()
+                && removedHideLetterboxEntries.isEmpty()
+                && removedAspectBlacklistEntries.isEmpty()) {
+            return;
+        }
+        for (String pkg : new ArrayList<>(strippedLetterboxPackages)) {
+            syncPackageHideLetterbox(loader, pkg, false);
+        }
+    }
 
     @SuppressWarnings("unchecked")
-    private void syncVoiceAssistHideLetterbox(ClassLoader loader, boolean strip) {
-        if (strip == voiceAssistLetterboxCleared) return;
+    private void syncPackageHideLetterbox(ClassLoader loader, String pkg, boolean strip) {
+        if (pkg == null || pkg.isEmpty()) return;
+        if (strip == strippedLetterboxPackages.contains(pkg)) return;
         ClassLoader cl = loader != null ? loader : systemServerClassLoader;
         Object s = service;
         if (cl == null || s == null) return;
@@ -1125,8 +1867,8 @@ public final class SystemServerEntry extends XposedModule {
         } catch (Throwable ignored) {
         }
         synchronized (lockObj) {
-            synchronized (voiceAssistLetterboxGuard) {
-                if (strip == voiceAssistLetterboxCleared) return;
+            synchronized (letterboxGuard) {
+                if (strip == strippedLetterboxPackages.contains(pkg)) return;
                 try {
                     Class<?> arImplClass = Class.forName("com.android.server.wm.ActivityRecordImpl", false, cl);
                     Field hideLbField = arImplClass.getDeclaredField("FLIP_SCF_HIDE_LETTERBOX_LIST");
@@ -1138,34 +1880,39 @@ public final class SystemServerEntry extends XposedModule {
                     blField.setAccessible(true);
                     Object blObj = blField.get(null);
 
+                    String prefix = pkg + "/";
                     if (strip) {
                         if (hideLbSet instanceof java.util.Collection<?> col) {
-                            if (col.remove("com.miui.voiceassist")) {
-                                removedHideLetterboxEntries.add("com.miui.voiceassist");
+                            if (col.remove(pkg)) {
+                                removedHideLetterboxEntries.add(pkg);
                             }
                         }
                         if (blObj instanceof java.util.Collection<?> col) {
                             java.util.Iterator<?> it = col.iterator();
                             while (it.hasNext()) {
                                 Object item = it.next();
-                                if (item instanceof String str
-                                        && ("com.miui.voiceassist".equals(str) || str.startsWith("com.miui.voiceassist/"))) {
+                                if (item instanceof String str && (pkg.equals(str) || str.startsWith(prefix))) {
                                     removedAspectBlacklistEntries.add(str);
                                     it.remove();
                                 }
                             }
                         }
-                        voiceAssistLetterboxCleared = true;
+                        strippedLetterboxPackages.add(pkg);
                     } else {
-                        if (hideLbSet instanceof java.util.Collection<?> col && !removedHideLetterboxEntries.isEmpty()) {
-                            ((java.util.Collection<String>) col).addAll(removedHideLetterboxEntries);
-                            removedHideLetterboxEntries.clear();
+                        if (hideLbSet instanceof java.util.Collection<?> col && removedHideLetterboxEntries.remove(pkg)) {
+                            ((java.util.Collection<String>) col).add(pkg);
                         }
                         if (blObj instanceof java.util.Collection<?> col && !removedAspectBlacklistEntries.isEmpty()) {
-                            ((java.util.Collection<String>) col).addAll(removedAspectBlacklistEntries);
-                            removedAspectBlacklistEntries.clear();
+                            java.util.Iterator<String> it = removedAspectBlacklistEntries.iterator();
+                            while (it.hasNext()) {
+                                String entry = it.next();
+                                if (pkg.equals(entry) || entry.startsWith(prefix)) {
+                                    ((java.util.Collection<String>) col).add(entry);
+                                    it.remove();
+                                }
+                            }
                         }
-                        voiceAssistLetterboxCleared = false;
+                        strippedLetterboxPackages.remove(pkg);
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1237,12 +1984,23 @@ public final class SystemServerEntry extends XposedModule {
                     hooks.add(hook(m).intercept(chain -> {
                         try {
                             Object ar = chain.getArg(0);
-                            if (ar != null && arPkgField != null && "com.miui.voiceassist".equals(arPkgField.get(ar))) {
-                                if (appCompatEnabled("com.miui.voiceassist")) {
-                                    syncVoiceAssistHideLetterbox(loader, true);
+                            if (ar != null && arPkgField != null && arPkgField.get(ar) instanceof String pkg) {
+                                ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) {
+                                    syncPackageHideLetterbox(loader, pkg, false);
+                                    return 0;
+                                }
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) {
+                                    syncPackageHideLetterbox(loader, pkg, true);
                                     return 2;
                                 }
-                                syncVoiceAssistHideLetterbox(loader, false);
+                                if ("com.miui.voiceassist".equals(pkg)) {
+                                    if (appCompatEnabled(pkg)) {
+                                        syncPackageHideLetterbox(loader, pkg, true);
+                                        return 2;
+                                    }
+                                    syncPackageHideLetterbox(loader, pkg, false);
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1253,11 +2011,36 @@ public final class SystemServerEntry extends XposedModule {
                     deoptimize(m);
                     hooks.add(hook(m).intercept(chain -> {
                         try {
-                            if ("com.miui.voiceassist".equals(chain.getArg(1))) {
-                                if (appCompatEnabled("com.miui.voiceassist")) {
+                            if (chain.getArg(1) instanceof String pkg) {
+                                ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                                if (rule != null && rule.widthMode() != ModuleConfig.WIDTH_MODE_DEFAULT) {
                                     return 0;
                                 }
-                                syncVoiceAssistHideLetterbox(loader, false);
+                                if ("com.miui.voiceassist".equals(pkg)) {
+                                    if (appCompatEnabled(pkg)) {
+                                        return 0;
+                                    }
+                                    syncPackageHideLetterbox(loader, pkg, false);
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    }));
+                } else if ("getGlobalScaleByName".equals(name) && m.getReturnType() == float.class) {
+                    m.setAccessible(true);
+                    deoptimize(m);
+                    hooks.add(hook(m).intercept(chain -> {
+                        try {
+                            if (enabled() && isCoverFolded() && chain.getArg(0) instanceof String pkg) {
+                                ModuleConfig.PerAppRule rule = ModuleConfig.perAppRule(pkg);
+                                if (rule != null && rule.scalePercent() > 0) {
+                                    if (rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL
+                                            || rule.scalePercent() > 100) {
+                                        return 1.0f;
+                                    }
+                                    return Math.max(0.65f, Math.min(1.0f, rule.scalePercent() / 100f));
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1299,10 +2082,18 @@ public final class SystemServerEntry extends XposedModule {
                     m.setAccessible(true);
                     hooks.add(hook(m).intercept(chain -> {
                         try {
-                            if (chain.getArg(0) instanceof PackageItemInfo info
-                                    && "com.miui.voiceassist".equals(info.packageName)
-                                    && appCompatEnabled("com.miui.voiceassist")) {
-                                return 2;
+                            if (chain.getArg(0) instanceof PackageItemInfo info && info.packageName != null) {
+                                String pkg = info.packageName;
+                                ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) {
+                                    return 0;
+                                }
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) {
+                                    return 2;
+                                }
+                                if ("com.miui.voiceassist".equals(pkg) && appCompatEnabled(pkg)) {
+                                    return 2;
+                                }
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1313,12 +2104,62 @@ public final class SystemServerEntry extends XposedModule {
                     hooks.add(hook(m).intercept(chain -> {
                         try {
                             Object ar = chain.getArg(0);
-                            if (ar != null && arPkgField != null && "com.miui.voiceassist".equals(arPkgField.get(ar))) {
-                                if (appCompatEnabled("com.miui.voiceassist")) {
-                                    syncVoiceAssistHideLetterbox(loader, true);
+                            if (ar != null && arPkgField != null && arPkgField.get(ar) instanceof String pkg) {
+                                ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) {
+                                    syncPackageHideLetterbox(loader, pkg, false);
+                                    return true;
+                                }
+                                if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) {
+                                    syncPackageHideLetterbox(loader, pkg, true);
                                     return false;
                                 }
-                                syncVoiceAssistHideLetterbox(loader, false);
+                                if ("com.miui.voiceassist".equals(pkg)) {
+                                    if (appCompatEnabled(pkg)) {
+                                        syncPackageHideLetterbox(loader, pkg, true);
+                                        return false;
+                                    }
+                                    syncPackageHideLetterbox(loader, pkg, false);
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    }));
+                } else if ("getFlipCompatModeByActivity".equals(name) && m.getReturnType() == int.class) {
+                    m.setAccessible(true);
+                    hooks.add(hook(m).intercept(chain -> {
+                        try {
+                            Object arg0 = chain.getArg(0);
+                            String pkg = arg0 instanceof ComponentName cn ? cn.getPackageName()
+                                    : (arg0 != null && arPkgField != null && arPkgField.getDeclaringClass().isInstance(arg0)
+                                    ? (String) arPkgField.get(arg0) : null);
+                            ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                            if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL) {
+                                return 0;
+                            }
+                            if (rule != null && rule.widthMode() == ModuleConfig.WIDTH_MODE_SAFE_COLUMN) {
+                                syncPackageHideLetterbox(loader, pkg, true);
+                                return 2;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        return chain.proceed();
+                    }));
+                } else if ("getFlipCompatModeByApp".equals(name) && m.getReturnType() == int.class) {
+                    m.setAccessible(true);
+                    hooks.add(hook(m).intercept(chain -> {
+                        try {
+                            String pkg = null;
+                            for (Object arg : chain.getArgs()) {
+                                if (arg instanceof String s && !s.isEmpty()) {
+                                    pkg = s;
+                                    break;
+                                }
+                            }
+                            ModuleConfig.PerAppRule rule = enabled() ? ModuleConfig.perAppRule(pkg) : null;
+                            if (rule != null && rule.widthMode() != ModuleConfig.WIDTH_MODE_DEFAULT) {
+                                return 0;
                             }
                         } catch (Throwable ignored) {
                         }
@@ -1332,6 +2173,23 @@ public final class SystemServerEntry extends XposedModule {
 
         try {
             Class<?> iacClass = loader.loadClass("com.android.server.wm.InterceptActivityController");
+            iacTopActivityField = optionalField(iacClass, "mCurrentTopActivityRecord",
+                    loader.loadClass("com.android.server.wm.ActivityRecord"));
+            iacIsTopKeepedField = optionalField(iacClass, "mIsTopActivityContinuityKeeped", boolean.class);
+            try {
+                Class<?> cpsClass = loader.loadClass("com.android.server.wm.ContinuityPolicyService");
+                iacPolicyField = optionalField(iacClass, "mPolicy", cpsClass);
+                policyGetFgPkgMethod = optionalMethod(cpsClass, "getForegroundPackageName", String.class);
+            } catch (Throwable ignored) {
+            }
+            for (java.lang.reflect.Constructor<?> ctor : iacClass.getDeclaredConstructors()) {
+                ctor.setAccessible(true);
+                hooks.add(hook(ctor).intercept(chain -> {
+                    Object res = chain.proceed();
+                    interceptActivityControllerRef = chain.getThisObject();
+                    return res;
+                }));
+            }
             for (Method m : iacClass.getDeclaredMethods()) {
                 if (!Modifier.isAbstract(m.getModifiers()) && !Modifier.isNative(m.getModifiers())) {
                     deoptimize(m);
@@ -1347,6 +2205,9 @@ public final class SystemServerEntry extends XposedModule {
                     // prompt. Report them as not intercepted so they open directly on the cover screen.
                     m.setAccessible(true);
                     hooks.add(hook(m).intercept(chain -> {
+                        if (chain.getThisObject() != null) {
+                            interceptActivityControllerRef = chain.getThisObject();
+                        }
                         try {
                             if (runtimeActive() && ModuleConfig.allowAllCoverApps()) {
                                 return false;
@@ -1355,16 +2216,72 @@ public final class SystemServerEntry extends XposedModule {
                         }
                         return chain.proceed();
                     }));
-                }
-            }
-            for (Method m : iacClass.getDeclaredMethods()) {
-                if ("isFlipContinuityEnabledFromSetting".equals(m.getName())
+                } else if ("isFlipContinuityEnabled".equals(iacName)
+                        && m.getParameterCount() == 0
                         && m.getReturnType() == boolean.class) {
                     m.setAccessible(true);
                     hooks.add(hook(m).intercept(chain -> {
+                        if (chain.getThisObject() != null) {
+                            interceptActivityControllerRef = chain.getThisObject();
+                        }
                         try {
-                            if (enabled() && ModuleConfig.universalCompatEnabled()) {
+                            if (runtimeActive() && ModuleConfig.foldContinuityMode() != ModuleConfig.FOLD_CONT_SYSTEM) {
                                 return true;
+                            }
+                        } catch (Throwable t) {
+                            error(t);
+                        }
+                        return chain.proceed();
+                    }));
+                } else if ("isFlipContinuityEnabledFromSetting".equals(iacName)
+                        && m.getParameterCount() == 3
+                        && m.getReturnType() == boolean.class) {
+                    m.setAccessible(true);
+                    hooks.add(hook(m).intercept(chain -> {
+                        if (chain.getThisObject() != null) {
+                            interceptActivityControllerRef = chain.getThisObject();
+                        }
+                        try {
+                            if (runtimeActive()) {
+                                int mode = ModuleConfig.foldContinuityMode();
+                                if (mode != ModuleConfig.FOLD_CONT_SYSTEM
+                                        && chain.getArg(0) instanceof String pkg
+                                        && !isLauncherOrSystemUiPackage(pkg)) {
+                                    return mode == ModuleConfig.FOLD_CONT_ALL
+                                            || ModuleConfig.isFoldContinuityApp(pkg);
+                                }
+                            }
+                        } catch (Throwable t) {
+                            error(t);
+                        }
+                        return chain.proceed();
+                    }));
+                } else if ("isKeepContinuityInFold".equals(iacName)
+                        && m.getParameterCount() == 0
+                        && m.getReturnType() == boolean.class) {
+                    m.setAccessible(true);
+                    hooks.add(hook(m).intercept(chain -> {
+                        Object self = chain.getThisObject();
+                        if (self != null) interceptActivityControllerRef = self;
+                        try {
+                            if (runtimeActive()) {
+                                int mode = ModuleConfig.foldContinuityMode();
+                                if (mode != ModuleConfig.FOLD_CONT_SYSTEM) {
+                                    String fgPkg = resolveFoldForegroundPackage(self);
+                                    if (fgPkg == null) {
+                                        return chain.proceed();
+                                    }
+                                    boolean keep = (mode == ModuleConfig.FOLD_CONT_ALL)
+                                            || ModuleConfig.isFoldContinuityApp(fgPkg);
+                                    if (iacIsTopKeepedField != null && self != null) {
+                                        iacIsTopKeepedField.setBoolean(self, keep);
+                                    }
+                                    if (keep) {
+                                        lastSeamlessFoldContinuityAt = SystemClock.uptimeMillis();
+                                    }
+                                    ModLog.i(TAG, "isKeepContinuityInFold pkg=" + fgPkg + " mode=" + mode + " -> " + keep);
+                                    return keep;
+                                }
                             }
                         } catch (Throwable t) {
                             error(t);
@@ -1376,6 +2293,8 @@ public final class SystemServerEntry extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "InterceptActivityController hook skipped", t);
         }
+
+        installMiuiFlipPolicyHook(loader);
 
         for (String extraClsName : new String[]{
                 "com.android.server.wm.AppCompatTask",
@@ -1407,6 +2326,58 @@ public final class SystemServerEntry extends XposedModule {
         installCoverThirdPartyImeHooks(loader);
 
         Log.i(TAG, "universal cover app continuity hooks installed");
+    }
+
+    private void installMiuiFlipPolicyHook(ClassLoader loader) {
+        try {
+            Class<?> flipPolicyClass = loader.loadClass("com.android.server.display.MiuiFlipPolicy");
+            flipPolicyNeedContinueField = optionalField(flipPolicyClass, "mNeedContinueShowAPP", boolean.class);
+            Method shouldSleep = method(flipPolicyClass, "shouldDeviceBeSleep", boolean.class);
+            deoptimize(shouldSleep);
+            hooks.add(hook(shouldSleep).intercept(chain -> {
+                try {
+                    if (!runtimeActive()) {
+                        return chain.proceed();
+                    }
+                    int mode = ModuleConfig.foldContinuityMode();
+                    if (mode == ModuleConfig.FOLD_CONT_SYSTEM) {
+                        return chain.proceed();
+                    }
+                    Object self = chain.getThisObject();
+                    Object s = service;
+                    Context ctx = s != null && serviceContext != null ? (Context) serviceContext.get(s) : null;
+                    if (isDeviceKeyguardLocked(ctx)) {
+                        return chain.proceed();
+                    }
+                    String fgPkg = resolveActiveInnerForegroundApp();
+                    if (fgPkg == null) {
+                        return chain.proceed();
+                    }
+                    boolean shouldContinue = (mode == ModuleConfig.FOLD_CONT_ALL)
+                            || ModuleConfig.isFoldContinuityApp(fgPkg);
+                    if (shouldContinue) {
+                        lastSeamlessFoldContinuityAt = SystemClock.uptimeMillis();
+                        ModLog.i(TAG, "MiuiFlipPolicy seamless continuity kept alive pkg=" + fgPkg);
+                        return false;
+                    }
+                    if (flipPolicyNeedContinueField != null && self != null) {
+                        boolean prev = flipPolicyNeedContinueField.getBoolean(self);
+                        flipPolicyNeedContinueField.setBoolean(self, false);
+                        try {
+                            return chain.proceed();
+                        } finally {
+                            flipPolicyNeedContinueField.setBoolean(self, prev);
+                        }
+                    }
+                } catch (Throwable t) {
+                    error(t);
+                }
+                return chain.proceed();
+            }));
+            Log.i(TAG, "MiuiFlipPolicy fold continuity hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "MiuiFlipPolicy hook skipped", t);
+        }
     }
 
     private void installCoverThirdPartyImeHooks(ClassLoader loader) {
@@ -1571,12 +2542,24 @@ public final class SystemServerEntry extends XposedModule {
                         Object wpc = chain.getThisObject();
                         if (wpc != null && cfg != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                             knownImeProcesses.add(wpc);
-                            if (isCoverFolded() && coverImeEnabled()) {
-                                int rot = getRotationFromConfig(cfg);
-                                adaptCoverImeConfiguration(cfg, rot);
-                                syncProcessCompatForIme(wpc, true, rot);
+                            if (isCoverImeActiveForProcess()) {
+                                // Always clone before mutating: wpc.mWindowProcessControllerConfig may alias
+                                // ATMS.mGlobalConfiguration (mRootWindowContainer.mFullConfiguration).
+                                Configuration copy = new Configuration(cfg);
+                                int rot = getRotationFromConfig(copy);
+                                adaptCoverImeConfiguration(copy, rot);
+                                // Do NOT push FIXED_ASPECT_RATIO_STATE via out-of-band scheduleTransactionItemNow
+                                // during process init before the client receives a full Configuration with appBounds.
+                                return copy;
                             } else {
                                 syncProcessCompatForIme(wpc, false, 0);
+                                if (hasCoverImeOverride(cfg)) {
+                                    Configuration dcCfg = getDefaultDisplayConfig();
+                                    if (dcCfg != null) {
+                                        return new Configuration(dcCfg);
+                                    }
+                                }
+                                return new Configuration(cfg);
                             }
                         }
                     } catch (Throwable t) {
@@ -1593,7 +2576,7 @@ public final class SystemServerEntry extends XposedModule {
                         Object wpc = chain.getThisObject();
                         if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                             knownImeProcesses.add(wpc);
-                            boolean coverActive = isCoverFolded() && coverImeEnabled();
+                            boolean coverActive = isCoverImeActiveForProcess();
                             Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
                             int rot = getRotationFromConfig(procCfg);
                             Configuration reqOverride = (Configuration) ccGetReqOverrideConfig.invoke(wpc);
@@ -1602,20 +2585,25 @@ public final class SystemServerEntry extends XposedModule {
                                 adaptCoverImeConfiguration(reqOverride, rot);
                                 adaptCoverImeConfiguration(resOverride, rot);
                                 adaptCoverImeConfiguration(procCfg, rot);
-                                if (wpcInitConfigField != null) {
-                                    Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
-                                    adaptCoverImeConfiguration(initCfg, rot);
-                                }
+                                setIsolatedWpcInitConfig(wpc, null, true, rot);
                             } else {
-                                clearCoverImeOverride(reqOverride);
-                                clearCoverImeOverride(resOverride);
+                                procCfg = scrubInnerImeProcessConfig(wpc, procCfg);
                             }
                             if (wpcLastReportedConfigField != null) {
                                 Configuration lastCfg = (Configuration) wpcLastReportedConfigField.get(wpc);
-                                if (lastCfg != null) lastCfg.densityDpi = 1;
+                                if (lastCfg != null && !isSharedSystemConfiguration(lastCfg)) {
+                                    lastCfg.densityDpi = 1;
+                                }
                             }
-                            wpcDispatchConfig.invoke(wpc, procCfg);
-                            syncProcessCompatForIme(wpc, coverActive, rot);
+                            if (!coverActive) {
+                                syncProcessCompatForIme(wpc, false, 0);
+                                wpcDispatchConfig.invoke(wpc, procCfg);
+                            } else {
+                                wpcDispatchConfig.invoke(wpc, procCfg);
+                                if (hasNonNullAppBounds(procCfg)) {
+                                    syncProcessCompatForIme(wpc, true, rot);
+                                }
+                            }
                         }
                     } catch (Throwable t) {
                         error(t);
@@ -1629,8 +2617,8 @@ public final class SystemServerEntry extends XposedModule {
                     Object pcc = chain.getThisObject();
                     Object wpc = pcc != null ? pccProcessField.get(pcc) : null;
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
-                        if (isCoverFolded() && coverImeEnabled()) {
-                            Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
+                        Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
+                        if (isCoverImeActiveForProcess() && hasNonNullAppBounds(procCfg)) {
                             int rot = getRotationFromConfig(procCfg);
                             pccBoundsField.set(pcc, coverImeSafeBounds(rot));
                             pccCurrentScaleField.setFloat(pcc, 1.0f);
@@ -1656,29 +2644,55 @@ public final class SystemServerEntry extends XposedModule {
                     Object pcc = chain.getThisObject();
                     Object wpc = pcc != null ? pccProcessField.get(pcc) : null;
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
+                        knownImeProcesses.add(wpc);
                         Configuration config = (Configuration) chain.getArg(0);
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (config == null) {
+                            return chain.proceed();
+                        }
+                        if (isCoverImeActiveForProcess()) {
                             Configuration copy = new Configuration(config);
                             int rot = getRotationFromConfig(config);
                             adaptCoverImeConfiguration(copy, rot);
-                            syncProcessCompatForIme(wpc, true, rot);
+                            Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
+                            if (hasNonNullAppBounds(procCfg)) {
+                                syncProcessCompatForIme(wpc, true, rot);
+                            }
                             return copy;
                         } else {
                             syncProcessCompatForIme(wpc, false, 0);
-                            return config;
+                            // Always return an isolated clone so WPC.<init>'s mWindowProcessControllerConfig
+                            // is detached from ATMS.mGlobalConfiguration from birth.
+                            return new Configuration(config);
                         }
-                    } else if (isNativeFlipTop(pcc)) {
-                        // Only push a new compat state when it actually changes; getCompatConfiguration is a hot
-                        // getter and must not send IPC on every call.
-                        if (clearFixedAspectState(pcc) && sendingCompatState.get() == null) {
-                            sendingCompatState.set(Boolean.TRUE);
-                            try {
-                                pccSendCompatState.invoke(pcc);
-                            } finally {
-                                sendingCompatState.remove();
+                    } else if (enabled() && isCoverFolded() && wpc != null && wpcInfoField != null) {
+                        ApplicationInfo ai = (ApplicationInfo) wpcInfoField.get(wpc);
+                        String procPkg = ai != null ? ai.packageName : null;
+                        ModuleConfig.PerAppRule rule = procPkg != null ? ModuleConfig.perAppRule(procPkg) : null;
+                        boolean nativeTop = isNativeFlipTop(pcc);
+                        if (nativeTop) {
+                            // Only push a new compat state when it actually changes; getCompatConfiguration is a hot
+                            // getter and must not send IPC on every call.
+                            if (clearFixedAspectState(pcc) && sendingCompatState.get() == null) {
+                                sendingCompatState.set(Boolean.TRUE);
+                                try {
+                                    pccSendCompatState.invoke(pcc);
+                                } finally {
+                                    sendingCompatState.remove();
+                                }
                             }
                         }
-                        return chain.getArg(0);
+                        if (rule != null && rule.scalePercent() > 0
+                                && (nativeTop || rule.widthMode() == ModuleConfig.WIDTH_MODE_FULL || rule.scalePercent() > 100)) {
+                            Configuration baseCfg = (Configuration) (nativeTop ? chain.getArg(0) : chain.proceed());
+                            if (baseCfg != null) {
+                                Configuration copy = new Configuration(baseCfg);
+                                applyPerAppCoverScaleConfig(copy, rule.scalePercent());
+                                return copy;
+                            }
+                        }
+                        if (nativeTop) {
+                            return chain.getArg(0);
+                        }
                     }
                 } catch (Throwable t) {
                     error(t);
@@ -1694,10 +2708,13 @@ public final class SystemServerEntry extends XposedModule {
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                         Configuration overrideCfg = (Configuration) chain.getArg(0);
                         Configuration parentCfg = (Configuration) chain.getArg(1);
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             int rot = getRotationFromConfig(parentCfg);
                             adaptCoverImeConfiguration(overrideCfg, rot);
-                            syncProcessCompatForIme(wpc, true, rot);
+                            Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
+                            if (hasNonNullAppBounds(procCfg)) {
+                                syncProcessCompatForIme(wpc, true, rot);
+                            }
                         } else {
                             clearCoverImeOverride(overrideCfg);
                             syncProcessCompatForIme(wpc, false, 0);
@@ -1716,13 +2733,15 @@ public final class SystemServerEntry extends XposedModule {
                     Object wpc = pcc != null ? pccProcessField.get(pcc) : null;
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                         Configuration cfg = (Configuration) chain.getArg(0);
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             int rot = getRotationFromConfig(cfg);
                             adaptCoverImeConfiguration(cfg, rot);
-                            syncProcessCompatForIme(wpc, true, rot);
+                            if (hasNonNullAppBounds(cfg)) {
+                                syncProcessCompatForIme(wpc, true, rot);
+                            }
                         } else {
-                            scrubInnerImeProcessConfig(wpc, cfg);
                             syncProcessCompatForIme(wpc, false, 0);
+                            scrubInnerImeProcessConfig(wpc, cfg);
                         }
                     }
                 } catch (Throwable t) {
@@ -1736,7 +2755,7 @@ public final class SystemServerEntry extends XposedModule {
                     Object wpc = chain.getThisObject();
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                         Configuration reqOverride = (Configuration) ccGetReqOverrideConfig.invoke(wpc);
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             Configuration parentCfg = (Configuration) chain.getArg(0);
                             adaptCoverImeConfiguration(reqOverride, getRotationFromConfig(parentCfg));
                         } else {
@@ -1750,7 +2769,7 @@ public final class SystemServerEntry extends XposedModule {
                 try {
                     Object wpc = chain.getThisObject();
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             Configuration parentCfg = (Configuration) chain.getArg(0);
                             int rot = getRotationFromConfig(parentCfg);
                             Configuration resolved = (Configuration) ccGetResolvedOverrideConfig.invoke(wpc);
@@ -1769,7 +2788,7 @@ public final class SystemServerEntry extends XposedModule {
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
                         Configuration reqOverride = (Configuration) ccGetReqOverrideConfig.invoke(wpc);
                         Configuration resOverride = (Configuration) ccGetResolvedOverrideConfig.invoke(wpc);
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             Configuration newParent = (Configuration) chain.getArg(0);
                             int rot = getRotationFromConfig(newParent);
                             adaptCoverImeConfiguration(reqOverride, rot);
@@ -1786,7 +2805,7 @@ public final class SystemServerEntry extends XposedModule {
                 try {
                     Object wpc = chain.getThisObject();
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
-                        if (isCoverFolded() && coverImeEnabled()) {
+                        if (isCoverImeActiveForProcess()) {
                             Configuration newParent = (Configuration) chain.getArg(0);
                             int rot = getRotationFromConfig(newParent);
                             Configuration full = (Configuration) ccGetConfig.invoke(wpc);
@@ -1800,25 +2819,52 @@ public final class SystemServerEntry extends XposedModule {
             }));
 
             hooks.add(hook(wpcDispatchConfig).intercept(chain -> {
+                Object wpc = null;
+                Configuration cfg = null;
+                Configuration overrideArg = null;
+                boolean pushCoverCompatAfter = false;
+                int pushRot = 0;
                 try {
-                    Object wpc = chain.getThisObject();
+                    wpc = chain.getThisObject();
                     if (wpc != null && imeHooksActive() && isThirdPartyImeProcess(wpc)) {
-                        Configuration cfg = (Configuration) chain.getArg(0);
-                        if (isCoverFolded() && coverImeEnabled()) {
-                            int rot = getRotationFromConfig(cfg);
-                            adaptCoverImeConfiguration(cfg, rot);
-                            Configuration full = (Configuration) ccGetConfig.invoke(wpc);
-                            adaptCoverImeConfiguration(full, rot);
-                            syncProcessCompatForIme(wpc, true, rot);
-                        } else {
-                            scrubInnerImeProcessConfig(wpc, cfg);
-                            syncProcessCompatForIme(wpc, false, 0);
+                        knownImeProcesses.add(wpc);
+                        cfg = (Configuration) chain.getArg(0);
+                        if (cfg != null) {
+                            if (isCoverImeActiveForProcess()) {
+                                int rot = getRotationFromConfig(cfg);
+                                Configuration dispatchCopy = new Configuration(cfg);
+                                adaptCoverImeConfiguration(dispatchCopy, rot);
+                                overrideArg = dispatchCopy;
+                                Configuration full = (Configuration) ccGetConfig.invoke(wpc);
+                                adaptCoverImeConfiguration(full, rot);
+                                pushCoverCompatAfter = hasNonNullAppBounds(dispatchCopy);
+                                pushRot = rot;
+                            } else {
+                                // Clear state=0 BEFORE dispatching inner/mirror config so client never runs BoundsCompat
+                                // against a transitioning Configuration.
+                                syncProcessCompatForIme(wpc, false, 0);
+                                Configuration scrubbed = scrubInnerImeProcessConfig(wpc, cfg);
+                                if (scrubbed != null && scrubbed != cfg) {
+                                    overrideArg = scrubbed;
+                                }
+                            }
                         }
                     }
                 } catch (Throwable t) {
                     error(t);
                 }
-                return chain.proceed();
+                Object res = overrideArg != null
+                        ? chain.proceed(new Object[]{overrideArg})
+                        : chain.proceed();
+                if (pushCoverCompatAfter && wpc != null) {
+                    try {
+                        // Push state=8 AFTER ConfigurationChangeItem is queued with non-null appBounds.
+                        syncProcessCompatForIme(wpc, true, pushRot);
+                    } catch (Throwable t) {
+                        error(t);
+                    }
+                }
+                return res;
             }));
 
             Class<?> winClass = loader.loadClass("com.android.server.wm.WindowState");
@@ -1858,12 +2904,14 @@ public final class SystemServerEntry extends XposedModule {
             hooks.add(hook(winSetFrames).intercept(chain -> {
                 try {
                     Object win = chain.getThisObject();
-                    if (isCoverFolded() && coverImeEnabled() && isThirdPartyImeWindow(win)) {
-                        int rot = getWindowRotation(win);
-                        ensureCoverImeWindowAttrs(win, rot);
-                        clampClientFramesHorizontally(chain.getArg(0), rot);
-                    } else if (imeHooksActive() && isThirdPartyImeWindow(win)) {
-                        restoreInnerImeWindowAttrs(win);
+                    if (isThirdPartyImeWindow(win)) {
+                        if (isCoverImeActiveForWindow(win)) {
+                            int rot = getWindowRotation(win);
+                            ensureCoverImeWindowAttrs(win, rot);
+                            clampClientFramesHorizontally(chain.getArg(0), rot);
+                        } else if (imeHooksActive()) {
+                            restoreInnerImeWindowAttrs(win);
+                        }
                     }
                 } catch (Throwable t) {
                     error(t);
@@ -1875,25 +2923,29 @@ public final class SystemServerEntry extends XposedModule {
                 Object res = chain.proceed();
                 try {
                     Object win = chain.getThisObject();
-                    if (isCoverFolded() && coverImeEnabled() && isThirdPartyImeWindow(win)) {
-                        int rot = getWindowRotation(win);
-                        ensureCoverImeWindowAttrs(win, rot);
-                        Object outFrames = chain.getArg(0);
-                        Object outMerged = chain.getArg(1);
-                        clampClientFramesHorizontally(outFrames, rot);
-                        Object lastFrames = winLastReportedFramesField.get(win);
-                        if (lastFrames != null && lastFrames != outFrames) {
-                            clampClientFramesHorizontally(lastFrames, rot);
+                    if (isThirdPartyImeWindow(win)) {
+                        if (isCoverImeActiveForWindow(win)) {
+                            int rot = getWindowRotation(win);
+                            ensureCoverImeWindowAttrs(win, rot);
+                            Object outFrames = chain.getArg(0);
+                            Object outMerged = chain.getArg(1);
+                            clampClientFramesHorizontally(outFrames, rot);
+                            Object lastFrames = winLastReportedFramesField.get(win);
+                            if (lastFrames != null && lastFrames != outFrames) {
+                                clampClientFramesHorizontally(lastFrames, rot);
+                            }
+                            adaptMergedConfiguration(outMerged, rot);
+                            Object lastMerged = winLastReportedConfigField.get(win);
+                            if (lastMerged != null && lastMerged != outMerged) {
+                                adaptMergedConfiguration(lastMerged, rot);
+                            }
+                            Configuration winCfg = (Configuration) ccGetConfig.invoke(win);
+                            adaptCoverImeConfiguration(winCfg, rot);
+                            Configuration winMergedOverride = (Configuration) wcGetMergedOverrideConfig.invoke(win);
+                            adaptCoverImeConfiguration(winMergedOverride, rot);
+                        } else if (imeHooksActive()) {
+                            restoreInnerImeWindowAttrs(win);
                         }
-                        adaptMergedConfiguration(outMerged, rot);
-                        Object lastMerged = winLastReportedConfigField.get(win);
-                        if (lastMerged != null && lastMerged != outMerged) {
-                            adaptMergedConfiguration(lastMerged, rot);
-                        }
-                        Configuration winCfg = (Configuration) ccGetConfig.invoke(win);
-                        adaptCoverImeConfiguration(winCfg, rot);
-                        Configuration winMergedOverride = (Configuration) wcGetMergedOverrideConfig.invoke(win);
-                        adaptCoverImeConfiguration(winMergedOverride, rot);
                     }
                 } catch (Throwable t) {
                     error(t);
@@ -1920,17 +2972,18 @@ public final class SystemServerEntry extends XposedModule {
                     int displayId = (Integer) chain.getArg(0);
                     if (infoObj != null
                             && displayId == 0
-                            && coverImeEnabled()
+                            && isCoverImeActiveForProcess()
                             && isThirdPartyImeUid(Binder.getCallingUid())
-                            && Binder.getCallingPid() != android.os.Process.myPid()
-                            && isCoverFolded()) {
+                            && Binder.getCallingPid() != android.os.Process.myPid()) {
                         Object copy = infoCopy.newInstance(infoObj);
                         int rot = getCurrentCoverDisplayRotation();
                         if (rot < 0) rot = infoRotation != null ? infoRotation.getInt(copy) : 0;
                         if (infoRotation != null) infoRotation.setInt(copy, rot);
+                        int scalePct = ModuleConfig.imeDpiScalePercent();
                         int imeW = CoverDisplay.coverImeWidth(rot);
                         int imeH = CoverDisplay.coverImeDisplayHeight(rot);
-                        int imeDpi = CoverDisplay.coverImeDensityDpi(rot);
+                        int imeDpi = CoverDisplay.coverImeDensityDpi(rot, scalePct);
+                        appliedCoverImeDpis.add(imeDpi);
                         int minDim = Math.min(imeW, imeH);
                         int maxDim = Math.max(imeW, imeH);
                         infoWidth.setInt(copy, imeW);
@@ -1953,8 +3006,10 @@ public final class SystemServerEntry extends XposedModule {
                 return infoObj;
             }));
 
+            ModLog.recordHookHealth("ime_hooks", "ok");
             Log.i(TAG, "cover third-party IME bounds & density adaptation hooks installed");
         } catch (Throwable t) {
+            ModLog.recordHookHealth("ime_hooks", "err:" + t.getClass().getSimpleName());
             Log.w(TAG, "cover third-party IME bounds & density adaptation hook failed", t);
         }
     }
@@ -2078,50 +3133,57 @@ public final class SystemServerEntry extends XposedModule {
         return CoverDisplay.coverImeSafeBounds(rotation);
     }
 
+    /**
+     * Lock-free reader safe to invoke from DMS.getDisplayInfo (which must NEVER acquire WMS.mGlobalLock to avoid
+     * DMS<->WMS AB-BA deadlock). Returns the cached rotation maintained by locked WM paths.
+     */
     private int getCurrentCoverDisplayRotation() {
+        return cachedCoverDisplayRotation;
+    }
+
+    /** Caller must already hold WMS.mGlobalLock. */
+    private int refreshCoverDisplayRotationLocked(Object dc) {
         try {
-            Object s = service;
-            if (s != null && serviceRoot != null && rootDisplay != null && getInfo != null && infoRotation != null) {
-                Object root = serviceRoot.get(s);
-                if (root != null) {
-                    Object dc = rootDisplay.invoke(root, 0);
-                    if (dc != null) {
-                        Object di = getInfo.invoke(dc);
-                        if (di != null) {
-                            int r = infoRotation.getInt(di);
-                            if (r >= 0) return r;
-                        }
+            if (dc != null && getInfo != null && infoRotation != null) {
+                Object di = getInfo.invoke(dc);
+                if (di != null) {
+                    int r = infoRotation.getInt(di);
+                    if (r >= 0) {
+                        cachedCoverDisplayRotation = r;
+                        return r;
                     }
                 }
             }
         } catch (Throwable ignored) {
         }
-        return -1;
+        return cachedCoverDisplayRotation;
     }
 
     private int getRotationFromConfig(Configuration cfg) {
-        if (isCoverFolded()) {
-            int live = getCurrentCoverDisplayRotation();
-            if (live >= 0) return live;
-        }
         if (cfg != null && windowConfigField != null) {
             try {
                 Object wc = windowConfigField.get(cfg);
                 if (wc != null) {
                     if (wcGetDisplayRotation != null) {
                         int dr = (Integer) wcGetDisplayRotation.invoke(wc);
-                        if (dr >= 0) return dr;
+                        if (dr >= 0) {
+                            if (isCoverFolded()) cachedCoverDisplayRotation = dr;
+                            return dr;
+                        }
                     }
                     if (wcGetRotation != null) {
                         int r = (Integer) wcGetRotation.invoke(wc);
-                        if (r >= 0) return r;
+                        if (r >= 0) {
+                            if (isCoverFolded()) cachedCoverDisplayRotation = r;
+                            return r;
+                        }
                     }
                 }
             } catch (Throwable ignored) {
             }
         }
-        int fallback = getCurrentCoverDisplayRotation();
-        return fallback >= 0 ? fallback : 0;
+        int cached = cachedCoverDisplayRotation;
+        return cached >= 0 ? cached : 0;
     }
 
     private int getWindowRotation(Object win) {
@@ -2132,7 +3194,12 @@ public final class SystemServerEntry extends XposedModule {
                     Object di = getInfo.invoke(dc);
                     if (di != null) {
                         int r = infoRotation.getInt(di);
-                        if (r >= 0) return r;
+                        if (r >= 0) {
+                            if (isCoverFolded() && isWindowOnDefaultDisplay(win)) {
+                                cachedCoverDisplayRotation = r;
+                            }
+                            return r;
+                        }
                     }
                 }
             }
@@ -2142,8 +3209,8 @@ public final class SystemServerEntry extends XposedModule {
             }
         } catch (Throwable ignored) {
         }
-        int fallback = getCurrentCoverDisplayRotation();
-        return fallback >= 0 ? fallback : 0;
+        int cached = cachedCoverDisplayRotation;
+        return cached >= 0 ? cached : 0;
     }
 
     private void ensureCoverImeWindowAttrs(Object win, int rotation) {
@@ -2176,12 +3243,108 @@ public final class SystemServerEntry extends XposedModule {
         }
     }
 
+    private Configuration getDefaultDisplayConfig() {
+        try {
+            Object s = service;
+            Object root = (s != null && serviceRoot != null) ? serviceRoot.get(s) : null;
+            Object dc = (root != null && rootDisplay != null) ? rootDisplay.invoke(root, 0) : null;
+            return (dc != null && ccGetConfig != null) ? (Configuration) ccGetConfig.invoke(dc) : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Hard identity guard preventing any in-place mutation of shared global/display Configuration
+     * instances ({@code mRootWindowContainer}'s global config or {@code DisplayContent(0)}'s config).
+     */
+    private boolean isSharedSystemConfiguration(Configuration cfg) {
+        if (cfg == null) return false;
+        if (EMPTY_CONFIG != null && cfg == EMPTY_CONFIG) return true;
+        try {
+            Object s = service;
+            Object root = (s != null && serviceRoot != null) ? serviceRoot.get(s) : null;
+            if (root != null && ccGetConfig != null) {
+                if (cfg == ccGetConfig.invoke(root)) return true;
+                if (ccGetReqOverrideConfig != null && cfg == ccGetReqOverrideConfig.invoke(root)) return true;
+                if (ccGetResolvedOverrideConfig != null && cfg == ccGetResolvedOverrideConfig.invoke(root)) return true;
+                Object dc0 = rootDisplay != null ? rootDisplay.invoke(root, 0) : null;
+                if (dc0 != null) {
+                    if (cfg == ccGetConfig.invoke(dc0)) return true;
+                    if (ccGetReqOverrideConfig != null && cfg == ccGetReqOverrideConfig.invoke(dc0)) return true;
+                    if (ccGetResolvedOverrideConfig != null && cfg == ccGetResolvedOverrideConfig.invoke(dc0)) return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void setIsolatedWpcInitConfig(Object wpc, Configuration source, boolean adaptCover, int rot)
+            throws ReflectiveOperationException {
+        if (wpc == null || wpcInitConfigField == null) return;
+        Configuration base = source != null ? source : (Configuration) wpcInitConfigField.get(wpc);
+        if (base == null) return;
+        if (!adaptCover && hasCoverImeOverride(base)) {
+            Configuration dcCfg = getDefaultDisplayConfig();
+            if (dcCfg != null) {
+                wpcInitConfigField.set(wpc, new Configuration(dcCfg));
+                return;
+            }
+        }
+        Configuration copy = new Configuration(base);
+        if (adaptCover) {
+            adaptCoverImeConfiguration(copy, rot);
+        } else if (hasCoverImeOverride(copy)) {
+            clearCoverImeOverride(copy);
+        }
+        wpcInitConfigField.set(wpc, copy);
+    }
+
+    private void applyPerAppCoverScaleConfig(Configuration cfg, int scalePercent) throws ReflectiveOperationException {
+        if (cfg == null || scalePercent <= 0) return;
+        if (isSharedSystemConfiguration(cfg)) {
+            ModLog.w(TAG, "refused in-place mutation of shared system Configuration in applyPerAppCoverScaleConfig");
+            return;
+        }
+        int targetDpi = Math.max(240, Math.min(640, Math.round(CoverDisplay.DENSITY_DPI * (scalePercent / 100f))));
+        int oldDpi = cfg.densityDpi > 0 ? cfg.densityDpi : CoverDisplay.DENSITY_DPI;
+        cfg.densityDpi = targetDpi;
+        Rect bounds = null;
+        if (windowConfigField != null && wcGetAppBounds != null) {
+            Object wc = windowConfigField.get(cfg);
+            if (wc != null) bounds = (Rect) wcGetAppBounds.invoke(wc);
+        }
+        int wDp;
+        int hDp;
+        if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+            wDp = Math.max(200, Math.round(bounds.width() * 160f / targetDpi));
+            hDp = Math.max(200, Math.round(bounds.height() * 160f / targetDpi));
+        } else {
+            wDp = Math.max(200, Math.round(cfg.screenWidthDp * (oldDpi / (float) targetDpi)));
+            hDp = Math.max(200, Math.round(cfg.screenHeightDp * (oldDpi / (float) targetDpi)));
+        }
+        int swDp = Math.min(wDp, hDp);
+        cfg.screenWidthDp = wDp;
+        cfg.screenHeightDp = hDp;
+        cfg.smallestScreenWidthDp = swDp;
+        if (cfgCompatWField != null) cfgCompatWField.setInt(cfg, wDp);
+        if (cfgCompatHField != null) cfgCompatHField.setInt(cfg, hDp);
+        if (cfgCompatSwField != null) cfgCompatSwField.setInt(cfg, swDp);
+    }
+
     private void adaptCoverImeConfiguration(Configuration cfg, int rotation) throws ReflectiveOperationException {
         if (cfg == null) return;
+        if (isSharedSystemConfiguration(cfg)) {
+            ModLog.w(TAG, "refused in-place mutation of shared system Configuration in adaptCoverImeConfiguration");
+            return;
+        }
         Rect safe = coverImeSafeBounds(rotation);
-        int dpi = CoverDisplay.coverImeDensityDpi(rotation);
-        int wDp = CoverDisplay.coverImeScreenWidthDp(rotation);
-        int hDp = CoverDisplay.coverImeScreenHeightDp(rotation);
+        int scalePct = ModuleConfig.imeDpiScalePercent();
+        int dpi = CoverDisplay.coverImeDensityDpi(rotation, scalePct);
+        int wDp = CoverDisplay.coverImeScreenWidthDp(rotation, scalePct);
+        int hDp = CoverDisplay.coverImeScreenHeightDp(rotation, scalePct);
+        appliedCoverImeDpis.add(dpi);
         Object wc = windowConfigField.get(cfg);
         if (wc != null) {
             wcSetBounds.invoke(wc, safe);
@@ -2204,38 +3367,68 @@ public final class SystemServerEntry extends XposedModule {
         Rect b = wc != null ? (Rect) wcGetBounds.invoke(wc) : null;
         return cfg.densityDpi == CoverDisplay.IME_DENSITY_DPI_ROT0
                 || cfg.densityDpi == CoverDisplay.IME_DENSITY_DPI_WIDE
+                || appliedCoverImeDpis.contains(cfg.densityDpi)
                 || (b != null && (CoverDisplay.isOuterDimensions(b.right, b.bottom)
                 || (b.width() == COVER_SAFE_WIDTH && b.height() == COVER_DISPLAY_HEIGHT)
                 || (b.width() == CoverDisplay.CAMERA_TOP && b.height() == CoverDisplay.WIDTH)));
     }
 
-    private void scrubInnerImeProcessConfig(Object wpc, Configuration cfg) throws ReflectiveOperationException {
+    private boolean hasNonNullAppBounds(Configuration cfg) {
+        if (cfg == null || windowConfigField == null || wcGetAppBounds == null) return false;
+        try {
+            Object wc = windowConfigField.get(cfg);
+            return wc != null && wcGetAppBounds.invoke(wc) instanceof Rect r && !r.isEmpty();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private Configuration scrubInnerImeProcessConfig(Object wpc, Configuration cfg) throws ReflectiveOperationException {
         clearCoverImeOverride((Configuration) ccGetReqOverrideConfig.invoke(wpc));
         clearCoverImeOverride((Configuration) ccGetResolvedOverrideConfig.invoke(wpc));
         if (wpcInitConfigField != null) {
-            clearCoverImeOverride((Configuration) wpcInitConfigField.get(wpc));
+            Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
+            if (initCfg != null && hasCoverImeOverride(initCfg)) {
+                Configuration dcCfg = getDefaultDisplayConfig();
+                if (dcCfg != null) {
+                    wpcInitConfigField.set(wpc, new Configuration(dcCfg));
+                } else {
+                    Configuration initCopy = new Configuration(initCfg);
+                    clearCoverImeOverride(initCopy);
+                    wpcInitConfigField.set(wpc, initCopy);
+                }
+            } else if (initCfg != null && isSharedSystemConfiguration(initCfg)) {
+                wpcInitConfigField.set(wpc, new Configuration(initCfg));
+            }
         }
-        if (!isCoverFolded() && hasCoverImeOverride(cfg)) {
+        // Never call clearCoverImeOverride(cfg) directly on a full dispatched Configuration (which would set
+        // windowConfiguration.mAppBounds = null and crash BoundsCompat.adaptDisplayInfo:100 with NPE). Always
+        // restore from DisplayContent(0)'s complete Configuration instead.
+        if ((!isCoverFolded() || CoverImeGuard.isMirrorVirtualDisplayActive()) && hasCoverImeOverride(cfg)) {
             try {
-                Object s = service;
-                Object root = s != null ? serviceRoot.get(s) : null;
-                Object dc = root != null ? rootDisplay.invoke(root, 0) : null;
-                Configuration dcCfg = dc != null ? (Configuration) ccGetConfig.invoke(dc) : null;
+                Configuration dcCfg = getDefaultDisplayConfig();
                 if (dcCfg != null) {
                     Configuration full = (Configuration) ccGetConfig.invoke(wpc);
-                    if (full != null) full.setTo(dcCfg);
-                    cfg.setTo(dcCfg);
-                    if (wpcInitConfigField != null) {
-                        Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
-                        if (initCfg != null) initCfg.setTo(dcCfg);
+                    if (full != null && !isSharedSystemConfiguration(full)) {
+                        full.setTo(dcCfg);
                     }
+                    if (wpcInitConfigField != null) {
+                        wpcInitConfigField.set(wpc, new Configuration(dcCfg));
+                    }
+                    return new Configuration(dcCfg);
                 }
             } catch (Throwable ignored) {
             }
         }
+        return cfg;
     }
 
     private void clearCoverImeOverride(Configuration reqOverride) throws ReflectiveOperationException {
+        if (reqOverride == null) return;
+        if (isSharedSystemConfiguration(reqOverride)) {
+            ModLog.w(TAG, "refused in-place mutation of shared system Configuration in clearCoverImeOverride");
+            return;
+        }
         if (!hasCoverImeOverride(reqOverride)) return;
         Object wc = windowConfigField.get(reqOverride);
         if (wc != null) {
@@ -2293,6 +3486,26 @@ public final class SystemServerEntry extends XposedModule {
         return installed && (imeCompatApplied || coverImeEnabled());
     }
 
+    /** Lock-free check: cover IME adaptation pauses while an active mirror/virtual display is hosting windows. */
+    private boolean isCoverImeActiveForProcess() {
+        return isCoverFolded() && coverImeEnabled() && !CoverImeGuard.isMirrorVirtualDisplayActive();
+    }
+
+    private boolean isWindowOnDefaultDisplay(Object win) {
+        if (win == null || getDisplay == null || displayGetIdMethod == null) return true;
+        try {
+            Object dc = getDisplay.invoke(win);
+            if (dc == null) return false;
+            return (Integer) displayGetIdMethod.invoke(dc) == 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean isCoverImeActiveForWindow(Object win) {
+        return isCoverImeActiveForProcess() && isWindowOnDefaultDisplay(win);
+    }
+
     private void syncProcessCompatForIme(Object wpc, boolean coverActive, int rotation) {
         if (wpc == null || wpcCompatCtrlField == null || pccBoundsField == null || pccSendCompatState == null) return;
         try {
@@ -2347,8 +3560,9 @@ public final class SystemServerEntry extends XposedModule {
                 Object dc = rootDisplay.invoke(root, 0);
                 if (dc == null) return;
                 Configuration dcConfig = (Configuration) ccGetConfig.invoke(dc);
-                int rot = getRotationFromConfig(dcConfig);
-                boolean coverActive = folded && featureOn;
+                int liveRot = refreshCoverDisplayRotationLocked(dc);
+                int rot = liveRot >= 0 ? liveRot : getRotationFromConfig(dcConfig);
+                boolean coverActive = folded && featureOn && !CoverImeGuard.isMirrorVirtualDisplayActive();
                 if (coverActive) imeCompatApplied = true;
 
                 Set<Object> imeProcs;
@@ -2382,21 +3596,15 @@ public final class SystemServerEntry extends XposedModule {
                         if (coverActive) {
                             adaptCoverImeConfiguration(reqOverride, rot);
                             adaptCoverImeConfiguration(resOverride, rot);
-                            if (wpcInitConfigField != null) {
-                                Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
-                                adaptCoverImeConfiguration(initCfg, rot);
-                            }
+                            setIsolatedWpcInitConfig(wpc, null, true, rot);
                         } else {
                             clearCoverImeOverride(reqOverride);
                             clearCoverImeOverride(resOverride);
-                            if (wpcInitConfigField != null) {
-                                Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
-                                clearCoverImeOverride(initCfg);
-                            }
+                            setIsolatedWpcInitConfig(wpc, null, false, 0);
                         }
                         if (wpcLastReportedConfigField != null) {
                             Configuration lastCfg = (Configuration) wpcLastReportedConfigField.get(wpc);
-                            if (lastCfg != null) {
+                            if (lastCfg != null && !isSharedSystemConfiguration(lastCfg)) {
                                 lastCfg.densityDpi = 1;
                             }
                         }
@@ -2404,29 +3612,40 @@ public final class SystemServerEntry extends XposedModule {
                         Configuration procCfg = (Configuration) ccGetConfig.invoke(wpc);
                         if (coverActive) {
                             adaptCoverImeConfiguration(procCfg, rot);
-                        } else if (wpcInitConfigField != null && procCfg != null) {
-                            Configuration initCfg = (Configuration) wpcInitConfigField.get(wpc);
-                            if (initCfg != null) initCfg.setTo(procCfg);
+                            wpcDispatchConfig.invoke(wpc, procCfg);
+                            if (hasNonNullAppBounds(procCfg)) {
+                                syncProcessCompatForIme(wpc, true, rot);
+                            }
+                        } else {
+                            if (wpcInitConfigField != null && procCfg != null) {
+                                wpcInitConfigField.set(wpc, new Configuration(procCfg));
+                            }
+                            syncProcessCompatForIme(wpc, false, 0);
+                            wpcDispatchConfig.invoke(wpc, procCfg);
                         }
-                        wpcDispatchConfig.invoke(wpc, procCfg);
-                        syncProcessCompatForIme(wpc, coverActive, rot);
                     } catch (Throwable t) {
                         error(t);
                     }
                 }
 
+                Set<Object> displaysToLayout = new HashSet<>();
+                displaysToLayout.add(dc);
                 for (Object w : imeWindows) {
                     try {
-                        if (coverActive) {
+                        if (coverActive && isWindowOnDefaultDisplay(w)) {
                             ensureCoverImeWindowAttrs(w, rot);
                         } else {
                             restoreInnerImeWindowAttrs(w);
                         }
                         notifyInsets.invoke(w);
+                        Object winDc = getDisplay != null ? getDisplay.invoke(w) : null;
+                        if (winDc != null) displaysToLayout.add(winDc);
                     } catch (Throwable ignored) {
                     }
                 }
-                layoutNeeded.invoke(dc);
+                for (Object d : displaysToLayout) {
+                    layoutNeeded.invoke(d);
+                }
                 traversal.invoke(s);
                 if (!featureOn) imeCompatApplied = false;
             }

@@ -32,15 +32,18 @@ final class SystemUiOrb {
     private final PowerManager power;
     private boolean started;
     private boolean shadeStateKnown;
+    private boolean blocked;
     private float panelFraction = 1f;
     private WindowManager windowManager;
     private StatusOrb orb;
     private int attachedDisplayId = Display.INVALID_DISPLAY;
     private int lastRotation = -1;
+    private int lastWindowFlags;
     private Rect lastBounds;
     private Rect lastCutout;
     private Rect lastLocation;
     private float desktopIconCenter = -1f;
+    private final Runnable configListener = this::scheduleRefresh;
     /** Window context for the cover display, created once per display id instead of on every poll. */
     private int windowContextDisplayId = Display.INVALID_DISPLAY;
     private Context windowContext;
@@ -92,6 +95,7 @@ final class SystemUiOrb {
                 filter.addAction(Intent.ACTION_USER_PRESENT);
                 context.registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
                 displays.registerDisplayListener(displayListener, handler);
+                ModuleConfig.addListener(configListener);
                 DesktopAlignment.listen(context, center -> {
                     if (desktopIconCenter != center) {
                         desktopIconCenter = center;
@@ -113,8 +117,13 @@ final class SystemUiOrb {
     void setSystemPanelExpanded(boolean expanded) {
         Runnable update = () -> {
             shadeStateKnown = true;
-            if (expanded) removeOverlay();
-            scheduleRefresh();
+            blocked = expanded;
+            if (expanded) {
+                panelFraction = 1f;
+                removeOverlay();
+            } else {
+                scheduleRefresh();
+            }
         };
         if (Looper.myLooper() == Looper.getMainLooper()) update.run();
         else handler.post(update);
@@ -124,17 +133,40 @@ final class SystemUiOrb {
         shadeStateKnown = true;
         panelFraction = value;
         if (orb != null) applyPresentation();
-        else scheduleRefresh();
+        else if (!blocked) scheduleRefresh();
+    }
+
+    private float desiredAlpha() {
+        boolean unlock = UnlockMotion.active();
+        return (1f - panelFraction) * (unlock ? UnlockMotion.alpha : 1f);
+    }
+
+    private int desiredWindowFlags(float alpha) {
+        boolean touchable = ModuleConfig.hasOrbInteraction() && alpha >= 0.05f && panelFraction <= 0.05f;
+        return WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                | (touchable ? 0 : WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
     }
 
     void applyPresentation() {
         if (orb == null) return;
         boolean unlock = UnlockMotion.active();
-        orb.setAlpha((1f - panelFraction) * (unlock ? UnlockMotion.alpha : 1f));
+        float alpha = (1f - panelFraction) * (unlock ? UnlockMotion.alpha : 1f);
+        orb.setAlpha(alpha);
         orb.setPivotX(orb.getWidth() / 2f);
         orb.setPivotY(orb.getHeight() * CoverGeometry.PANEL_DESIGN_ANCHOR_Y / CoverGeometry.PANEL_DESIGN_HEIGHT);
         orb.setScaleX(unlock ? UnlockMotion.scaleX : 1f);
         orb.setScaleY(unlock ? UnlockMotion.scaleY : 1f);
+        int flags = desiredWindowFlags(alpha);
+        if (flags != lastWindowFlags && windowManager != null && orb.isAttachedToWindow()
+                && orb.getLayoutParams() instanceof WindowManager.LayoutParams p) {
+            p.flags = flags;
+            lastWindowFlags = flags;
+            try {
+                windowManager.updateViewLayout(orb, p);
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     private void scheduleRefresh() {
@@ -162,7 +194,7 @@ final class SystemUiOrb {
     @SuppressLint("WrongConstant")
     private void refresh() {
         try {
-            if (!ModuleConfig.panelEnabled() || !shadeStateKnown
+            if (!ModuleConfig.panelEnabled() || !shadeStateKnown || blocked
                     || !CoverGeometry.interactive(context) || CoverGeometry.keyguardLocked(context)) {
                 removeOverlay();
                 return;
@@ -211,9 +243,12 @@ final class SystemUiOrb {
                 removeOverlay();
                 return;
             }
+            int desiredFlags = desiredWindowFlags(desiredAlpha());
             if (orb != null && attachedDisplayId == outer.getDisplayId()
                     && lastRotation == rotation && bounds.equals(lastBounds)
-                    && obstruction.equals(lastCutout) && location.equals(lastLocation)) {
+                    && obstruction.equals(lastCutout) && location.equals(lastLocation)
+                    && lastWindowFlags == desiredFlags) {
+                orb.updateInteractiveState();
                 applyPresentation();
                 return;
             }
@@ -229,11 +264,14 @@ final class SystemUiOrb {
                 p.height = height;
                 p.x = location.left - bounds.left;
                 p.y = location.top - bounds.top;
+                p.flags = desiredFlags;
                 windowManager.updateViewLayout(orb, p);
                 lastRotation = rotation;
+                lastWindowFlags = desiredFlags;
                 lastBounds = new Rect(bounds);
                 lastCutout = obstruction;
                 lastLocation = new Rect(location);
+                orb.updateInteractiveState();
                 applyPresentation();
                 orb.invalidate();
                 return;
@@ -241,13 +279,12 @@ final class SystemUiOrb {
             removeOverlay();
 
             StatusOrb next = new StatusOrb(windowContext);
+            next.updateInteractiveState();
             WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                     size,
                     height,
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    desiredFlags,
                     PixelFormat.TRANSLUCENT);
             params.gravity = Gravity.TOP | Gravity.LEFT;
             params.x = location.left - bounds.left;
@@ -258,6 +295,7 @@ final class SystemUiOrb {
             orb = next;
             attachedDisplayId = outer.getDisplayId();
             lastRotation = rotation;
+            lastWindowFlags = desiredFlags;
             lastBounds = new Rect(bounds);
             lastCutout = obstruction;
             lastLocation = new Rect(location);

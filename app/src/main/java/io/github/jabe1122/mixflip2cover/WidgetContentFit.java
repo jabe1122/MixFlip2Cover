@@ -39,6 +39,8 @@ final class WidgetContentFit {
     private static final WeakHashMap<View, Boolean> recentViews = new WeakHashMap<>();
     private static final WeakHashMap<Object, Object> dialSavedExpr = new WeakHashMap<>();
     private static final WeakHashMap<View, int[]> recentOriginalMetrics = new WeakHashMap<>();
+    /** Last applied (squareActive ? 1 : 0, side, gap) per RecentTaskView to avoid per-onLayout churn. */
+    private static final WeakHashMap<View, int[]> recentLastApplied = new WeakHashMap<>();
     /** Last inputs adaptMaml ran with, per view; onLayout re-adapts only when one of them changes. */
     private static final WeakHashMap<View, MamlState> mamlStates = new WeakHashMap<>();
     private static volatile Boolean lastEffectiveDark;
@@ -58,6 +60,10 @@ final class WidgetContentFit {
                              Double pureBlur, boolean night) {}
 
     private WidgetContentFit() {}
+
+    static Boolean currentEffectiveDark() {
+        return lastEffectiveDark;
+    }
 
     static void install(XposedModule module, ClassLoader loader) throws ReflectiveOperationException {
         Class<?> maml = loader.loadClass("com.miui.maml.component.MamlView");
@@ -94,7 +100,7 @@ final class WidgetContentFit {
                     if (recent.isInstance(v)) {
                         recentViews.put(v, Boolean.TRUE);
                         adaptRecent(v);
-                    } else {
+                    } else if (!QuickActionsWidget.isQuickWidgetHost(v)) {
                         mamlPaths.putIfAbsent(v, resolveWidgetName(v));
                         adaptMaml(v, elementGroup, putVar, setScale, requestUpdate, false);
                     }
@@ -148,6 +154,7 @@ final class WidgetContentFit {
         }
 
         PinnedAppsWidget.install(module, loader);
+        QuickActionsWidget.install(module, loader);
         installFrostedGlassMaterialHooks(module, loader);
 
         ModuleConfig.addListener(() -> {
@@ -241,9 +248,10 @@ final class WidgetContentFit {
                         args = chain.getArgs().toArray();
                         effectiveDark = isEffectiveDark(helper, loader);
                         pureBlur = args.length >= 2 && args[1] instanceof Number n ? n.doubleValue() : 1.0;
+                        lastEffectiveDark = effectiveDark;
+                        QuickActionsWidget.onThemeUpdated(effectiveDark);
                         if (SquareCards.active() && args.length >= 3) {
                             args[2] = effectiveDark ? 0.0 : 1.0; // 0.0 = white text, 1.0 = black text
-                            lastEffectiveDark = effectiveDark;
                             lastDesktopPureBlur = pureBlur;
                         }
                     } catch (Throwable t) {
@@ -366,6 +374,11 @@ final class WidgetContentFit {
             int appColor = ((Number) CoverGeometry.field(helper, "appColor")).intValue();
             ClassLoader effectiveLoader = loader != null ? loader : (lastBgLoaderRef != null ? lastBgLoaderRef.get() : null);
             boolean wpDark = isCoverWallpaperDark(helper, effectiveLoader);
+            boolean nowEffectiveDark = isDesk
+                    ? (wpDark || isNightMode(helper))
+                    : isAppBackgroundDark(helper, effectiveLoader);
+            lastEffectiveDark = nowEffectiveDark;
+            QuickActionsWidget.onThemeUpdated(nowEffectiveDark);
             if (!force
                     && lastSentDesk != null && lastSentDesk == isDesk
                     && lastSentAppColor != null && lastSentAppColor == appColor
@@ -428,6 +441,8 @@ final class WidgetContentFit {
 
     private static void applySoftMatteFrostedGlass(Object helper, Object state, boolean effectiveDark) {
         if (helper == null || state == null) return;
+        lastEffectiveDark = effectiveDark;
+        QuickActionsWidget.onThemeUpdated(effectiveDark);
         boolean appliedOfficial = false;
         try {
             Object params = CoverGeometry.field(helper, "mBgParams");
@@ -616,15 +631,21 @@ final class WidgetContentFit {
             }
 
             if (!SquareCards.active()) {
-                int[] orig = recentOriginalMetrics.get(recentView);
-                if (orig != null && rv.getLayoutParams() instanceof FrameLayout.LayoutParams lp) {
-                    lp.topMargin = orig[0];
-                    lp.setMarginStart(orig[1]);
-                    lp.setMarginEnd(0);
-                    rv.setLayoutParams(lp);
-                    CoverGeometry.setField(adapter, "mItemMarginBottom", orig[2]);
-                    CoverGeometry.setField(adapter, "mItemMarginEnd", orig[3]);
-                    updateRecyclerChildrenMargins(rv, orig[2], orig[3]);
+                int[] last = recentLastApplied.get(recentView);
+                if (last == null || last[0] != 0) {
+                    int[] orig = recentOriginalMetrics.get(recentView);
+                    if (orig != null && rv.getLayoutParams() instanceof FrameLayout.LayoutParams lp) {
+                        if (lp.topMargin != orig[0] || lp.getMarginStart() != orig[1] || lp.getMarginEnd() != 0) {
+                            lp.topMargin = orig[0];
+                            lp.setMarginStart(orig[1]);
+                            lp.setMarginEnd(0);
+                            rv.setLayoutParams(lp);
+                        }
+                        CoverGeometry.setField(adapter, "mItemMarginBottom", orig[2]);
+                        CoverGeometry.setField(adapter, "mItemMarginEnd", orig[3]);
+                        updateRecyclerChildrenMargins(rv, orig[2], orig[3]);
+                    }
+                    recentLastApplied.put(recentView, new int[]{0, 0, 0});
                 }
                 PinnedAppsWidget.refreshView(recentView, false);
                 return;
@@ -637,17 +658,22 @@ final class WidgetContentFit {
             int side = Math.min(w, h);
             int gap = Math.max(12, Math.round((side - 2 * iconSize) / 3f));
 
-            if (rv.getLayoutParams() instanceof FrameLayout.LayoutParams lp) {
-                if (lp.topMargin != gap || lp.getMarginStart() != gap || lp.getMarginEnd() != 0) {
-                    lp.topMargin = gap;
-                    lp.bottomMargin = 0;
-                    lp.setMarginStart(gap);
-                    lp.setMarginEnd(0);
-                    rv.setLayoutParams(lp);
+            int[] last = recentLastApplied.get(recentView);
+            boolean metricsChanged = last == null || last[0] != 1 || last[1] != side || last[2] != gap;
+            if (metricsChanged) {
+                if (rv.getLayoutParams() instanceof FrameLayout.LayoutParams lp) {
+                    if (lp.topMargin != gap || lp.getMarginStart() != gap || lp.getMarginEnd() != 0) {
+                        lp.topMargin = gap;
+                        lp.bottomMargin = 0;
+                        lp.setMarginStart(gap);
+                        lp.setMarginEnd(0);
+                        rv.setLayoutParams(lp);
+                    }
                 }
+                CoverGeometry.setField(adapter, "mItemMarginBottom", gap);
+                CoverGeometry.setField(adapter, "mItemMarginEnd", gap);
+                recentLastApplied.put(recentView, new int[]{1, side, gap});
             }
-            CoverGeometry.setField(adapter, "mItemMarginBottom", gap);
-            CoverGeometry.setField(adapter, "mItemMarginEnd", gap);
             updateRecyclerChildrenMargins(rv, gap, gap);
             PinnedAppsWidget.refreshView(recentView, false);
         } catch (ReflectiveOperationException | RuntimeException ignored) {
@@ -757,6 +783,7 @@ final class WidgetContentFit {
                     putVar.invoke(v, "view_height", 558.0, VAR_HIGH_PRIORITY);
                     setScale.invoke(v, h / 558.0f, Math.round(w / 2.0f), 0);
                 } else {
+                    putVar.invoke(v, "view_height", (double) rawH, VAR_HIGH_PRIORITY);
                     setScale.invoke(v, 1.0f, 0, 0);
                 }
             } else if (matches(name, "daily_steps") || hasVar(vars, "base_multiplier_ngl4ct")) {

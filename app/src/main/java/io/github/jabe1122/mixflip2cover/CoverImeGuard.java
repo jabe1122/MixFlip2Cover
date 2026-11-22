@@ -51,6 +51,15 @@ final class CoverImeGuard {
     private static final int FEATURE_IME_PLACEHOLDER = 7;
     private static final int FEATURE_IME = 8;
 
+    /** android.view.Display hidden display type constants. */
+    static final int DISPLAY_TYPE_INTERNAL = 1;
+    static final int DISPLAY_TYPE_VIRTUAL = 5;
+
+    private static volatile boolean displayReflectProbed;
+    private static volatile java.lang.reflect.Method displayGetTypeMethod;
+    private static volatile java.lang.reflect.Method displayGetUniqueIdMethod;
+    private static volatile boolean mirrorVirtualDisplayActive;
+
     private static boolean observing;
     private static Context appContext;
     private static Handler handler;
@@ -97,16 +106,17 @@ final class CoverImeGuard {
                 dm.registerDisplayListener(new DisplayManager.DisplayListener() {
                     @Override
                     public void onDisplayAdded(int displayId) {
-                        onDisplayMaybeChanged();
+                        onDisplayMaybeChanged(displayId, true);
                     }
 
                     @Override
                     public void onDisplayChanged(int displayId) {
-                        onDisplayMaybeChanged();
+                        onDisplayMaybeChanged(displayId, false);
                     }
 
                     @Override
                     public void onDisplayRemoved(int displayId) {
+                        onDisplayMaybeChanged(displayId, true);
                     }
                 }, handler);
             }
@@ -118,22 +128,171 @@ final class CoverImeGuard {
         sync(context);
     }
 
+    static boolean isMirrorVirtualDisplayActive() {
+        return mirrorVirtualDisplayActive;
+    }
+
+    static boolean shouldConstrainImeContainer(
+            boolean allowThirdParty, boolean isOuterDisplay, boolean mirrorVirtualActive) {
+        return allowThirdParty && isOuterDisplay && !mirrorVirtualActive;
+    }
+
+    static boolean isMirrorOrVirtualDisplayDescriptor(
+            int displayId,
+            int displayState,
+            int displayType,
+            String uniqueId,
+            String displayString,
+            int width,
+            int height) {
+        if (displayId == Display.DEFAULT_DISPLAY || displayId == 1 || displayId < 0) return false;
+        if (displayState == Display.STATE_OFF) return false;
+        if (displayType == DISPLAY_TYPE_INTERNAL) return false;
+        String uidLower = uniqueId != null ? uniqueId.toLowerCase(java.util.Locale.ROOT) : "";
+        String descLower = displayString != null ? displayString.toLowerCase(java.util.Locale.ROOT) : "";
+        // Never treat screen recorders, MediaProjection, scrcpy, or local capture displays as interactive mirror hosts.
+        if (containsAny(uidLower, "screenrecorder", "mediaprojection", "scrcpy", "screenshot", "capture")
+                || containsAny(descLower, "screenrecorder", "mediaprojection", "scrcpy", "screenshot", "capture")) {
+            return false;
+        }
+        // Only pause cover IME constraints for known interactive HyperOS mirror / cast / carlink virtual displays.
+        return containsAny(uidLower,
+                "virtual:com.xiaomi.mirror",
+                "com.xiaomi.mirror",
+                "com.milink.service",
+                "com.xiaomi.mi_connect_service",
+                "com.miui.carlink",
+                "miui.synergy")
+                || containsAny(descLower,
+                "virtual:com.xiaomi.mirror",
+                "com.xiaomi.mirror",
+                "com.milink.service",
+                "com.xiaomi.mi_connect_service",
+                "com.miui.carlink",
+                "miui.synergy");
+    }
+
+    private static boolean containsAny(String haystack, String... needles) {
+        if (haystack == null || haystack.isEmpty()) return false;
+        for (String n : needles) {
+            if (haystack.contains(n)) return true;
+        }
+        return false;
+    }
+
+    private static void ensureDisplayReflection() {
+        if (displayReflectProbed) return;
+        displayReflectProbed = true;
+        try {
+            displayGetTypeMethod = Display.class.getMethod("getType");
+        } catch (Throwable ignored) {
+        }
+        try {
+            displayGetUniqueIdMethod = Display.class.getMethod("getUniqueId");
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static int queryDisplayType(Display d) {
+        if (d == null) return -1;
+        ensureDisplayReflection();
+        java.lang.reflect.Method m = displayGetTypeMethod;
+        if (m == null) return -1;
+        try {
+            Object v = m.invoke(d);
+            if (v instanceof Integer i) return i;
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static String queryDisplayUniqueId(Display d) {
+        if (d == null) return null;
+        ensureDisplayReflection();
+        java.lang.reflect.Method m = displayGetUniqueIdMethod;
+        if (m == null) return null;
+        try {
+            Object v = m.invoke(d);
+            if (v instanceof String s) return s;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    static boolean hasActiveMirrorVirtualDisplay(DisplayManager dm) {
+        if (dm == null) return false;
+        Display[] displays;
+        try {
+            displays = dm.getDisplays();
+        } catch (Throwable ignored) {
+            return false;
+        }
+        if (displays == null) return false;
+        for (Display d : displays) {
+            if (d == null) continue;
+            try {
+                int id = d.getDisplayId();
+                if (id == Display.DEFAULT_DISPLAY || id == 1) continue;
+                int state = d.getState();
+                if (state == Display.STATE_OFF) continue;
+                int type = queryDisplayType(d);
+                String uniqueId = queryDisplayUniqueId(d);
+                int w = 0;
+                int h = 0;
+                try {
+                    Display.Mode mode = d.getMode();
+                    if (mode != null) {
+                        w = mode.getPhysicalWidth();
+                        h = mode.getPhysicalHeight();
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (w <= 0 || h <= 0) {
+                    try {
+                        android.graphics.Point p = new android.graphics.Point();
+                        d.getRealSize(p);
+                        w = p.x;
+                        h = p.y;
+                    } catch (Throwable ignored) {
+                    }
+                }
+                String desc = null;
+                try {
+                    desc = d.toString();
+                } catch (Throwable ignored) {
+                }
+                if (isMirrorOrVirtualDisplayDescriptor(id, state, type, uniqueId, desc, w, h)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
     /**
      * onDisplayChanged fires for brightness, refresh-rate and state changes many times per second. Only a fold
-     * transition or a rotation of display 0 matters here, so everything else returns after two cheap reads.
+     * transition, a rotation of display 0, or a mirror/virtual display add/remove/state change matters here.
      */
-    private static void onDisplayMaybeChanged() {
+    private static void onDisplayMaybeChanged(int changedDisplayId, boolean structural) {
+        if (!structural && changedDisplayId == 1) return;
         Context c = appContext;
         if (c == null) return;
         boolean outer = CoverResourceOverlay.isDefaultDisplayOuter(c);
         int rotation = 0;
+        boolean mirrorVirtualActive = mirrorVirtualDisplayActive;
         try {
             DisplayManager dm = c.getSystemService(DisplayManager.class);
             Display d = dm != null ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
             if (d != null) rotation = d.getRotation();
+            // Avoid scanning all displays on every Display 0 LTPO refresh/brightness tick.
+            if (structural || changedDisplayId > 1 || lastDisplayKey == Long.MIN_VALUE) {
+                mirrorVirtualActive = hasActiveMirrorVirtualDisplay(dm);
+            }
         } catch (Throwable ignored) {
         }
-        long key = (outer ? 10 : 0) + rotation;
+        mirrorVirtualDisplayActive = mirrorVirtualActive;
+        long key = (mirrorVirtualActive ? 100L : 0L) + (outer ? 10L : 0L) + rotation;
         if (key == lastDisplayKey) return;
         lastDisplayKey = key;
         Handler h = handler;
@@ -170,14 +329,21 @@ final class CoverImeGuard {
             lastAllowThirdParty = allowThirdParty;
 
             if (allowThirdParty) {
-                syncImeContainerBounds(context, true);
                 String preferredIme = resolvePreferredThirdPartyIme(context, cr);
-                if (preferredIme == null || preferredIme.isEmpty()) return;
+                if (preferredIme == null || preferredIme.isEmpty()) {
+                    releaseImeContainer(context);
+                    return;
+                }
+                syncImeContainerBounds(context, true);
 
-                if (pm.getComponentEnabledSetting(SOGOU_COMPONENT) != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
-                    pm.setComponentEnabledSetting(SOGOU_COMPONENT,
-                            PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP);
-                    Log.i(TAG, "disabled forced Sogou cover IME component; preferred=" + preferredIme);
+                try {
+                    if (pm.getComponentEnabledSetting(SOGOU_COMPONENT) != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                        pm.setComponentEnabledSetting(SOGOU_COMPONENT,
+                                PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP);
+                        Log.i(TAG, "disabled forced Sogou cover IME component; preferred=" + preferredIme);
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // Sogou is not installed on this device.
                 }
                 ensureImeInEnabledList(cr, preferredIme);
                 if (isBlankOrSogou(Settings.Secure.getString(cr, KEY_INTERNAL_FLIP_IME))) {
@@ -191,7 +357,7 @@ final class CoverImeGuard {
                 // Feature off (the default): only undo what this module changed, never touch stock settings.
                 releaseImeContainer(context);
                 reenableSogou(pm);
-                if (wasAllowed || isLeftoverWeTypeCoverState(context, cr)) {
+                if (wasAllowed || isLeftoverThirdPartyCoverState(context, cr)) {
                     restoreStockCoverIme(context, cr);
                 }
             }
@@ -243,11 +409,11 @@ final class CoverImeGuard {
         }
     }
 
-    private static boolean isLeftoverWeTypeCoverState(Context context, ContentResolver cr) {
+    private static boolean isLeftoverThirdPartyCoverState(Context context, ContentResolver cr) {
         if (cr == null || !CoverResourceOverlay.isDefaultDisplayOuter(context)) return false;
         String currentDefault = Settings.Secure.getString(cr, KEY_DEFAULT_IME);
         String internalFlip = Settings.Secure.getString(cr, KEY_INTERNAL_FLIP_IME);
-        return WETYPE_IME_ID.equals(currentDefault) && WETYPE_IME_ID.equals(internalFlip);
+        return isValidThirdPartyIme(currentDefault) && currentDefault.equals(internalFlip);
     }
 
     private static void reenableSogou(PackageManager pm) {
@@ -289,7 +455,6 @@ final class CoverImeGuard {
 
             Object organizer = ctor.newInstance(executor);
             Object listObj = registerMethod.invoke(organizer, FEATURE_IME_PLACEHOLDER);
-            imePlaceholderOrganizer = organizer;
             if (listObj instanceof List<?> appearedList) {
                 for (Object appeared : appearedList) {
                     if (appeared == null) continue;
@@ -303,6 +468,15 @@ final class CoverImeGuard {
                     }
                 }
             }
+            if (imeTokensByDisplay.isEmpty()) {
+                try {
+                    daoClass.getMethod("unregisterOrganizer").invoke(organizer);
+                } catch (Throwable ignored) {
+                }
+                imePlaceholderOrganizer = null;
+                return;
+            }
+            imePlaceholderOrganizer = organizer;
 
             // Clear overrides that earlier builds may have left on the FEATURE_IME container.
             try {
@@ -320,6 +494,7 @@ final class CoverImeGuard {
                         Object token = daInfo.getClass().getField("token").get(daInfo);
                         if (token != null) {
                             wctClass.getMethod("setBounds", tokenClass, android.graphics.Rect.class).invoke(wct, token, empty);
+                            wctClass.getMethod("setAppBounds", tokenClass, android.graphics.Rect.class).invoke(wct, token, (Object) null);
                             wctClass.getMethod("setDensityDpi", tokenClass, int.class).invoke(wct, token, 0);
                             wctClass.getMethod("setScreenSizeDp", tokenClass, int.class, int.class).invoke(wct, token, 0, 0);
                             wctClass.getMethod("setSmallestScreenWidthDp", tokenClass, int.class).invoke(wct, token, 0);
@@ -359,10 +534,16 @@ final class CoverImeGuard {
             DisplayManager dm = context.getSystemService(DisplayManager.class);
             if (dm == null) return;
 
-            long key = allowThirdParty ? 1000L : 0L;
+            boolean mirrorVirtualActive = hasActiveMirrorVirtualDisplay(dm);
+            mirrorVirtualDisplayActive = mirrorVirtualActive;
+
+            int dpiScale = ModuleConfig.imeDpiScalePercent();
+            long key = (allowThirdParty ? 1000L : 0L) * 1000L + dpiScale;
+            key = key * 31 + (mirrorVirtualActive ? 2 : 1);
             for (Map.Entry<Integer, List<Object>> entry : imeTokensByDisplay.entrySet()) {
                 Display d = dm.getDisplay(entry.getKey());
-                boolean constrain = allowThirdParty && d != null && CoverDisplay.isOuterDisplay(d);
+                boolean constrain = shouldConstrainImeContainer(
+                        allowThirdParty, d != null && CoverDisplay.isOuterDisplay(d), mirrorVirtualActive);
                 int rotation = d != null ? d.getRotation() : android.view.Surface.ROTATION_0;
                 key = key * 31 + (constrain ? (10 + rotation) : 1);
             }
@@ -385,14 +566,14 @@ final class CoverImeGuard {
                 boolean isOuter = d != null && CoverDisplay.isOuterDisplay(d);
                 int rotation = d != null ? d.getRotation() : android.view.Surface.ROTATION_0;
                 if (displayId == Display.DEFAULT_DISPLAY) defaultOuter = isOuter;
-                if (allowThirdParty && isOuter) {
+                if (shouldConstrainImeContainer(allowThirdParty, isOuter, mirrorVirtualActive)) {
                     android.graphics.Rect safe = CoverDisplay.coverImeSafeBounds(rotation);
                     // Keep the DisplayArea container origin at (0, 0) so WindowState.getRelativePosition()
                     // produces surface coordinates identical to display coordinates, while appBounds reflects safe.
                     android.graphics.Rect containerBounds = new android.graphics.Rect(0, 0, safe.right, safe.bottom);
-                    int dpi = CoverDisplay.coverImeDensityDpi(rotation);
-                    int swDp = CoverDisplay.coverImeScreenWidthDp(rotation);
-                    int shDp = CoverDisplay.coverImeScreenHeightDp(rotation);
+                    int dpi = CoverDisplay.coverImeDensityDpi(rotation, dpiScale);
+                    int swDp = CoverDisplay.coverImeScreenWidthDp(rotation, dpiScale);
+                    int shDp = CoverDisplay.coverImeScreenHeightDp(rotation, dpiScale);
                     for (Object token : entry.getValue()) {
                         setBounds.invoke(wct, token, containerBounds);
                         setAppBounds.invoke(wct, token, safe);
@@ -401,9 +582,11 @@ final class CoverImeGuard {
                         setSmallestScreenWidthDp.invoke(wct, token, swDp);
                     }
                 } else {
+                    // WindowConfiguration.updateFrom only skips mAppBounds when it is null (an empty Rect(0,0,0,0)
+                    // is non-null and would collapse unhooked IMEs such as MIUI Security Keyboard to 0px height).
                     for (Object token : entry.getValue()) {
                         setBounds.invoke(wct, token, empty);
-                        setAppBounds.invoke(wct, token, empty);
+                        setAppBounds.invoke(wct, token, (Object) null);
                         setDensityDpi.invoke(wct, token, 0);
                         setScreenSizeDp.invoke(wct, token, 0, 0);
                         setSmallestScreenWidthDp.invoke(wct, token, 0);
@@ -414,7 +597,9 @@ final class CoverImeGuard {
             Class<?> woClass = Class.forName("android.window.WindowOrganizer");
             woClass.getMethod("applyTransaction", wctClass).invoke(woClass.getConstructor().newInstance(), wct);
             lastAppliedImeConfigKey = key;
-            ModLog.i(TAG, "applied IME container bounds defaultOuter=" + defaultOuter + " allowThirdParty=" + allowThirdParty);
+            ModLog.i(TAG, "applied IME container bounds defaultOuter=" + defaultOuter
+                    + " allowThirdParty=" + allowThirdParty
+                    + " mirrorVirtualActive=" + mirrorVirtualActive);
         } catch (Throwable t) {
             Log.w(TAG, "syncImeContainerBounds failed", t);
         }
@@ -504,11 +689,12 @@ final class CoverImeGuard {
         return imeId != null && imeId.startsWith(SOGOU_PKG);
     }
 
-    private static boolean isValidThirdPartyIme(String imeId) {
+    static boolean isValidThirdPartyIme(String imeId) {
         return imeId != null
                 && !imeId.isEmpty()
                 && !"null".equalsIgnoreCase(imeId)
                 && !imeId.startsWith(SOGOU_PKG)
+                && !imeId.startsWith("com.miui.securityinputmethod")
                 && !imeId.startsWith("com.google.android.tts");
     }
 }

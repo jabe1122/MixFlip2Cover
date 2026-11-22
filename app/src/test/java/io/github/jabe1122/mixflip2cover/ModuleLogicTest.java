@@ -991,4 +991,595 @@ public class ModuleLogicTest {
         assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(802, 810));
         assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1196, 1208));
     }
+
+    @Test
+    public void quickActionsWidget_fourGridSlotParsingSerializationAndValidation() {
+        try {
+            // 1. Default 4-grid order: Home, Recents, Lock, Back
+            assertEquals(
+                    java.util.List.of("home", "recents", "lock", "back"),
+                    ModuleConfig.parseQuickActionSlots(null));
+            assertEquals(
+                    java.util.List.of("home", "recents", "lock", "back"),
+                    ModuleConfig.parseQuickActionSlots(""));
+            assertEquals(
+                    "home,recents,lock,back",
+                    ModuleConfig.serializeQuickActionSlots(null));
+
+            // 2. Custom slots including controls & app:<pkg>, with whitespace normalization
+            java.util.List<String> custom = ModuleConfig.parseQuickActionSlots(
+                    " back , torch , app: com.tencent.mm , control_center , screenshot ");
+            assertEquals(
+                    java.util.List.of("back", "torch", "app:com.tencent.mm", "control_center"),
+                    custom);
+            assertEquals(
+                    "back,torch,app:com.tencent.mm,control_center",
+                    ModuleConfig.serializeQuickActionSlots(custom));
+
+            // 3. Invalid tokens fall back per-slot to default [home, recents, lock, back]
+            assertEquals(
+                    java.util.List.of("notifications", "recents", "ringer", "back"),
+                    ModuleConfig.parseQuickActionSlots("notifications,invalid_action,ringer,app:com.miui.fliphome"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("home"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("recents"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("lock"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("back"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("screenshot"));
+            assertTrue(ModuleConfig.isValidQuickActionToken("app:com.android.settings"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:nopackagedot"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:com.miui.fliphome"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:com.bad pkg"));
+
+            // 4. Live override & package relevance filtering
+            ModuleConfig.overrideQuickWidget(true, "home,app:com.tencent.mm,lock,back");
+            assertTrue(ModuleConfig.quickWidgetEnabled());
+            assertTrue(QuickActionsWidget.isPackageRelevantToQuickWidget("com.tencent.mm"));
+            assertFalse(QuickActionsWidget.isPackageRelevantToQuickWidget("com.xiaomi.joyose"));
+
+            ModuleConfig.overrideQuickWidget(false, "home,app:com.tencent.mm,lock,back");
+            assertFalse(ModuleConfig.quickWidgetEnabled());
+            assertFalse(QuickActionsWidget.isPackageRelevantToQuickWidget("com.tencent.mm"));
+
+            // 5. Logcat tag registration
+            assertTrue(java.util.Arrays.asList(ModLog.LOGCAT_TAGS).contains("MF2C.QuickWidget:V"));
+            assertTrue(java.util.Arrays.asList(ModLog.LOGCAT_TAGS).contains("MF2C.LauncherApps:V"));
+        } finally {
+            ModuleConfig.clearQuickWidgetOverrides();
+        }
+    }
+
+    @Test
+    public void foldContinuity_modesAndSelectedPackageParsing() {
+        try {
+            assertEquals(ModuleConfig.FOLD_CONT_SYSTEM, ModuleConfig.clampFoldContinuityMode(-1));
+            assertEquals(ModuleConfig.FOLD_CONT_SYSTEM, ModuleConfig.clampFoldContinuityMode(0));
+            assertEquals(ModuleConfig.FOLD_CONT_SELECTED, ModuleConfig.clampFoldContinuityMode(1));
+            assertEquals(ModuleConfig.FOLD_CONT_ALL, ModuleConfig.clampFoldContinuityMode(2));
+            assertEquals(ModuleConfig.FOLD_CONT_SYSTEM, ModuleConfig.clampFoldContinuityMode(99));
+
+            // Launchers are stripped from fold-continuity selected lists
+            java.util.Set<String> parsed = ModuleConfig.parsePackageSet(
+                    " com.autonavi.minimap , com.miui.fliphome , com.tencent.mm , com.miui.home , com.autonavi.minimap ");
+            assertEquals(java.util.Set.of("com.autonavi.minimap", "com.tencent.mm"), parsed);
+            assertEquals(
+                    "com.autonavi.minimap,com.tencent.mm",
+                    ModuleConfig.serializePackageList(java.util.List.of(
+                            "com.autonavi.minimap", "com.miui.home", "com.tencent.mm", "com.miui.fliphome")));
+
+            ModuleConfig.overrideFoldContinuity(
+                    ModuleConfig.FOLD_CONT_SELECTED,
+                    "com.autonavi.minimap,com.tencent.mm",
+                    true);
+            assertEquals(ModuleConfig.FOLD_CONT_SELECTED, ModuleConfig.foldContinuityMode());
+            assertTrue(ModuleConfig.isFoldContinuityApp("com.autonavi.minimap"));
+            assertTrue(ModuleConfig.isFoldContinuityApp("com.tencent.mm"));
+            assertFalse(ModuleConfig.isFoldContinuityApp("com.miui.fliphome"));
+            assertFalse(ModuleConfig.isFoldContinuityApp("com.example.other"));
+            assertTrue(ModuleConfig.foldPocketGuardEnabled());
+
+            ModuleConfig.overrideFoldContinuity(99, "", false);
+            assertEquals(ModuleConfig.FOLD_CONT_SYSTEM, ModuleConfig.foldContinuityMode());
+            assertFalse(ModuleConfig.foldPocketGuardEnabled());
+        } finally {
+            ModuleConfig.clearFoldContinuityOverrides();
+        }
+    }
+
+    @Test
+    public void launcherUnlockAndGestures_doubleTapWindowAndOrbActionTokens() {
+        try {
+            // 1. Eligible cover launcher packages exclude both launchers
+            assertTrue(CoverLauncherApps.isEligibleOuterLauncherPackage("com.google.android.googlequicksearchbox"));
+            assertTrue(CoverLauncherApps.isEligibleOuterLauncherPackage("com.xiaomi.scanner"));
+            assertFalse(CoverLauncherApps.isEligibleOuterLauncherPackage("com.miui.fliphome"));
+            assertFalse(CoverLauncherApps.isEligibleOuterLauncherPackage("com.miui.home"));
+            assertFalse(CoverLauncherApps.isEligibleOuterLauncherPackage(""));
+            assertFalse(CoverLauncherApps.isEligibleOuterLauncherPackage(null));
+
+            // 2. Double-tap empty space window checks (timing & spatial slop)
+            assertTrue(LauncherPullDown.isWithinDoubleTapWindow(1000L, 1180L, 200f, 300f, 212f, 316f, 300L, 80f));
+            assertFalse(LauncherPullDown.isWithinDoubleTapWindow(0L, 1180L, 200f, 300f, 200f, 300f, 300L, 80f));
+            assertFalse(LauncherPullDown.isWithinDoubleTapWindow(1000L, 1000L, 200f, 300f, 200f, 300f, 300L, 80f));
+            assertFalse(LauncherPullDown.isWithinDoubleTapWindow(1000L, 1450L, 200f, 300f, 200f, 300f, 300L, 80f));
+            assertFalse(LauncherPullDown.isWithinDoubleTapWindow(1000L, 1150L, 200f, 300f, 350f, 300f, 300L, 80f));
+
+            // 3. StatusOrb tap / long-press token validation & normalization
+            assertTrue(ModuleConfig.isValidOrbActionToken("none"));
+            assertTrue(ModuleConfig.isValidOrbActionToken("torch"));
+            assertTrue(ModuleConfig.isValidOrbActionToken("lock"));
+            assertTrue(ModuleConfig.isValidOrbActionToken("app:com.tencent.mm"));
+            assertFalse(ModuleConfig.isValidOrbActionToken("app:com.miui.fliphome"));
+            assertFalse(ModuleConfig.isValidOrbActionToken("unknown_action"));
+            assertEquals("none", ModuleConfig.normalizeOrbActionToken(null));
+            assertEquals("none", ModuleConfig.normalizeOrbActionToken("invalid"));
+            assertEquals("app:com.tencent.mm", ModuleConfig.normalizeOrbActionToken(" app: com.tencent.mm "));
+
+            ModuleConfig.overrideOrbActions("none", "none");
+            assertFalse(ModuleConfig.hasOrbInteraction());
+
+            ModuleConfig.overrideOrbActions("torch", "lock");
+            assertTrue(ModuleConfig.hasOrbInteraction());
+            assertEquals("torch", ModuleConfig.orbTapAction());
+            assertEquals("lock", ModuleConfig.orbLongPressAction());
+        } finally {
+            ModuleConfig.clearOrbOverrides();
+        }
+    }
+
+    @Test
+    public void universalCoverIme_scalingMathAndInnerUnfoldSanitization() {
+        try {
+            // Baseline 100% matches existing constants exactly
+            assertEquals(340, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_0, 100));
+            assertEquals(420, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_180, 100));
+            assertEquals(730, CoverDisplay.coverImeMaxHeight(Surface.ROTATION_180, 100));
+            assertEquals(662, CoverDisplay.coverImeMinTop(Surface.ROTATION_180, 100));
+            assertEquals(398, CoverDisplay.coverImeCandidateLeftInset(Surface.ROTATION_180, -1));
+
+            // Custom 85% density scale & 90% max height & 260px inset
+            ModuleConfig.overrideImeTuning(85, 90, 260);
+            assertEquals(85, ModuleConfig.imeDpiScalePercent());
+            assertEquals(90, ModuleConfig.imeMaxHeightPercent());
+            assertEquals(260, ModuleConfig.imeTopInsetPx());
+
+            int rot0Dpi85 = CoverDisplay.coverImeDensityDpi(Surface.ROTATION_0, 85);
+            int rot180Dpi85 = CoverDisplay.coverImeDensityDpi(Surface.ROTATION_180, 85);
+            assertEquals(289, rot0Dpi85);
+            assertEquals(357, rot180Dpi85);
+            assertEquals(657, CoverDisplay.coverImeMaxHeight(Surface.ROTATION_180, 90));
+            assertEquals(1392 - 657, CoverDisplay.coverImeMinTop(Surface.ROTATION_180, 90));
+            assertEquals(260, CoverDisplay.coverImeCandidateLeftInset(Surface.ROTATION_180, 260));
+            assertEquals(0, CoverDisplay.coverImeCandidateLeftInset(Surface.ROTATION_0, 260));
+            assertEquals(0, CoverDisplay.coverImeCandidateLeftInset(Surface.ROTATION_180, 0));
+
+            // Clamping bounds
+            ModuleConfig.overrideImeTuning(10, 200, 999);
+            assertEquals(ModuleConfig.MIN_IME_DPI_SCALE_PERCENT, ModuleConfig.imeDpiScalePercent());
+            assertEquals(ModuleConfig.MAX_IME_MAX_HEIGHT_PERCENT, ModuleConfig.imeMaxHeightPercent());
+            assertEquals(ModuleConfig.MAX_IME_TOP_INSET_PX, ModuleConfig.imeTopInsetPx());
+
+            // Unfolding from a custom-scaled cover IME DPI restores true inner metrics
+            ModuleConfig.overrideImeTuning(85, 100, -1);
+            android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+            dm.widthPixels = CoverDisplay.coverImeWidth(Surface.ROTATION_180);
+            dm.heightPixels = CoverDisplay.coverImeDisplayHeight(Surface.ROTATION_180);
+            dm.densityDpi = rot180Dpi85;
+            assertTrue(AppCompatibility.isModuleOverriddenMetrics(dm));
+            assertTrue(AppCompatibility.sanitizeInnerRealMetrics(dm, 1224, 2912, Surface.ROTATION_0, 520));
+            assertEquals(1224, dm.widthPixels);
+            assertEquals(2912, dm.heightPixels);
+            assertEquals(520, dm.densityDpi);
+        } finally {
+            ModuleConfig.clearImeTuningOverrides();
+        }
+    }
+
+    @Test
+    public void perAppCoverRules_jsonRoundTripMergeValidationAndLookup() {
+        try {
+            // 1. Target package validation & rule clamping
+            assertTrue(ModuleConfig.isValidRuleTargetPackage("tv.danmaku.bili"));
+            assertTrue(ModuleConfig.isValidRuleTargetPackage("com.tencent.mm"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("android"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("system"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("com.android.systemui"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("com.miui.fliphome"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("com.miui.home"));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage(BuildConfig.APPLICATION_ID));
+            assertFalse(ModuleConfig.isValidRuleTargetPackage("bad pkg name"));
+
+            ModuleConfig.PerAppRule clamped = ModuleConfig.PerAppRule.of(500, 99, 20);
+            assertEquals(ModuleConfig.MAX_TOP_GAP_PX, clamped.topGapPx());
+            assertEquals(ModuleConfig.WIDTH_MODE_DEFAULT, clamped.widthMode());
+            assertEquals(ModuleConfig.MIN_SCALE_PERCENT, clamped.scalePercent());
+            assertTrue(ModuleConfig.PerAppRule.DEFAULT.isDefault());
+
+            // 2. Pure-Java JSON serialize / parse round-trip (pretty & compact), stripping default rules & invalid pkgs
+            Map<String, ModuleConfig.PerAppRule> input = new HashMap<>();
+            input.put("tv.danmaku.bili", ModuleConfig.PerAppRule.of(0, ModuleConfig.WIDTH_MODE_FULL, 85));
+            input.put("com.tencent.mm", ModuleConfig.PerAppRule.of(30, ModuleConfig.WIDTH_MODE_SAFE_COLUMN, 75));
+            input.put("com.ignored.default", ModuleConfig.PerAppRule.DEFAULT);
+            input.put("com.miui.fliphome", ModuleConfig.PerAppRule.of(0, 1, 80));
+
+            String pretty = ModuleConfig.serializePerAppRulesJson(input, true);
+            assertTrue(pretty.contains("mixflip2cover.rules.v1"));
+            assertFalse(pretty.contains("com.ignored.default"));
+            assertFalse(pretty.contains("com.miui.fliphome"));
+
+            Map<String, ModuleConfig.PerAppRule> parsed = ModuleConfig.parsePerAppRulesJsonStrict(pretty);
+            assertEquals(2, parsed.size());
+            assertEquals(new ModuleConfig.PerAppRule(0, ModuleConfig.WIDTH_MODE_FULL, 85), parsed.get("tv.danmaku.bili"));
+            assertEquals(new ModuleConfig.PerAppRule(30, ModuleConfig.WIDTH_MODE_SAFE_COLUMN, 75), parsed.get("com.tencent.mm"));
+
+            // 3. Merge vs Replace semantics
+            Map<String, ModuleConfig.PerAppRule> incoming = Map.of(
+                    "com.tencent.mm", ModuleConfig.PerAppRule.DEFAULT,
+                    "com.eg.android.AlipayGphone", ModuleConfig.PerAppRule.of(60, ModuleConfig.WIDTH_MODE_SAFE_COLUMN, 0));
+            Map<String, ModuleConfig.PerAppRule> merged = ModuleConfig.mergePerAppRules(parsed, incoming, false);
+            assertEquals(2, merged.size());
+            assertFalse(merged.containsKey("com.tencent.mm"));
+            assertTrue(merged.containsKey("tv.danmaku.bili"));
+            assertEquals(60, merged.get("com.eg.android.AlipayGphone").topGapPx());
+
+            Map<String, ModuleConfig.PerAppRule> replaced = ModuleConfig.mergePerAppRules(parsed, incoming, true);
+            assertEquals(1, replaced.size());
+            assertTrue(replaced.containsKey("com.eg.android.AlipayGphone"));
+
+            // 4. Cached runtime lookup & effective top-gap fallback
+            ModuleConfig.overridePerAppRules(ModuleConfig.serializePerAppRulesJson(merged, false));
+            assertEquals(0, ModuleConfig.effectiveAppTopGapPx("tv.danmaku.bili", 30));
+            assertEquals(60, ModuleConfig.effectiveAppTopGapPx("com.eg.android.AlipayGphone", 30));
+            assertEquals(30, ModuleConfig.effectiveAppTopGapPx("com.example.unconfigured", 30));
+
+            // 5. Strict parser rejects malformed JSON while safe parser returns empty map
+            assertTrue(ModuleConfig.parsePerAppRulesJson("{not valid json").isEmpty());
+            boolean threw = false;
+            try {
+                ModuleConfig.parsePerAppRulesJsonStrict("{not valid json");
+            } catch (IllegalArgumentException expected) {
+                threw = true;
+            }
+            assertTrue(threw);
+        } finally {
+            ModuleConfig.clearPerAppRuleOverrides();
+        }
+    }
+
+    @Test
+    public void imeVirtualDisplayIsNonCoverAndDetectsStaleCoverCache() {
+        // Default display (0) with outer cover dimensions 1208x1392 is the cover display.
+        assertFalse(AppCompatibility.isNonCoverDisplayDimensions(0, 1208, 1392));
+        assertFalse(AppCompatibility.isNonCoverDisplayDimensions(0, 1392, 1208));
+        // Default display (0) unfolded inner screen (1224x2912) is non-cover.
+        assertTrue(AppCompatibility.isNonCoverDisplayDimensions(0, 1224, 2912));
+        // Mirror VirtualDisplay (e.g. Display #40 Sam:IPhone 1168x2168) is always non-cover,
+        // even if its dimensions ever happened to match cover dimensions.
+        assertTrue(AppCompatibility.isNonCoverDisplayDimensions(40, 1168, 2168));
+        assertTrue(AppCompatibility.isNonCoverDisplayDimensions(40, 1208, 1392));
+
+        // WeType width cache staleness checks when moving from cover screen -> VirtualDisplay #40 (1168px) or inner (1224px).
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(810, 1168));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(1208, 1168));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(1392, 1168));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(1224, 1168));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(1168, 1224));
+        assertFalse(AppCompatibility.isImeWidthCacheStaleForDisplay(1168, 1168));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(810, 1224));
+        assertTrue(AppCompatibility.isImeWidthCacheStaleForDisplay(1208, 1224));
+        assertFalse(AppCompatibility.isImeWidthCacheStaleForDisplay(1224, 1224));
+        assertFalse(AppCompatibility.isImeWidthCacheStaleForDisplay(0, 1168));
+
+        // Laid-out self-draw key row width staleness catches 56px unfolded->virtual overflow (1224 vs 1168)
+        assertTrue(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1220, 1168));
+        assertFalse(AppCompatibility.isWeTypeLaidOutKeyWidthStale(1160, 1168));
+
+        // Metrics & Configuration mismatch checks between unfolded Display #0 (1224x2912 @ 520dpi)
+        // and mirror VirtualDisplay #49 (1168x2168 @ 496dpi), while tolerating normal system-bar height insets.
+        android.util.DisplayMetrics innerReal = new android.util.DisplayMetrics();
+        innerReal.widthPixels = 1224;
+        innerReal.heightPixels = 2912;
+        innerReal.densityDpi = 520;
+        innerReal.density = 520 / 160f;
+
+        android.util.DisplayMetrics mirrorReal = new android.util.DisplayMetrics();
+        mirrorReal.widthPixels = 1168;
+        mirrorReal.heightPixels = 2168;
+        mirrorReal.densityDpi = 496;
+        mirrorReal.density = 496 / 160f;
+
+        android.util.DisplayMetrics innerAppDm = new android.util.DisplayMetrics();
+        innerAppDm.widthPixels = 1224;
+        innerAppDm.heightPixels = 2701;
+        innerAppDm.densityDpi = 520;
+
+        android.util.DisplayMetrics mirrorAppDm = new android.util.DisplayMetrics();
+        mirrorAppDm.widthPixels = 1168;
+        mirrorAppDm.heightPixels = 2103;
+        mirrorAppDm.densityDpi = 496;
+
+        assertTrue(AppCompatibility.isMetricsMismatchedForTarget(innerReal, mirrorReal));
+        assertTrue(AppCompatibility.isMetricsMismatchedForTarget(mirrorReal, innerReal));
+        assertFalse(AppCompatibility.isMetricsMismatchedForTarget(mirrorAppDm, mirrorReal));
+        assertFalse(AppCompatibility.isMetricsMismatchedForTarget(innerAppDm, innerReal));
+
+        android.content.res.Configuration innerCfg = new android.content.res.Configuration();
+        innerCfg.densityDpi = 520;
+        innerCfg.screenWidthDp = 377;
+        innerCfg.screenHeightDp = 896;
+
+        android.content.res.Configuration innerAppCfg = new android.content.res.Configuration();
+        innerAppCfg.densityDpi = 520;
+        innerAppCfg.screenWidthDp = 377;
+        innerAppCfg.screenHeightDp = 831;
+
+        android.content.res.Configuration mirrorCfg = new android.content.res.Configuration();
+        mirrorCfg.densityDpi = 496;
+        mirrorCfg.screenWidthDp = 377;
+        mirrorCfg.screenHeightDp = 699;
+
+        assertTrue(AppCompatibility.isConfigMismatchedForTarget(innerCfg, mirrorReal));
+        assertFalse(AppCompatibility.isConfigMismatchedForTarget(mirrorCfg, mirrorReal));
+        assertTrue(AppCompatibility.isConfigMismatchedForTarget(mirrorCfg, innerReal));
+        assertFalse(AppCompatibility.isConfigMismatchedForTarget(innerAppCfg, innerReal));
+    }
+
+    @Test
+    public void coverImeGuard_mirrorVirtualDisplayDetectionAndContainerConstraintGate() {
+        assertFalse(CoverImeGuard.hasActiveMirrorVirtualDisplay(null));
+
+        // Built-in default (0) and secondary internal (1) displays never trigger mirror bypass
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                0, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_INTERNAL,
+                "local:4630946219955703955", "Display id 0", 1224, 2912));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                1, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_INTERNAL,
+                "local:4630946219955703956", "Display id 1", 1208, 1392));
+
+        // OFF or internal displays on id > 1 never trigger mirror bypass
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                46, android.view.Display.STATE_OFF, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.xiaomi.mirror,1000,Sam:IPhone,0", "Display id 46", 1168, 2168));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                2, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_INTERNAL,
+                "local:2", "Display id 2", 1920, 1080));
+
+        // Screen recorders, MediaProjection, scrcpy, and generic unnamed virtual displays must NOT disable cover IME
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                46, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.miui.screenrecorder,1000,ScreenRecorder,0", "Display id 46", 1168, 2168));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                47, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.example.cast,1000,MediaProjection,0", "Display id 47", 1920, 1080));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                48, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                null, "Display id 48 scrcpy", 1208, 1392));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                49, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                null, null, 1168, 2168));
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                49, android.view.Display.STATE_ON, -1,
+                null, "Display id 49", 1168, 2168));
+
+        // Known interactive HyperOS mirror / cast / carlink / synergy virtual displays DO trigger mirror bypass
+        assertTrue(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                46, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.xiaomi.mirror,1000,Sam:IPhone,0", null, 800, 600));
+        assertTrue(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                49, android.view.Display.STATE_ON, -1,
+                null, "Display id 49: uniqueId \"virtual:com.xiaomi.mirror,1000\"", 800, 600));
+        assertTrue(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                50, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.miui.carlink,1000,CarLink,0", "Display id 50", 1920, 720));
+        assertTrue(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                51, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                "virtual:com.milink.service,1000,MiLink,0", "Display id 51", 1280, 720));
+        assertTrue(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                52, android.view.Display.STATE_ON, CoverImeGuard.DISPLAY_TYPE_VIRTUAL,
+                null, "Display id 52 miui.synergy", 1080, 1920));
+
+        // Small non-virtual display does not falsely disable cover IME container constraints
+        assertFalse(CoverImeGuard.isMirrorOrVirtualDisplayDescriptor(
+                2, android.view.Display.STATE_ON, 0, "overlay:1", "Display id 2", 800, 600));
+
+        // FEATURE_IME_PLACEHOLDER constraint gate: releases 810x1392 whenever mirror VirtualDisplay is active
+        assertTrue(CoverImeGuard.shouldConstrainImeContainer(true, true, false));
+        assertFalse(CoverImeGuard.shouldConstrainImeContainer(true, true, true));
+        assertFalse(CoverImeGuard.shouldConstrainImeContainer(true, false, false));
+        assertFalse(CoverImeGuard.shouldConstrainImeContainer(false, true, false));
+    }
+
+    @Test
+    public void moduleConfig_newQuickActionTokensDualAppTargetsAndSnapshotCache() {
+        try {
+            // 4 new Option C Quick Action / Orb tokens
+            for (String tok : java.util.List.of(
+                    ModuleConfig.QA_ROTATION_LOCK,
+                    ModuleConfig.QA_MEDIA_PLAY_PAUSE,
+                    ModuleConfig.QA_BRIGHTNESS,
+                    ModuleConfig.QA_SCAN)) {
+                assertTrue("quick action token valid: " + tok, ModuleConfig.isValidQuickActionToken(tok));
+                assertTrue("orb action token valid: " + tok, ModuleConfig.isValidOrbActionToken(tok));
+                assertEquals(tok, ModuleConfig.normalizeQuickActionToken(" " + tok + " ", ModuleConfig.QA_HOME));
+                assertEquals(tok, ModuleConfig.normalizeOrbActionToken(" " + tok + " "));
+            }
+            java.util.List<String> slots = ModuleConfig.parseQuickActionSlots(
+                    "rotation_lock,media_play_pause,brightness,scan");
+            assertEquals(
+                    java.util.List.of("rotation_lock", "media_play_pause", "brightness", "scan"),
+                    slots);
+            assertEquals("rotation_lock,media_play_pause,brightness,scan",
+                    ModuleConfig.serializeQuickActionSlots(slots));
+
+            // Dual-App (u999) target formatting, extraction & normalization
+            assertEquals("com.tencent.mm", ModuleConfig.formatAppTarget("com.tencent.mm", 0));
+            assertEquals("com.tencent.mm", ModuleConfig.formatAppTarget("com.tencent.mm", -5));
+            assertEquals("com.tencent.mm#999", ModuleConfig.formatAppTarget("com.tencent.mm", 999));
+            assertEquals("com.tencent.mm", ModuleConfig.extractAppTargetPackage("com.tencent.mm#999"));
+            assertEquals("com.tencent.mm", ModuleConfig.extractAppTargetPackage("app:com.tencent.mm#999"));
+            assertEquals(999, ModuleConfig.extractAppTargetUserId("com.tencent.mm#999"));
+            assertEquals(999, ModuleConfig.extractAppTargetUserId("app:com.tencent.mm#999"));
+            assertEquals(0, ModuleConfig.extractAppTargetUserId("com.tencent.mm"));
+            assertEquals(0, ModuleConfig.extractAppTargetUserId("com.tencent.mm#0"));
+            assertEquals(0, ModuleConfig.extractAppTargetUserId("com.tencent.mm#abc"));
+
+            assertEquals(
+                    "com.tencent.mm,com.tencent.mm#999,com.tencent.mobileqq#999",
+                    ModuleConfig.normalizePinnedWidgetApps(
+                            " com.tencent.mm , com.tencent.mm#999, com.miui.fliphome, com.tencent.mm#999, "
+                                    + "com.tencent.mobileqq#999, bad#0, bad#abc "));
+            assertTrue(ModuleConfig.isValidQuickActionToken("app:com.tencent.mm#999"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:com.tencent.mm#0"));
+            assertFalse(ModuleConfig.isValidQuickActionToken("app:com.miui.fliphome#999"));
+            assertEquals(
+                    "app:com.tencent.mm#999",
+                    ModuleConfig.normalizeQuickActionToken(" app: com.tencent.mm#999 ", ModuleConfig.QA_HOME));
+
+            // overrideUnlockLauncherApps refreshes the volatile ConfigSnapshot immediately
+            ModuleConfig.overrideUnlockLauncherApps(false);
+            assertFalse(ModuleConfig.unlockLauncherApps());
+            ModuleConfig.overrideUnlockLauncherApps(true);
+            assertTrue(ModuleConfig.unlockLauncherApps());
+        } finally {
+            ModuleConfig.clearUnlockLauncherAppsOverride();
+        }
+    }
+
+    @Test
+    public void coverDisplay_rot270ImeDensityAndCustomScale() {
+        assertEquals(340, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_270));
+        assertEquals(340, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_270, 100));
+        assertEquals(289, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_270, 85));
+        assertEquals(420, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_90));
+        assertEquals(504, CoverDisplay.coverImeDensityDpi(Surface.ROTATION_180, 120));
+    }
+
+    @Test
+    public void coverDisplay_nextCoverBrightnessLevelCyclesFor4095And255Scales() {
+        final int auto = android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC;
+        final int manual = android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL;
+
+        // bixi 4096-level backlight (maxVal = 4095): AUTO -> ~20% (819) -> ~55% (2252) -> ~90% (3686) -> AUTO (-1)
+        int bixiLow = CoverDisplay.nextCoverBrightnessLevel(auto, 0, 4095);
+        assertEquals(819, bixiLow);
+        int bixiMed = CoverDisplay.nextCoverBrightnessLevel(manual, bixiLow, 4095);
+        assertEquals(2252, bixiMed);
+        int bixiHigh = CoverDisplay.nextCoverBrightnessLevel(manual, bixiMed, 4095);
+        assertEquals(3686, bixiHigh);
+        assertEquals(-1, CoverDisplay.nextCoverBrightnessLevel(manual, bixiHigh, 4095));
+        // Threshold boundaries around 37% (1515) and 72% (2948)
+        assertEquals(2252, CoverDisplay.nextCoverBrightnessLevel(manual, 1514, 4095));
+        assertEquals(3686, CoverDisplay.nextCoverBrightnessLevel(manual, 1515, 4095));
+        assertEquals(3686, CoverDisplay.nextCoverBrightnessLevel(manual, 2947, 4095));
+        assertEquals(-1, CoverDisplay.nextCoverBrightnessLevel(manual, 2948, 4095));
+
+        // Legacy 8-bit panel (maxVal = 255): AUTO -> ~20% (51) -> ~55% (140) -> ~90% (230) -> AUTO (-1)
+        int legLow = CoverDisplay.nextCoverBrightnessLevel(auto, 0, 255);
+        assertEquals(51, legLow);
+        int legMed = CoverDisplay.nextCoverBrightnessLevel(manual, legLow, 255);
+        assertEquals(140, legMed);
+        int legHigh = CoverDisplay.nextCoverBrightnessLevel(manual, legMed, 255);
+        assertEquals(230, legHigh);
+        assertEquals(-1, CoverDisplay.nextCoverBrightnessLevel(manual, legHigh, 255));
+
+        // Sub-255 maxVal safely clamps to 255 floor; JVM fallback maxScreenBrightnessInt >= 255
+        assertEquals(51, CoverDisplay.nextCoverBrightnessLevel(auto, 0, 0));
+        assertEquals(51, CoverDisplay.nextCoverBrightnessLevel(auto, 0, 100));
+        assertTrue(CoverDisplay.maxScreenBrightnessInt() >= 255);
+    }
+
+    @Test
+    public void modLog_hookHealthAndClearTimestampFiltering() {
+        ModLog.recordHookHealth("z_test_hook", "ok");
+        ModLog.recordHookHealth("a_test_hook", "degraded");
+        ModLog.recordHookHealth("", "ignored");
+        ModLog.recordHookHealth(null, "ignored");
+        String health = ModLog.formatHookHealthSummary();
+        assertTrue(health.contains("a_test_hook=degraded"));
+        assertTrue(health.contains("z_test_hook=ok"));
+        assertTrue(health.indexOf("a_test_hook=degraded") < health.indexOf("z_test_hook=ok"));
+
+        // Timestamp-based logcat clear filter (replaces global logcat -c)
+        String marker = "06-15 12:30:00.500";
+        assertTrue(ModLog.isLogcatLineAtOrAfter("06-15 12:30:00.500  1000  1000 I MF2C: exact", marker));
+        assertTrue(ModLog.isLogcatLineAtOrAfter("06-15 12:30:01.000  1000  1000 I MF2C: after", marker));
+        assertFalse(ModLog.isLogcatLineAtOrAfter("06-15 12:29:59.999  1000  1000 I MF2C: before", marker));
+        assertFalse(ModLog.isLogcatLineAtOrAfter("short", marker));
+        assertFalse(ModLog.isLogcatLineAtOrAfter(null, marker));
+        assertTrue(ModLog.isLogcatLineAtOrAfter("any line", null));
+
+        // Year rollover (Dec -> Jan)
+        assertTrue(ModLog.isLogcatLineAtOrAfter("01-01 00:00:00.001  1000  1000 I MF2C: newyear", "12-31 23:59:59.900"));
+        assertFalse(ModLog.isLogcatLineAtOrAfter("12-31 23:59:59.900  1000  1000 I MF2C: oldyear", "01-01 00:00:00.001"));
+    }
+
+    @Test
+    public void mainActivity_diagnosticRedactionHelpers() {
+        // System, core, built-in deep-compat & module packages stay readable
+        assertTrue(MainActivity.isPublicDiagnosticPackage("system"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("android"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.android.systemui"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.miui.fliphome"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.miui.voiceassist"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.tencent.mm"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.tencent.mm#999"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.tencent.wetype"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage("com.android.settings"));
+        assertTrue(MainActivity.isPublicDiagnosticPackage(BuildConfig.APPLICATION_ID));
+
+        // Personal 3rd-party packages are redacted
+        assertFalse(MainActivity.isPublicDiagnosticPackage("com.personal.bank"));
+        assertFalse(MainActivity.isPublicDiagnosticPackage("com.personal.bank#999"));
+        assertFalse(MainActivity.isPublicDiagnosticPackage("com.example.diary"));
+
+        java.util.List<String> scopes = java.util.List.of(
+                "system", "com.android.systemui", "com.tencent.mm", "com.personal.bank", "com.example.diary");
+        assertEquals(
+                "[system, com.android.systemui, com.tencent.mm, <redacted:2>]",
+                MainActivity.formatDiagnosticPackageList(scopes, true));
+        assertEquals(scopes.toString(), MainActivity.formatDiagnosticPackageList(scopes, false));
+
+        // Action tokens & lists (preserving Dual-App indicator while masking package name)
+        assertEquals("rotation_lock", MainActivity.formatDiagnosticActionToken("rotation_lock", true));
+        assertEquals("app:com.tencent.mm#999", MainActivity.formatDiagnosticActionToken("app:com.tencent.mm#999", true));
+        assertEquals("app:<redacted>", MainActivity.formatDiagnosticActionToken("app:com.personal.bank", true));
+        assertEquals("app:<redacted>#999", MainActivity.formatDiagnosticActionToken("app:com.personal.bank#999", true));
+        assertEquals(
+                "[home, app:com.tencent.mm, app:<redacted>, scan]",
+                MainActivity.formatDiagnosticActionList(
+                        java.util.List.of("home", "app:com.tencent.mm", "app:com.personal.bank", "scan"),
+                        true));
+
+        // Runtime log line redaction masks personal packages without altering public tags
+        String redactedLine = MainActivity.redactDiagnosticLogLine(
+                "06-15 12:00:00.000 I/MF2C.Compat: pkg=com.personal.bank dual=com.personal.bank.sub sys=com.android.systemui",
+                java.util.List.of("com.personal.bank.sub", "com.personal.bank"));
+        assertEquals(
+                "06-15 12:00:00.000 I/MF2C.Compat: pkg=<redacted-pkg> dual=<redacted-pkg> sys=com.android.systemui",
+                redactedLine);
+    }
+
+    public static final class OverloadSample {
+        public String handle(String v) { return "str:" + v; }
+        public String handle(Integer v) { return "intObj:" + v; }
+        public String handle(int v) { return "intPrim:" + v; }
+    }
+
+    @Test
+    public void coverGeometry_findMethodOverloadSafeCache() throws Exception {
+        java.lang.reflect.Method mStr = CoverGeometry.findMethod(OverloadSample.class, "handle", String.class);
+        java.lang.reflect.Method mIntObj = CoverGeometry.findMethod(OverloadSample.class, "handle", Integer.class);
+        java.lang.reflect.Method mIntPrim = CoverGeometry.findMethod(OverloadSample.class, "handle", int.class);
+        java.lang.reflect.Method mMissing = CoverGeometry.findMethod(OverloadSample.class, "handle", Long.class);
+
+        assertNotNull(mStr);
+        assertNotNull(mIntObj);
+        assertNotNull(mIntPrim);
+        assertNull(mMissing);
+
+        OverloadSample sample = new OverloadSample();
+        assertEquals("str:hi", mStr.invoke(sample, "hi"));
+        assertEquals("intObj:7", mIntObj.invoke(sample, Integer.valueOf(7)));
+        assertEquals("intPrim:9", mIntPrim.invoke(sample, 9));
+    }
 }

@@ -3,10 +3,18 @@ package io.github.jabe1122.mixflip2cover;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
+import android.app.ActivityOptions;
+import android.app.BroadcastOptions;
+import android.app.NotificationManager;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.LauncherActivityInfo;
+import android.content.pm.LauncherApps;
+import android.content.pm.PackageManager;
 import android.database.ContentObserver;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -14,23 +22,37 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
+import android.media.AudioManager;
+import android.net.Uri;
 import android.net.wifi.SupplicantState;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.text.format.DateFormat;
 import android.util.Log;
 import android.view.Display;
+import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.animation.PathInterpolator;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 /** Transparent Duo-style status cluster with optional battery numbers and physical SIM rows. */
 final class StatusOrb extends View {
@@ -48,6 +70,17 @@ final class StatusOrb extends View {
     private static final Path HOTSPOT_RIGHT = new Path();
     private static final float[] SIGNAL_XS = {30, 43.054f, 56.946f, 70};
     private static final float[] SIGNAL_YS = {122.641f, 127.392f, 127.392f, 122.641f};
+    /** Deterministic 9-point +/-2px OLED burn-in micro-shift pattern advancing every 3 minutes. */
+    private static final float[][] BURN_IN_SHIFTS = {
+            {0f, 0f}, {2f, 0f}, {2f, 2f},
+            {0f, 2f}, {-2f, 2f}, {-2f, 0f},
+            {-2f, -2f}, {0f, -2f}, {2f, -2f}
+    };
+    private static volatile boolean userReflectionResolved;
+    private static volatile UserHandle currentUserHandle;
+    private static volatile Method sendBroadcastAsUser4;
+    private static volatile Method sendBroadcastAsUser3;
+    private static volatile Method startActivityAsUser3;
 
     static {
         buildHotspot(HOTSPOT_LEFT, HOTSPOT_RIGHT);
@@ -63,9 +96,27 @@ final class StatusOrb extends View {
     private VisualState targetState;
     private final NetworkStatus network;
     private final Runnable configChanged = () -> {
+        updateInteractiveState();
         readStatus();
         postInvalidateOnAnimation();
     };
+    private float downRawX, downRawY;
+    private long downTimeMs;
+    private boolean longPressTriggered, dragRouted, orbPressed;
+    private float pressScale = 1f;
+    private ValueAnimator pressAnimator;
+    private final Runnable longPressRunnable = () -> {
+        String action = ModuleConfig.orbLongPressAction();
+        if (!dragRouted && !ModuleConfig.QA_NONE.equals(action)) {
+            longPressTriggered = true;
+            animateOrbPress(false);
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            executeOrbAction(getContext(), action);
+        }
+    };
+    private static volatile boolean torchTrackerRegistered;
+    private static volatile String backFlashId;
+    private static volatile boolean torchActive;
     private int battery = -1, wifi = -1;
     private int batteryColor = Color.WHITE;
     private boolean charging, full, powerSave, receiverRegistered, powerObserverRegistered;
@@ -85,11 +136,19 @@ final class StatusOrb extends View {
             if (Intent.ACTION_TIME_TICK.equals(action)
                     || Intent.ACTION_TIME_CHANGED.equals(action)
                     || Intent.ACTION_TIMEZONE_CHANGED.equals(action)) {
-                String next = DateFormat.getTimeFormat(getContext()).format(new Date());
-                if (!next.equals(time)) {
-                    time = next;
-                    updateDescription();
+                updateBurnInShift();
+                long now = SystemClock.elapsedRealtime();
+                if (lastStatusRead == 0 || now - lastStatusRead >= 55_000L) {
+                    readStatus();
+                    lastStatusRead = now;
                     invalidate();
+                } else {
+                    String next = DateFormat.getTimeFormat(getContext()).format(new Date());
+                    if (!next.equals(time)) {
+                        time = next;
+                        updateDescription();
+                        invalidate();
+                    }
                 }
                 scheduleMinuteRefresh();
                 return;
@@ -121,6 +180,106 @@ final class StatusOrb extends View {
     private boolean homeOverride;
     private int homeTarget, animatedInk, lastDrawnInk = Color.WHITE;
     private long homeDeadline;
+    private float burnInShiftX, burnInShiftY;
+
+    private void updateBurnInShift() {
+        long bucket = Math.abs(System.currentTimeMillis() / 180_000L);
+        int idx = (int) (bucket % BURN_IN_SHIFTS.length);
+        float nx = BURN_IN_SHIFTS[idx][0];
+        float ny = BURN_IN_SHIFTS[idx][1];
+        if (nx != burnInShiftX || ny != burnInShiftY) {
+            burnInShiftX = nx;
+            burnInShiftY = ny;
+            postInvalidateOnAnimation();
+        }
+    }
+
+    private static void ensureUserReflection() {
+        if (userReflectionResolved) return;
+        userReflectionResolved = true;
+        try {
+            Object u = UserHandle.class.getField("CURRENT").get(null);
+            if (u instanceof UserHandle uh) currentUserHandle = uh;
+        } catch (Throwable ignored) {
+        }
+        if (currentUserHandle == null) {
+            try {
+                currentUserHandle = Process.myUserHandle();
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            sendBroadcastAsUser4 = Context.class.getMethod(
+                    "sendBroadcastAsUser", Intent.class, UserHandle.class, String.class, Bundle.class);
+        } catch (Throwable ignored) {
+        }
+        try {
+            sendBroadcastAsUser3 = Context.class.getMethod(
+                    "sendBroadcastAsUser", Intent.class, UserHandle.class, String.class);
+        } catch (Throwable ignored) {
+        }
+        try {
+            startActivityAsUser3 = Context.class.getMethod(
+                    "startActivityAsUser", Intent.class, Bundle.class, UserHandle.class);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Dispatches a SystemUI broadcast with an explicit {@link UserHandle} to avoid
+     * {@code ContextImpl: Calling a method in the system process without a qualified user} warnings,
+     * while strictly preserving {@link Bundle} options such as {@code setShareIdentityEnabled(true)}.
+     */
+    static void sendBroadcastAsCurrentUser(Context ctx, Intent intent, String permission, Bundle options) {
+        if (ctx == null || intent == null) return;
+        ensureUserReflection();
+        UserHandle user = currentUserHandle;
+        if (user != null) {
+            if (options != null && sendBroadcastAsUser4 != null) {
+                try {
+                    sendBroadcastAsUser4.invoke(ctx, intent, user, permission, options);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            } else if (options == null && sendBroadcastAsUser3 != null) {
+                try {
+                    sendBroadcastAsUser3.invoke(ctx, intent, user, permission);
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (options != null) {
+            ctx.sendBroadcast(intent, permission, options);
+        } else if (permission != null) {
+            ctx.sendBroadcast(intent, permission);
+        } else {
+            ctx.sendBroadcast(intent);
+        }
+    }
+
+    static void startActivityAsCurrentUser(Context ctx, Intent intent, Bundle options) {
+        if (ctx == null || intent == null) return;
+        ensureUserReflection();
+        UserHandle user = currentUserHandle;
+        if (user != null && startActivityAsUser3 != null) {
+            try {
+                startActivityAsUser3.invoke(ctx, intent, options, user);
+                return;
+            } catch (InvocationTargetException ite) {
+                Throwable cause = ite.getCause();
+                if (cause instanceof RuntimeException re) throw re;
+                if (cause instanceof Error err) throw err;
+                throw new RuntimeException(cause != null ? cause : ite);
+            } catch (ReflectiveOperationException ignored) {
+            }
+        }
+        if (options != null) {
+            ctx.startActivity(intent, options);
+        } else {
+            ctx.startActivity(intent);
+        }
+    }
 
     void animateHomeInk(int target) {
         if (homeAnimator != null) homeAnimator.cancel();
@@ -186,15 +345,416 @@ final class StatusOrb extends View {
 
     StatusOrb(Context context) {
         super(context);
-        network = new NetworkStatus(context, () -> post(configChanged));
+        network = new NetworkStatus(context, () -> {
+            removeCallbacks(configChanged);
+            post(configChanged);
+        });
         NativeStatusStyle.observeTint(this);
         if (SystemClock.uptimeMillis() < NativeStatusStyle.homeInkUntil) {
             homeTarget = animatedInk = lastDrawnInk = NativeStatusStyle.homeInk;
             homeOverride = true;
             homeDeadline = SystemClock.elapsedRealtime() + 1200;
         }
-        setClickable(false);
+        updateBurnInShift();
+        updateInteractiveState();
         setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+    }
+
+    private static boolean isTorchConfigured() {
+        return ModuleConfig.QA_TORCH.equals(ModuleConfig.orbTapAction())
+                || ModuleConfig.QA_TORCH.equals(ModuleConfig.orbLongPressAction());
+    }
+
+    void updateInteractiveState() {
+        boolean interactive = ModuleConfig.hasOrbInteraction();
+        setClickable(interactive);
+        setLongClickable(!ModuleConfig.QA_NONE.equals(ModuleConfig.orbLongPressAction()));
+        if (isTorchConfigured()) {
+            CameraManager cm = getContext().getSystemService(CameraManager.class);
+            if (cm != null) ensureTorchTracker(cm);
+        }
+    }
+
+    private void animateOrbPress(boolean pressed) {
+        if (orbPressed == pressed) return;
+        orbPressed = pressed;
+        if (pressAnimator != null) pressAnimator.cancel();
+        pressAnimator = ValueAnimator.ofFloat(pressScale, pressed ? 0.90f : 1f);
+        pressAnimator.setDuration(pressed ? 90L : 170L);
+        pressAnimator.setInterpolator(new PathInterpolator(0.2f, 0f, 0f, 1f));
+        pressAnimator.addUpdateListener(v -> {
+            pressScale = (Float) v.getAnimatedValue();
+            postInvalidateOnAnimation();
+        });
+        pressAnimator.start();
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (!ModuleConfig.hasOrbInteraction()) {
+            return super.onTouchEvent(event);
+        }
+        int action = event.getActionMasked();
+        float rawX = event.getRawX();
+        float rawY = event.getRawY();
+        float slop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
+        switch (action) {
+            case MotionEvent.ACTION_DOWN -> {
+                downRawX = rawX;
+                downRawY = rawY;
+                downTimeMs = SystemClock.uptimeMillis();
+                longPressTriggered = false;
+                dragRouted = false;
+                animateOrbPress(true);
+                removeCallbacks(longPressRunnable);
+                if (!ModuleConfig.QA_NONE.equals(ModuleConfig.orbLongPressAction())) {
+                    postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout());
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_MOVE -> {
+                if (dragRouted || longPressTriggered) return true;
+                float dx = rawX - downRawX;
+                float dy = rawY - downRawY;
+                if (dy > slop && dy > Math.abs(dx) * 1.2f) {
+                    removeCallbacks(longPressRunnable);
+                    dragRouted = true;
+                    animateOrbPress(false);
+                    expandPanelForOrbDrag(downRawX);
+                } else if (dx * dx + dy * dy > slop * slop * 2.25f) {
+                    removeCallbacks(longPressRunnable);
+                    animateOrbPress(false);
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_UP -> {
+                removeCallbacks(longPressRunnable);
+                animateOrbPress(false);
+                if (!dragRouted && !longPressTriggered) {
+                    float dx = rawX - downRawX;
+                    float dy = rawY - downRawY;
+                    long elapsed = SystemClock.uptimeMillis() - downTimeMs;
+                    if (dx * dx + dy * dy <= slop * slop * 2.25f && elapsed < 650L) {
+                        String tapAction = ModuleConfig.orbTapAction();
+                        if (!ModuleConfig.QA_NONE.equals(tapAction)) {
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                            executeOrbAction(getContext(), tapAction);
+                        }
+                    }
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPressRunnable);
+                animateOrbPress(false);
+                return true;
+            }
+            default -> {
+                return true;
+            }
+        }
+    }
+
+    private void expandPanelForOrbDrag(float startRawX) {
+        Display d = getDisplay();
+        int rot = d != null ? d.getRotation() : Surface.ROTATION_0;
+        int logicalW = CoverDisplay.isPortraitRotation(rot) ? CoverDisplay.WIDTH : CoverDisplay.HEIGHT;
+        boolean control = CoverDisplay.isControlCenterPull(startRawX, logicalW, rot);
+        expandSystemPanel(control);
+    }
+
+    private static void expandSystemPanel(boolean control) {
+        try {
+            Object controller = control ? PanelMotion.controlCenter : PanelMotion.notification;
+            if (controller != null) {
+                controller.getClass().getMethod(control ? "expand" : "show", boolean.class).invoke(controller, true);
+                PanelMotion.wake();
+                ModLog.i(TAG, control ? "orb routed to control center" : "orb routed to notifications");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "orb panel expand unavailable", t);
+        }
+    }
+
+    private void executeOrbAction(Context ctx, String token) {
+        if (ctx == null || token == null || token.isEmpty() || ModuleConfig.QA_NONE.equals(token)) return;
+        ModLog.i(TAG, "executing status orb action=" + token);
+        switch (token) {
+            case ModuleConfig.QA_LOCK -> {
+                try {
+                    PowerManager pm = ctx.getSystemService(PowerManager.class);
+                    if (pm != null) {
+                        PowerManager.class.getMethod("goToSleep", long.class).invoke(pm, SystemClock.uptimeMillis());
+                    }
+                } catch (Throwable t) {
+                    sendSystemQuickAction(ctx, ModuleConfig.QA_LOCK);
+                }
+            }
+            case ModuleConfig.QA_NOTIFICATIONS -> expandSystemPanel(false);
+            case ModuleConfig.QA_CONTROL_CENTER -> expandSystemPanel(true);
+            case ModuleConfig.QA_TORCH -> toggleOrbTorch(ctx);
+            case ModuleConfig.QA_RINGER -> cycleOrbRinger(ctx);
+            case ModuleConfig.QA_RECENTS -> triggerOrbRecents(ctx);
+            case ModuleConfig.QA_ROTATION_LOCK -> toggleOrbRotationLock(ctx);
+            case ModuleConfig.QA_MEDIA_PLAY_PAUSE -> dispatchOrbMediaPlayPause(ctx);
+            case ModuleConfig.QA_BRIGHTNESS -> cycleOrbBrightness(ctx);
+            case ModuleConfig.QA_SCAN -> launchOrbScan(ctx);
+            case ModuleConfig.QA_HOME, ModuleConfig.QA_BACK, ModuleConfig.QA_SCREENSHOT ->
+                    sendSystemQuickAction(ctx, token);
+            default -> {
+                if (token.startsWith(ModuleConfig.QA_APP_PREFIX)) {
+                    String target = token.substring(ModuleConfig.QA_APP_PREFIX.length()).trim();
+                    launchOrbApp(ctx, target);
+                }
+            }
+        }
+    }
+
+    private static void sendSystemQuickAction(Context ctx, String action) {
+        try {
+            Intent intent = new Intent(SystemServerEntry.ACTION_COVER_QUICK_ACTION)
+                    .setPackage("android")
+                    .putExtra(SystemServerEntry.EXTRA_QUICK_ACTION, action);
+            BroadcastOptions opts = BroadcastOptions.makeBasic();
+            opts.setShareIdentityEnabled(true);
+            sendBroadcastAsCurrentUser(ctx, intent, null, opts.toBundle());
+        } catch (Throwable t) {
+            Log.w(TAG, "orb quick action broadcast failed: " + action, t);
+        }
+    }
+
+    private static void triggerOrbRecents(Context ctx) {
+        try {
+            Intent intent = new Intent(QuickActionsWidget.ACTION_TRIGGER_RECENTS)
+                    .setPackage(CoverGeometry.FLIPHOME);
+            BroadcastOptions opts = BroadcastOptions.makeBasic();
+            opts.setShareIdentityEnabled(true);
+            sendBroadcastAsCurrentUser(ctx, intent, null, opts.toBundle());
+        } catch (Throwable t) {
+            sendSystemQuickAction(ctx, ModuleConfig.QA_RECENTS);
+        }
+    }
+
+    private void toggleOrbRotationLock(Context ctx) {
+        try {
+            ContentResolver cr = ctx.getContentResolver();
+            int cur = Settings.System.getInt(cr, Settings.System.ACCELEROMETER_ROTATION, 1);
+            int next = cur == 0 ? 1 : 0;
+            if (next == 0) {
+                Display d = getDisplay();
+                if (d == null) d = CoverGeometry.outerDisplay(ctx);
+                int rot = d != null ? d.getRotation() : Surface.ROTATION_0;
+                Settings.System.putInt(cr, Settings.System.USER_ROTATION, rot);
+            }
+            Settings.System.putInt(cr, Settings.System.ACCELEROMETER_ROTATION, next);
+        } catch (Throwable t) {
+            sendSystemQuickAction(ctx, ModuleConfig.QA_ROTATION_LOCK);
+        }
+    }
+
+    private static void dispatchOrbMediaPlayPause(Context ctx) {
+        try {
+            AudioManager am = ctx.getSystemService(AudioManager.class);
+            if (am == null) {
+                sendSystemQuickAction(ctx, ModuleConfig.QA_MEDIA_PLAY_PAUSE);
+                return;
+            }
+            long now = SystemClock.uptimeMillis();
+            am.dispatchMediaKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
+            am.dispatchMediaKeyEvent(new KeyEvent(now, now + 8L, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, 0));
+        } catch (Throwable t) {
+            sendSystemQuickAction(ctx, ModuleConfig.QA_MEDIA_PLAY_PAUSE);
+        }
+    }
+
+    private static void cycleOrbBrightness(Context ctx) {
+        try {
+            ContentResolver cr = ctx.getContentResolver();
+            int maxVal = CoverDisplay.maxScreenBrightnessInt();
+            int mode = Settings.System.getInt(
+                    cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);
+            int val = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, Math.round(maxVal * 0.55f));
+            int next = CoverDisplay.nextCoverBrightnessLevel(mode, val, maxVal);
+            if (next < 0) {
+                Settings.System.putInt(
+                        cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);
+            } else {
+                if (mode != Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) {
+                    Settings.System.putInt(
+                            cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);
+                }
+                Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, next);
+            }
+        } catch (Throwable t) {
+            sendSystemQuickAction(ctx, ModuleConfig.QA_BRIGHTNESS);
+        }
+    }
+
+    private static void launchOrbScan(Context ctx) {
+        try {
+            Display outer = CoverGeometry.outerDisplay(ctx);
+            int displayId = outer != null ? outer.getDisplayId() : Display.DEFAULT_DISPLAY;
+            ActivityOptions opts = ActivityOptions.makeBasic();
+            opts.setLaunchDisplayId(displayId);
+
+            PackageManager pm = ctx.getPackageManager();
+            boolean hasWeChat = false;
+            try {
+                pm.getPackageInfo("com.tencent.mm", 0);
+                hasWeChat = true;
+            } catch (Throwable ignored) {
+            }
+            Intent scanIntent;
+            if (hasWeChat) {
+                scanIntent = new Intent(Intent.ACTION_MAIN)
+                        .setComponent(new ComponentName("com.tencent.mm", "com.tencent.mm.ui.LauncherUI"))
+                        .putExtra("LauncherUI.From.Scaner.Shortcut", true)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            } else {
+                scanIntent = new Intent(Intent.ACTION_VIEW, Uri.parse("alipays://platformapi/startapp?saId=10000007"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            }
+            startActivityAsCurrentUser(ctx, scanIntent, opts.toBundle());
+        } catch (Throwable t) {
+            sendSystemQuickAction(ctx, ModuleConfig.QA_SCAN);
+        }
+    }
+
+    private void launchOrbApp(Context ctx, String target) {
+        String pkg = ModuleConfig.extractAppTargetPackage(target);
+        int userId = ModuleConfig.extractAppTargetUserId(target);
+        if (pkg.isEmpty()) return;
+        try {
+            Display outer = CoverGeometry.outerDisplay(ctx);
+            int displayId = outer != null ? outer.getDisplayId() : Display.DEFAULT_DISPLAY;
+            ActivityOptions opts = ActivityOptions.makeBasic();
+            opts.setLaunchDisplayId(displayId);
+
+            if (userId > 0) {
+                try {
+                    LauncherApps la = ctx.getSystemService(LauncherApps.class);
+                    if (la != null) {
+                        UserHandle userHandle = UserHandle.getUserHandleForUid(userId * 100000);
+                        List<LauncherActivityInfo> acts = la.getActivityList(pkg, userHandle);
+                        if (acts != null && !acts.isEmpty()) {
+                            la.startMainActivity(acts.get(0).getComponentName(), userHandle, null, opts.toBundle());
+                            return;
+                        }
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "orb dual-app LauncherApps launch failed: " + target, t);
+                }
+                sendSystemQuickAction(ctx, ModuleConfig.QA_APP_PREFIX + ModuleConfig.formatAppTarget(pkg, userId));
+                return;
+            }
+
+            Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
+            if (launch == null) {
+                Log.w(TAG, "orb launch intent missing for " + target);
+                return;
+            }
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+            startActivityAsCurrentUser(ctx, launch, opts.toBundle());
+        } catch (Throwable t) {
+            Log.w(TAG, "orb launch app failed: " + target, t);
+        }
+    }
+
+    private static String resolveBackFlashCameraId(CameraManager cm) {
+        if (cm == null) return null;
+        try {
+            String fallback = null;
+            for (String camId : cm.getCameraIdList()) {
+                CameraCharacteristics cc = cm.getCameraCharacteristics(camId);
+                if (!Boolean.TRUE.equals(cc.get(CameraCharacteristics.FLASH_INFO_AVAILABLE))) continue;
+                Integer facing = cc.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    return camId;
+                }
+                if (fallback == null) fallback = camId;
+            }
+            return fallback;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void toggleOrbTorch(Context ctx) {
+        try {
+            CameraManager cm = ctx.getSystemService(CameraManager.class);
+            if (cm == null) return;
+            ensureTorchTracker(cm);
+            String id = backFlashId;
+            if (id == null) {
+                id = resolveBackFlashCameraId(cm);
+                backFlashId = id;
+            }
+            if (id != null) {
+                boolean next = !torchActive;
+                cm.setTorchMode(id, next);
+                torchActive = next;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "orb torch toggle failed", t);
+        }
+    }
+
+    private static void ensureTorchTracker(CameraManager cm) {
+        if (torchTrackerRegistered || cm == null) return;
+        torchTrackerRegistered = true;
+        try {
+            if (backFlashId == null) {
+                backFlashId = resolveBackFlashCameraId(cm);
+            }
+            cm.registerTorchCallback(new CameraManager.TorchCallback() {
+                @Override
+                public void onTorchModeChanged(String cameraId, boolean enabled) {
+                    if (cameraId != null && (backFlashId == null || cameraId.equals(backFlashId))) {
+                        backFlashId = cameraId;
+                        torchActive = enabled;
+                    }
+                }
+
+                @Override
+                public void onTorchModeUnavailable(String cameraId) {
+                    if (cameraId != null && cameraId.equals(backFlashId)) {
+                        torchActive = false;
+                    }
+                }
+            }, new Handler(Looper.getMainLooper()));
+        } catch (Throwable ignored) {
+            torchTrackerRegistered = false;
+        }
+    }
+
+    private static void cycleOrbRinger(Context ctx) {
+        try {
+            AudioManager am = ctx.getSystemService(AudioManager.class);
+            if (am == null) return;
+            int cur = am.getRingerMode();
+            boolean policyGranted = false;
+            try {
+                NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+                policyGranted = nm != null && nm.isNotificationPolicyAccessGranted();
+            } catch (Throwable ignored) {
+            }
+            int next;
+            if (cur == AudioManager.RINGER_MODE_NORMAL) {
+                next = AudioManager.RINGER_MODE_VIBRATE;
+            } else if (cur == AudioManager.RINGER_MODE_VIBRATE) {
+                next = policyGranted ? AudioManager.RINGER_MODE_SILENT : AudioManager.RINGER_MODE_NORMAL;
+            } else {
+                next = AudioManager.RINGER_MODE_NORMAL;
+            }
+            try {
+                am.setRingerMode(next);
+            } catch (SecurityException se) {
+                am.setRingerMode(cur == AudioManager.RINGER_MODE_NORMAL
+                        ? AudioManager.RINGER_MODE_VIBRATE : AudioManager.RINGER_MODE_NORMAL);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "orb ringer cycle failed", t);
+        }
     }
 
     void startUpdates() {
@@ -227,6 +787,11 @@ final class StatusOrb extends View {
             getContext().registerReceiver(batteryReceiver, f, Context.RECEIVER_NOT_EXPORTED);
             receiverRegistered = true;
         }
+        if (isTorchConfigured()) {
+            CameraManager cm = getContext().getSystemService(CameraManager.class);
+            if (cm != null) ensureTorchTracker(cm);
+        }
+        updateBurnInShift();
         lastStatusRead = 0;
         post(refresh);
     }
@@ -260,6 +825,8 @@ final class StatusOrb extends View {
 
     @Override
     protected void onDetachedFromWindow() {
+        removeCallbacks(longPressRunnable);
+        if (pressAnimator != null) pressAnimator.cancel();
         stopUpdates();
         if (homeAnimator != null) homeAnimator.cancel();
         NativeStatusStyle.removeTintObserver(this);
@@ -431,6 +998,12 @@ final class StatusOrb extends View {
         int ink = displayInk(NativeStatusStyle.inkColor());
         int muted = (ink & 0x00ffffff) | 0x60000000;
         int saved = c.save();
+        if (burnInShiftX != 0f || burnInShiftY != 0f) {
+            c.translate(burnInShiftX, burnInShiftY);
+        }
+        if (pressScale != 1f) {
+            c.scale(pressScale, pressScale, getWidth() / 2f, getHeight() / 2f);
+        }
         float scale = Math.min(getWidth() / CoverGeometry.PANEL_DESIGN_WIDTH, getHeight() / CoverGeometry.PANEL_DESIGN_HEIGHT);
         c.translate((getWidth() - scale * CoverGeometry.PANEL_DESIGN_WIDTH) / 2,
                 (getHeight() - scale * CoverGeometry.PANEL_DESIGN_HEIGHT) / 2);
@@ -468,11 +1041,15 @@ final class StatusOrb extends View {
                 if (layer.state.networkSame(other.state)) weight += other.alpha;
             }
             if (weight < .001f) continue;
-            int networkSave = c.saveLayerAlpha(null, Math.round(255 * Math.min(1, weight)));
-            c.translate(0, 4 * (1 - weight));
-            c.scale(.9f + .1f * weight, .9f + .1f * weight, 50, 88);
-            drawNetwork(c, layer.state, ink, muted);
-            c.restoreToCount(networkSave);
+            if (weight >= 0.999f) {
+                drawNetwork(c, layer.state, ink, muted);
+            } else {
+                int networkSave = c.saveLayerAlpha(null, Math.round(255 * Math.min(1, weight)));
+                c.translate(0, 4 * (1 - weight));
+                c.scale(.9f + .1f * weight, .9f + .1f * weight, 50, 88);
+                drawNetwork(c, layer.state, ink, muted);
+                c.restoreToCount(networkSave);
+            }
         }
         c.restoreToCount(saved);
     }
@@ -572,9 +1149,12 @@ final class StatusOrb extends View {
                 if (layer.state.badgeSame(other.state)) weight += other.alpha;
             }
             if (weight < .001f) continue;
-            int badgeSave = c.saveLayerAlpha(null, Math.round(255 * Math.min(1, weight)));
-            c.translate(0, 2.5f * (1 - weight));
-            c.scale(.9f + .1f * weight, .9f + .1f * weight, 50, 53);
+            boolean fading = weight < 0.999f;
+            int badgeSave = fading ? c.saveLayerAlpha(null, Math.round(255 * Math.min(1, weight))) : -1;
+            if (fading) {
+                c.translate(0, 2.5f * (1 - weight));
+                c.scale(.9f + .1f * weight, .9f + .1f * weight, 50, 53);
+            }
             VisualState state = layer.state;
             Badge badge = new Badge(state);
             float start = 50 - badge.contentWidth / 2;
@@ -584,7 +1164,7 @@ final class StatusOrb extends View {
                 if (state.charged) drawPlug(c, cx, CHARGE_SYMBOL_CENTER_Y, ink);
                 else drawBolt(c, cx, CHARGE_SYMBOL_CENTER_Y, ink);
             }
-            c.restoreToCount(badgeSave);
+            if (fading) c.restoreToCount(badgeSave);
         }
     }
 

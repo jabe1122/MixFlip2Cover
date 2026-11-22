@@ -19,9 +19,12 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Verbose logging gate and cross-process in-memory diagnostic ring buffer.
@@ -44,6 +47,12 @@ final class ModLog {
             DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS", Locale.US);
     private static final ArrayDeque<String> BUFFER = new ArrayDeque<>(MAX_BUFFER_LINES);
     private static final Set<String> REGISTERED_PROCESSES = ConcurrentHashMap.newKeySet();
+    private static final ConcurrentHashMap<String, String> HOOK_HEALTH = new ConcurrentHashMap<>();
+    /**
+     * Timestamp marker recorded when the user clears logs so we filter out older logcat lines
+     * without running global {@code logcat -c} (which would wipe unrelated system crash logs).
+     */
+    private static final AtomicReference<String> LOGCAT_CLEAR_MARKER = new AtomicReference<>(null);
     private static volatile String currentProcessLabel = "";
 
     static final String[] LOGCAT_TAGS = {
@@ -57,6 +66,7 @@ final class ModLog {
             "MF2C.Ime:V",
             "MF2C.ImeGuard:V",
             "MF2C.Island:V",
+            "MF2C.LauncherApps:V",
             "MF2C.Layout:V",
             "MF2C.Mask:V",
             "MF2C.NotifTop:V",
@@ -65,6 +75,7 @@ final class ModLog {
             "MF2C.Panel:V",
             "MF2C.PinnedWidget:V",
             "MF2C.Privacy:V",
+            "MF2C.QuickWidget:V",
             "MF2C.Settings:V",
             "MF2C.SystemUI:V",
             "MF2C.Tint:V",
@@ -133,6 +144,24 @@ final class ModLog {
         }
     }
 
+    static void recordHookHealth(String key, String status) {
+        if (key == null || key.isEmpty()) return;
+        HOOK_HEALTH.put(key, status != null ? status : "");
+    }
+
+    static String formatHookHealthSummary() {
+        if (HOOK_HEALTH.isEmpty()) return "";
+        TreeMap<String, String> sorted = new TreeMap<>(HOOK_HEALTH);
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (Map.Entry<String, String> e : sorted.entrySet()) {
+            if (!first) sb.append(", ");
+            first = false;
+            sb.append(e.getKey()).append('=').append(e.getValue());
+        }
+        return sb.toString();
+    }
+
     static ArrayList<String> snapshot() {
         synchronized (BUFFER) {
             return new ArrayList<>(BUFFER);
@@ -143,6 +172,27 @@ final class ModLog {
         synchronized (BUFFER) {
             BUFFER.clear();
         }
+        try {
+            LOGCAT_CLEAR_MARKER.set(TS_FORMATTER.format(LocalDateTime.now()));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static boolean isLogcatLineAtOrAfter(String line, String clearMarker) {
+        if (clearMarker == null || clearMarker.length() < 18) return true;
+        if (line == null || line.length() < 18) return false;
+        if (line.charAt(2) != '-' || line.charAt(5) != ' '
+                || line.charAt(8) != ':' || line.charAt(11) != ':' || line.charAt(14) != '.') {
+            return false;
+        }
+        String ts = line.substring(0, 18);
+        boolean markerDec = clearMarker.startsWith("12-");
+        boolean markerJan = clearMarker.startsWith("01-");
+        boolean lineDec = ts.startsWith("12-");
+        boolean lineJan = ts.startsWith("01-");
+        if (markerDec && lineJan) return true;
+        if (markerJan && lineDec) return false;
+        return ts.compareTo(clearMarker) >= 0;
     }
 
     /**
@@ -177,21 +227,16 @@ final class ModLog {
                         boolean clearRequested = intent.getBooleanExtra(EXTRA_CLEAR_LOGS, false);
                         if (clearRequested) {
                             clear();
-                            if ("system_server".equals(processLabel)) {
-                                new Thread(() -> {
-                                    try {
-                                        java.lang.Process p = new ProcessBuilder("logcat", "-c").start();
-                                        if (!p.waitFor(3, TimeUnit.SECONDS)) {
-                                            p.destroyForcibly();
-                                        }
-                                    } catch (Throwable ignored) {
-                                    }
-                                }, "mf2c-logcat-clear").start();
-                            }
                         }
                         ResultReceiver receiver = intent.getParcelableExtra(EXTRA_RESULT_RECEIVER, ResultReceiver.class);
                         if (receiver == null) return;
                         ArrayList<String> lines = snapshot();
+                        if (!clearRequested) {
+                            String health = formatHookHealthSummary();
+                            if (!health.isEmpty()) {
+                                lines.add(0, "[hook_health] " + health);
+                            }
+                        }
                         if ("system_server".equals(processLabel) && !clearRequested) {
                             new Thread(() -> {
                                 Bundle b = new Bundle();
@@ -220,6 +265,7 @@ final class ModLog {
 
     static ArrayList<String> readFilteredLogcat(int maxLines) {
         ArrayList<String> out = new ArrayList<>();
+        String clearMarker = LOGCAT_CLEAR_MARKER.get();
         java.lang.Process proc = null;
         try {
             ArrayList<String> cmd = new ArrayList<>();
@@ -230,24 +276,47 @@ final class ModLog {
             cmd.add("-t");
             cmd.add(String.valueOf(Math.max(50, maxLines)));
             for (String spec : LOGCAT_TAGS) cmd.add(spec);
-            proc = new ProcessBuilder(cmd).redirectErrorStream(true).start();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.startsWith("--------- beginning of")) continue;
-                    out.add(line);
+            final java.lang.Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            proc = p;
+            Thread readerThread = new Thread(() -> {
+                boolean lastKept = (clearMarker == null);
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("--------- beginning of")) continue;
+                        if (clearMarker != null) {
+                            boolean hasTimestamp = line.length() >= 18
+                                    && line.charAt(2) == '-' && line.charAt(5) == ' '
+                                    && line.charAt(8) == ':' && line.charAt(11) == ':' && line.charAt(14) == '.';
+                            if (hasTimestamp) {
+                                lastKept = isLogcatLineAtOrAfter(line, clearMarker);
+                            }
+                            if (!lastKept) continue;
+                        }
+                        synchronized (out) {
+                            out.add(line);
+                        }
+                    }
+                } catch (Throwable ignored) {
                 }
+            }, "mf2c-logcat-read");
+            readerThread.start();
+            if (!p.waitFor(4, TimeUnit.SECONDS)) {
+                p.destroyForcibly();
             }
+            readerThread.join(1000L);
         } catch (Throwable ignored) {
         } finally {
             if (proc != null) {
                 try {
-                    proc.destroy();
+                    proc.destroyForcibly();
                 } catch (Throwable ignored) {
                 }
             }
         }
-        return out;
+        synchronized (out) {
+            return new ArrayList<>(out);
+        }
     }
 }

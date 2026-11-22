@@ -7,13 +7,16 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.SparseArray;
 import android.view.Display;
 import android.view.View;
 import android.view.ViewGroup;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedModule;
@@ -97,10 +100,22 @@ final class CoverNotificationTop {
                 DisplayManager dm = context.getSystemService(DisplayManager.class);
                 Handler h = mainHandler != null ? mainHandler : new Handler(Looper.getMainLooper());
                 if (dm != null) {
+                    SparseArray<String> displayKeys = new SparseArray<>();
                     dm.registerDisplayListener(new DisplayManager.DisplayListener() {
-                        @Override public void onDisplayAdded(int displayId) { scheduleRefresh(); }
-                        @Override public void onDisplayRemoved(int displayId) { scheduleRefresh(); }
-                        @Override public void onDisplayChanged(int displayId) { scheduleRefresh(); }
+                        @Override public void onDisplayAdded(int displayId) {
+                            displayKeys.remove(displayId);
+                            scheduleRefresh();
+                        }
+                        @Override public void onDisplayRemoved(int displayId) {
+                            displayKeys.remove(displayId);
+                            scheduleRefresh();
+                        }
+                        @Override public void onDisplayChanged(int displayId) {
+                            String key = displayStateKey(dm, displayId);
+                            if (key != null && key.equals(displayKeys.get(displayId))) return;
+                            if (key != null) displayKeys.put(displayId, key);
+                            scheduleRefresh();
+                        }
 
                         private void scheduleRefresh() {
                             h.removeCallbacksAndMessages(DISPLAY_REFRESH_TOKEN);
@@ -344,45 +359,64 @@ final class CoverNotificationTop {
         }
     }
 
-    private static void refreshAllControllers() {
-        synchronized (COMBINED_CONTROLLERS) {
-            for (Object ctrl : COMBINED_CONTROLLERS) {
-                if (ctrl == null) continue;
-                Class<?> cls = ctrl.getClass();
-                syncNotificationHeaderLayout(
-                        ctrl,
-                        findField(cls, "context"),
-                        findField(cls, "notificationHeaderView"),
-                        findField(cls, "shadeHeaderController"),
-                        findField(cls, "notificationExpandProgressController"));
-            }
+    private static String displayStateKey(DisplayManager dm, int displayId) {
+        try {
+            Display d = dm.getDisplay(displayId);
+            if (d == null) return displayId + ":null";
+            Display.Mode m = d.getMode();
+            int w = m != null ? m.getPhysicalWidth() : 0;
+            int h = m != null ? m.getPhysicalHeight() : 0;
+            return displayId + ":" + d.getState() + ":" + w + "x" + h + ":" + d.getRotation();
+        } catch (RuntimeException e) {
+            return null;
         }
+    }
+
+    private static void refreshAllControllers() {
+        List<Object> controllers;
+        synchronized (COMBINED_CONTROLLERS) {
+            controllers = new ArrayList<>(COMBINED_CONTROLLERS);
+        }
+        for (Object ctrl : controllers) {
+            if (ctrl == null) continue;
+            Class<?> cls = ctrl.getClass();
+            syncNotificationHeaderLayout(
+                    ctrl,
+                    findField(cls, "context"),
+                    findField(cls, "notificationHeaderView"),
+                    findField(cls, "shadeHeaderController"),
+                    findField(cls, "notificationExpandProgressController"));
+        }
+        List<Object> animators;
         synchronized (HEIGHT_ANIMATORS) {
-            for (Object anim : HEIGHT_ANIMATORS) {
-                if (anim == null) continue;
-                try {
-                    Method m = anim.getClass().getDeclaredMethod(
-                            "updateAnimateHeight", boolean.class, boolean.class);
-                    m.setAccessible(true);
-                    m.invoke(anim, false, false);
-                } catch (Throwable ignored) {
-                }
+            animators = new ArrayList<>(HEIGHT_ANIMATORS);
+        }
+        for (Object anim : animators) {
+            if (anim == null) continue;
+            try {
+                Method m = anim.getClass().getDeclaredMethod(
+                        "updateAnimateHeight", boolean.class, boolean.class);
+                m.setAccessible(true);
+                m.invoke(anim, false, false);
+            } catch (Throwable ignored) {
             }
         }
         Method insetMethod = miuiHeadsUpInsetMethod;
         Field insetField = cachedNsslHeadsUpInsetField;
         if (insetMethod != null && insetField != null) {
+            List<View> layouts;
             synchronized (STACK_SCROLL_LAYOUTS) {
-                for (View layout : STACK_SCROLL_LAYOUTS) {
-                    if (layout == null || !layout.isAttachedToWindow()) continue;
-                    try {
-                        Object val = insetMethod.invoke(null, layout.getContext());
-                        if (val instanceof Integer updatedInset && insetField.getInt(layout) != updatedInset) {
-                            insetField.setInt(layout, updatedInset);
-                            layout.requestLayout();
-                        }
-                    } catch (Throwable ignored) {
+                layouts = new ArrayList<>(STACK_SCROLL_LAYOUTS);
+            }
+            for (View layout : layouts) {
+                if (layout == null || !layout.isAttachedToWindow()) continue;
+                try {
+                    Object val = insetMethod.invoke(null, layout.getContext());
+                    if (val instanceof Integer updatedInset && insetField.getInt(layout) != updatedInset) {
+                        insetField.setInt(layout, updatedInset);
+                        layout.requestLayout();
                     }
+                } catch (Throwable ignored) {
                 }
             }
         }
